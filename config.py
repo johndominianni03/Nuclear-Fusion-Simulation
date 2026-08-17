@@ -40,7 +40,7 @@ class SimulationConfiguration:
         self.reactor_dt = 1.0e-9        # Short dt to resolve the full gyro-orbit
         self.nu_c = 5000.0              # Collision frequency
         
-        self.initial_thermal_count = 550000
+        self.initial_thermal_count = 1000001
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
         self.inject_every_n_steps = 2
