@@ -39,8 +39,15 @@ class SimulationConfiguration:
         self.reactor_num_steps = 10000
         self.reactor_dt = 1.0e-9        # Short dt to resolve the full gyro-orbit
         self.nu_c = 5000.0              # Collision frequency
+
+        """
+        initial thermal count which sets initial plasma particle count. 
+        in main.py, GPU_THRESHOLD determines the initial thermal particle count 
+        at which below the threshold, the simulation runs on Numba JIT (on the CPU), 
+        and at or above the threshold, the simulation runs on PyTorch (on the GPU)
+        """
         
-        self.initial_thermal_count = 1000001
+        self.initial_thermal_count = 50000
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
         self.inject_every_n_steps = 2
@@ -48,7 +55,7 @@ class SimulationConfiguration:
         # Decaying beam source (a fixed batch forever meant inventory only grew, so no
         # steady state): rate(step) = NBI_BATCH_SIZE * exp(-step / NBI_DECAY_TAU_STEPS).
         # Fractional rates are realised stochastically so the beam thins out smoothly.
-        self.NBI_BATCH_SIZE = 1
+        self.NBI_BATCH_SIZE = 5
         self.NBI_DECAY_TAU_STEPS = 2500.0
 
         # 3.5 MeV alphas cover ~1.3e-2 m per global step against a ~2.2e-2 m Larmor
@@ -179,13 +186,13 @@ class SimulationConfiguration:
         # Auto-detect Apple Silicon Metal Performance Shaders (MPS)
         if self.USE_GPU_ACCELERATION and torch.backends.mps.is_available():
             self.HPC_DEVICE = torch.device("mps")
-            print("🔥 APPLE SILICON METAL ACCELERATION (MPS) ACTIVATED 🔥")
+            print("APPLE SILICON METAL PERFORMANCE SHADERS SIMULATION RUN")
         elif self.USE_GPU_ACCELERATION and torch.cuda.is_available():
             self.HPC_DEVICE = torch.device("cuda")
-            print("🔥 CUDA GPU ACTIVATED 🔥")
+            print("CUDA GPU SIMULATION RUN")
         else:
             self.HPC_DEVICE = torch.device("cpu")
-            print("⚠️ GPU NOT FOUND. FALLING BACK TO CPU THREADS ⚠️")
+            print("GPU NOT FOUND. FALLING BACK TO CPU THREADS")
 
         # Particle scales for the timing sweep
         self.BENCHMARK_PARTICLE_COUNTS = [1000, 10000, 100000, 1000000]
