@@ -110,7 +110,7 @@ def apply_vectorized_collisions(vel_arr, type_arr, nu_c, dt):
 # =======================================================
 def run_hpc_benchmark(cfg):
     print("==================================================")
-    print("   WEEK 23: MULTI-CORE & GPU HPC BENCHMARK RUN    ")
+    print("   MULTI-CORE & GPU HPC BENCHMARK RUN    ")
     print("==================================================")
     
     cpu_times = []
@@ -544,10 +544,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- TRIPLE PRODUCT DENSITY MUST MATCH THE Q-FACTOR NORMALISATION ---
         # n_e was hardcoded to 1e20 m^-3 here, which had nothing to do with the
         # macro-particle weight that scales alpha heating into the reactor-scale MW
-        # feeding Q_sci on the panel directly above this one. The two halves of the Week
-        # 22 figure were therefore normalised to different plasmas, and the triple product
-        # came out ~100x low purely from that mismatch.
-        #
+        # feeding Q_sci on the panel directly above this one.
         # Deriving n_e from the same MACRO_WEIGHT_REACTOR and the psi_edge volume makes
         # the panels describe one plasma. Units are unchanged and already correct:
         # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
@@ -973,10 +970,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- TRIPLE PRODUCT DENSITY MUST MATCH THE Q-FACTOR NORMALISATION ---
         # n_e was hardcoded to 1e20 m^-3 here, which had nothing to do with the
         # macro-particle weight that scales alpha heating into the reactor-scale MW
-        # feeding Q_sci on the panel directly above this one. The two halves of the Week
-        # 22 figure were therefore normalised to different plasmas, and the triple product
-        # came out ~100x low purely from that mismatch.
-        #
+        # feeding Q_sci on the panel directly above this one. 
         # Deriving n_e from the same MACRO_WEIGHT_REACTOR and the psi_edge volume makes
         # the panels describe one plasma. Units are unchanged and already correct:
         # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
@@ -1007,7 +1001,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
 def run_reactor_steady_state():
     print("==================================================")
-    print("      WEEK 11: PIC FULL CYCLE (LORENTZ PUSH)      ")
+    print("      PIC FULL CYCLE (LORENTZ PUSH)      ")
     print("==================================================")
 
     cfg = SimulationConfiguration()
@@ -1106,7 +1100,7 @@ def run_reactor_steady_state():
         R_phase = R_all[keep].tolist()
         v_parallel_phase = v_par_all[keep].tolist()
 
-    print("[SYSTEM] Mapping Volumetric Fusion Power (Week 18)...")
+    print("[SYSTEM] Mapping Volumetric Fusion Power ")
     n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
     scale_factor = 1.0e20 / (np.max(n_e_grid_raw) + 1e-10)
     n_e_grid_scaled = n_e_grid_raw * scale_factor
@@ -1144,7 +1138,7 @@ def run_reactor_steady_state():
 
 def run_plasma_oscillation_test():
     print("==================================================")
-    print("  WEEK 12: HYBRID TENSOR OSCILLATIONS & SHIELDING ")
+    print("  HYBRID TENSOR OSCILLATIONS & SHIELDING ")
     print("==================================================")
     
     cfg = SimulationConfiguration()
@@ -1208,7 +1202,7 @@ def run_plasma_oscillation_test():
 
 def run_nuclear_reaction_dynamics():
     print("==================================================")
-    print("  WEEK 17: EVALUATING D-T QUANTUM CROSS-SECTION   ")
+    print("  EVALUATING D-T QUANTUM CROSS-SECTION   ")
     print("==================================================")
     E_kev_arr = np.linspace(1.0, 200.0, 500)
     sigma_arr = np.array([compute_dt_cross_section(e) for e in E_kev_arr])
