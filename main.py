@@ -888,9 +888,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             cfg.SPI_TRIGGERED = True
             trigger_time = t
             T_core_baseline = T_core_kinetic
-            print(f"  [⚠️ EMERGENCY] Magnetic Island exceeded {cfg.MAX_ISLAND_WIDTH_THRESHOLD*100}% minor radius!")
-            print(f"  [⚙️ SYSTEM] Firing Shattered Pellet Injection (SPI) at t={t*1000:.2f} ms...")
-            print(f"  [⚙️ SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
+            print(f"  [EMERGENCY] Magnetic Island exceeded {cfg.MAX_ISLAND_WIDTH_THRESHOLD*100}% minor radius!")
+            print(f"  [SYSTEM] Firing Shattered Pellet Injection (SPI) at t={t*1000:.2f} ms...")
+            print(f"  [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
 
         # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
         # Post-trigger T_core used to come from trigger_thermal_quench()'s analytic
@@ -1116,7 +1116,7 @@ def run_reactor_steady_state():
             total_fusion_power_watts += P_fusion_grid[i, j] * cell_volume
             
     print("==================================================")
-    print(f" ⚡ TOTAL INTEGRATED FUSION POWER: {total_fusion_power_watts / 1e6:.2f} MW ")
+    print(f" TOTAL INTEGRATED FUSION POWER: {total_fusion_power_watts / 1e6:.2f} MW ")
     print("==================================================")
 
     diagnostics.run_steady_state_diagnostics(
