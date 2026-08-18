@@ -31,11 +31,11 @@ def _scrub_particles(particles):
     return clean
 
 # =======================================================
-# HPC BENCHMARK GRAPH
+# SIMULATION RUN BENCHMARK GRAPH
 # =======================================================
 def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
     print("==================================================")
-    print("      WEEK 23: HPC BENCHMARK SCALING GRAPH        ")
+    print("      SIMULATION RUN BENCHMARK SCALING GRAPH        ")
     print("==================================================")
     plt.figure(figsize=(9, 6))
     
@@ -50,7 +50,7 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
         plt.plot(counts, gpu_t, color='dodgerblue', linewidth=2.5, marker='s', markersize=8, label='GPU Accelerated (Apple Metal/PyTorch)')
         plt.fill_between(counts, gpu_t, cpu_t, color='lightgray', alpha=0.3, label='Hardware Acceleration Gap')
         
-    plt.title("Week 23: HPC Drag Race (Particle Push Scaling)")
+    plt.title("Simulation Performance: Numba JIT (CPU) vs PyTorch (GPU)")
     plt.xlabel("Number of Particles (Log Scale)")
     plt.ylabel("Execution Time for 100 Steps (Seconds - Log Scale)")
     plt.xscale('log')
@@ -79,7 +79,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     tau_p = (avg_inventory / loss_rate) if loss_rate > 0 else float('inf')
 
     print("==================================================")
-    print("      WEEK 11: REACTOR PERFORMANCE DIAGNOSTIC     ")
+    print("         REACTOR PERFORMANCE DIAGNOSTIC     ")
     print("==================================================")
     print(f"Total Particles Sourced       : {total_injected}")
     print(f"Total Particles Lost (Sink)   : {total_lost}")
@@ -130,7 +130,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         axis.plot(WALL_R, WALL_Z, color='black', linewidth=1.2, alpha=0.85, zorder=7,
                   linestyle='--', label=label)
 
-    # --- 1. 2D CHARGE DENSITY MAP (percentile clipped) ---
+    # --- 2D CHARGE DENSITY MAP (percentile clipped) ---
     plt.figure(figsize=(7, 6))
     rho_clean = np.where(_confinement_mask, np.nan, rho_grid.T)
     p_min, p_max = np.nanpercentile(rho_clean, 2), np.nanpercentile(rho_clean, 98)
@@ -139,7 +139,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
     contour_rho = plt.contourf(R_mesh, Z_mesh, rho_clean, levels=np.linspace(p_min, p_max, 40), cmap='plasma', extend='both')
     plt.colorbar(contour_rho, label="Charge Density $\\rho$ (C/m$^3$)")
-    plt.title("Week 11: Poloidal Charge Density Distribution (CIC)")
+    plt.title("Poloidal Charge Density Distribution (CIC)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
     _draw_wall(plt.gca())
@@ -151,7 +151,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.savefig("charge_density_map.png", dpi=300)
     plt.show()
 
-    # --- 2. ELECTROSTATIC POTENTIAL MAP (percentile clipped) ---
+    # --- ELECTROSTATIC POTENTIAL MAP (percentile clipped) ---
     plt.figure(figsize=(7, 6))
     phi_clean = np.where(_confinement_mask, np.nan, phi_grid.T)
     p_min, p_max = np.nanpercentile(phi_clean, 2), np.nanpercentile(phi_clean, 98)
@@ -160,7 +160,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
     contour_phi = plt.contourf(R_mesh, Z_mesh, phi_clean, levels=np.linspace(p_min, p_max, 40), cmap='viridis', extend='both')
     plt.colorbar(contour_phi, label="Electrostatic Potential $\\phi$ (Volts)")
-    plt.title("Week 11: Self-Consistent Potential Field (Poisson Solver)")
+    plt.title("Self-Consistent Potential Field (Poisson Solver)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
     _draw_wall(plt.gca())
@@ -172,7 +172,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.savefig("potential_field_map.png", dpi=300)
     plt.show()
 
-    # --- 3. STORED ENERGY WAVEFORM ---
+    # --- STORED ENERGY WAVEFORM ---
     plt.figure(figsize=(8, 4))
     plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6, energy_history_keV, color='firebrick', linewidth=1.5)
     plt.title("Stored Plasma Energy vs. Time (Full Lorentz Push)")
@@ -183,7 +183,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.savefig("plasma_stored_energy_time.png", dpi=300)
     plt.show()
 
-    # --- 4. TOKAMAK TRAJECTORIES (2D, axes locked) ---
+    # --- TOKAMAK TRAJECTORIES (2D, axes locked) ---
     cartesian_dfs = []
     classifications = []
     
@@ -251,12 +251,12 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.savefig("tokamak_reactor_2d.png", dpi=300)
     plt.show()
 
-    # --- 5. (3D TOKAMAK RENDERING MOVED) ---
+    # --- 3D TOKAMAK RENDERING MOVED ---
     # Runs after section 10 so the alpha trajectories are in cartesian_dfs first. Alphas
     # are the clearest banana orbits in the simulation but were previously drawn only on
     # the 2D alpha plot, never in the 3D torus view.
 
-    # --- 6. 1D RADIAL FLUID PROFILES ---
+    # --- 1D RADIAL FLUID PROFILES ---
     if R_centers is not None and density_profile is not None and pressure_profile is not None:
         fig, ax1 = plt.subplots(figsize=(8, 5))
         
@@ -273,18 +273,18 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         ax2.plot(_scrub_1d(R_centers), _scrub_1d(pressure_profile), color=color_pres, linewidth=2, linestyle='--', label="Pressure Profile")
         ax2.tick_params(axis='y', labelcolor=color_pres)
         
-        plt.title("Week 13: Macroscopic Fluid Approximations (Density & Pressure)")
+        plt.title("Macroscopic Fluid Approximations (Density & Pressure)")
         fig.tight_layout()
         plt.savefig("radial_profiles.png", dpi=300)
         plt.show()
 
-    # --- 7. PHASE-SPACE DISTRIBUTION ---
+    # --- PHASE-SPACE DISTRIBUTION ---
     if R_phase is not None and v_parallel_phase is not None and len(R_phase) > 0:
         plt.figure(figsize=(8, 6))
         v_par_scrubbed = _scrub_1d(v_parallel_phase)
         
         plt.scatter(_scrub_1d(R_phase), v_par_scrubbed, s=2, color='darkviolet', alpha=0.3)
-        plt.title("Week 14: Phase-Space Map (Banana Orbits vs. Passing Particles)")
+        plt.title("Phase-Space Map (Banana Orbits vs. Passing Particles)")
         plt.xlabel("Major Radius R (m)")
         plt.ylabel("Parallel (Toroidal) Velocity $v_\\parallel$ (m/s)")
         plt.axhline(0, color='black', linewidth=1, linestyle='--')
@@ -300,14 +300,14 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.savefig("phase_space_map.png", dpi=300)
         plt.show()
 
-    # --- 8. MHD INSTABILITY EXPONENTIAL GROWTH ---
+    # --- MHD INSTABILITY EXPONENTIAL GROWTH ---
     if instability_amp_history is not None and len(instability_amp_history) > 0:
         plt.figure(figsize=(8, 5))
         amp_history = _scrub_1d(instability_amp_history)
         time_array = np.arange(len(amp_history)) * cfg.reactor_dt * 1e6 
         plt.plot(time_array, amp_history, color='darkorange', linewidth=2.5)
         
-        plt.title(f"Week 15: Tearing Mode Instability Growth (m={cfg.m_mode}, n={cfg.n_mode})")
+        plt.title(f"Tearing Mode Instability Growth (m={cfg.m_mode}, n={cfg.n_mode})")
         plt.xlabel("Simulation Time ($\\mu s$)")
         plt.ylabel("Perturbation Amplitude $\\delta B$ (Tesla)")
         plt.grid(True, linestyle='--', alpha=0.5)
@@ -315,7 +315,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.savefig("instability_growth.png", dpi=300)
         plt.show()
 
-    # --- 9. VOLUMETRIC FUSION POWER HEATMAP (percentile clipped) ---
+    # --- VOLUMETRIC FUSION POWER HEATMAP (percentile clipped) ---
     if P_fusion_grid is not None:
         plt.figure(figsize=(7, 6))
         P_mw_grid = np.where(_confinement_mask, np.nan, P_fusion_grid.T / 1e6)
@@ -326,7 +326,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
         contour_pf = plt.contourf(R_mesh, Z_mesh, P_mw_grid, levels=np.linspace(0, p_max, 40), cmap='inferno', extend='max')
         plt.colorbar(contour_pf, label="Volumetric Fusion Power ($MW/m^3$)")
-        plt.title("Week 18: D-T Core Fusion Power Density")
+        plt.title("D-T Core Fusion Power Density")
         plt.xlabel("Major Radius R (m)")
         plt.ylabel("Height Z (m)")
         plt.xlim(*VIEW_XLIM)
@@ -337,29 +337,12 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.savefig("fusion_power_density.png", dpi=300)
         plt.show()
 
-    # --- 10. ALPHA PARTICLE TRAJECTORIES ---
+    # --- ALPHA PARTICLE TRAJECTORIES ---
     if alpha_particles is not None and len(alpha_particles) > 0:
         print("--- RENDERING WEEK 19 ALPHA ORBITS ---")
         fig, ax = plt.subplots(figsize=(8, 8))
         eq.plot_equilibrium(ax=ax)
 
-        """
-        
-        thermal_count = 0
-        for p in active_particles:
-            if p.get("type") == 0 and thermal_count < 3:
-                traj = p["history"]
-                if len(traj) > 1:
-                    R_path = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)
-                    ax.plot(R_path, traj[:, 2], color='cyan', alpha=0.8, linewidth=1.2)
-                    thermal_count += 1
-                
-        for p in alpha_particles:
-            traj = p["history"]
-            if len(traj) > 1:
-                R_path = np.sqrt(traj[:, 0]**2 + traj[:, 1]**2)
-                ax.plot(R_path, traj[:, 2], color='magenta', alpha=0.9, linewidth=1.8)
-        """
         thermal_count = 0
         nbi_count = 0
         
@@ -418,7 +401,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         ax.set_ylim(*VIEW_YLIM)
         ax.set_aspect('equal')
                 
-        ax.set_title("Week 19: 3.5 MeV Alpha Orbits vs Thermal Background")
+        ax.set_title("3.5 MeV Alpha Orbits vs Thermal Background")
         ax.set_xlabel("Major Radius R (m)")
         ax.set_ylabel("Height Z (m)")
         
@@ -435,7 +418,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.savefig("alpha_orbits.png", dpi=300)
         plt.show()
 
-    # --- 5 (deferred). 3D TOKAMAK RENDERING ---
+    # --- 3D TOKAMAK RENDERING ---
     # Runs here so cartesian_dfs already carries the alpha orbits.
     print("--- RENDERING 3D STEADY-STATE TOKAMAK ---")
     try:
@@ -449,7 +432,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         print(f"[WARNING] Skipping 3D visualization due to missing dependency or window issue: {e}")
 
     # =======================================================
-    # 11. ALPHA HEATING & IGNITION BALANCE GRAPH
+    # ALPHA HEATING & IGNITION BALANCE GRAPH
     # =======================================================
     if alpha_power_history is not None and ext_power_history is not None and len(alpha_power_history) > 0:
         plt.figure(figsize=(8, 5))
@@ -462,7 +445,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.plot(time_array, alpha_pwr_arr, color='magenta', linewidth=2.5, label='Internal Alpha Heating')
         plt.fill_between(time_array, alpha_pwr_arr, ext_pwr_arr, where=(alpha_pwr_arr > ext_pwr_arr), interpolate=True, color='magenta', alpha=0.2, label='Ignition Achieved (Self-Heating)')
 
-        plt.title("Week 20: Reactor Ignition Criteria (Alpha Heating Balance)")
+        plt.title("Reactor Ignition Criteria (Alpha Heating Balance)")
         plt.xlabel("Simulation Time ($\\mu s$)")
         plt.ylabel("Heating Power (MW)")
         plt.grid(True, linestyle=':', alpha=0.6)
@@ -473,7 +456,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.show()
         
     # =======================================================
-    # 12. RADIATION LOSS PROFILE
+    # RADIATION LOSS PROFILE
     # =======================================================
     if brem_power_history is not None and cyc_power_history is not None and alpha_power_history is not None and len(brem_power_history) > 0:
         plt.figure(figsize=(8, 6))
@@ -493,7 +476,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.fill_between(time_array, alpha_pwr_arr, total_rad_loss, where=(alpha_pwr_arr >= total_rad_loss), interpolate=True, color='lightgreen', alpha=0.3, label='Net Heating (Ignition Maintained)')
         plt.fill_between(time_array, alpha_pwr_arr, total_rad_loss, where=(alpha_pwr_arr < total_rad_loss), interpolate=True, color='salmon', alpha=0.3, label='Net Cooling (Reactor Dying)')
         
-        plt.title("Week 21: Thermodynamic Balance (Alpha Heating vs Radiation Loss)")
+        plt.title("Thermodynamic Balance (Alpha Heating vs Radiation Loss)")
         plt.xlabel("Simulation Time ($\\mu s$)")
         plt.ylabel("Power (MW)")
         plt.grid(True, linestyle=':', alpha=0.6)
@@ -504,7 +487,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.show()
 
     # =======================================================
-    # 13. Q-FACTORS & LAWSON CRITERION
+    # Q-FACTORS & LAWSON CRITERION
     # =======================================================
     if q_sci_history is not None and q_eng_history is not None and lawson_history is not None and len(q_sci_history) > 0:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
@@ -619,7 +602,7 @@ def plot_fusion_cross_section(E_kev_arr, sigma_arr):
     plt.axvline(x=peak_energy, color='gold', linestyle='--', label=f'Resonance Peak (~{peak_energy:.1f} keV)')
     plt.plot(peak_energy, peak_sigma, 'ro')
     
-    plt.title("Week 17: D-T Fusion Cross-Section vs. Collision Energy")
+    plt.title("D-T Fusion Cross-Section vs. Collision Energy")
     plt.xlabel("Center-of-Mass Collision Energy (keV)")
     plt.ylabel("Cross-Section $\\sigma$ (barns)")
     plt.xlim(0, 200)
