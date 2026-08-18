@@ -1,7 +1,41 @@
 import numpy as np
 import torch
 from mhd_equilibrium import MHDEquilibrium
-from physics_engine import ParticlePusher, compute_flux_thresholds, interpolate_psi_array
+from physics_engine import (
+    ParticlePusher,
+    compute_flux_thresholds,
+    interpolate_psi_array,
+    compute_flux_boundary_contour,   # psi_edge wall polygon, shared by physics and plots
+    compute_plasma_volume,           # revolved volume of that surface
+)
+
+def _attach_flux_surfaces(eq, cfg=None, R0=1.0, a_minor=0.3):
+    # Flux-surface (psi) boundaries, calibrated against the legacy circular region
+    # (R0=1.0, a_minor=0.3) so the confined volume is comparably sized but follows the
+    # real magnetic topology. Stashed on `eq` so downstream code reads them via eq.psi_*
+    # without changing any caller's positionally-unpacked return signature.
+    #
+    # Shared by the reactor and the oscillation test: both now decide particle loss with
+    # check_confinement_flux against this one surface, so both need it attached.
+    psi_axis, psi_edge, psi_core, psi_grid, psi_R_min, psi_R_max, psi_Z_min, psi_Z_max, psi_nR, psi_nZ = \
+        compute_flux_thresholds(eq, R0=R0, a_minor=a_minor)
+    eq.psi_axis, eq.psi_edge, eq.psi_core = psi_axis, psi_edge, psi_core
+    eq.psi_grid = psi_grid
+    eq.psi_R_min, eq.psi_R_max = psi_R_min, psi_R_max
+    eq.psi_Z_min, eq.psi_Z_max = psi_Z_min, psi_Z_max
+    eq.psi_nR, eq.psi_nZ = psi_nR, psi_nZ
+
+    # The wall the diagnostics draw and the volume the Lawson density divides by are both
+    # derived from this same contour, so plot, physics and reactor metrics cannot drift
+    # apart the way the r = 0.3 circle did.
+    eq.wall_R, eq.wall_Z = compute_flux_boundary_contour(
+        psi_grid, psi_edge, psi_R_min, psi_R_max, psi_Z_min, psi_Z_max, psi_nR, psi_nZ
+    )
+    eq.plasma_volume_m3 = compute_plasma_volume(eq.wall_R, eq.wall_Z)
+    if cfg is not None and eq.plasma_volume_m3 > 0.0:
+        cfg.PLASMA_VOLUME_M3 = eq.plasma_volume_m3
+    return eq
+
 
 def initialize_reactor(cfg):
     # Sets up the steady-state NBI reactor environment using PyTorch Tensors.
@@ -9,17 +43,13 @@ def initialize_reactor(cfg):
     eq.solve_grad_shafranov()
     engine = ParticlePusher(equilibrium=eq)
 
-    # Flux-surface (psi) boundaries, calibrated against the legacy circular region
-    # (R0=1.0, a_minor=0.3) so the confined volume is comparably sized but follows the
-    # real magnetic topology. Stashed on `eq` so downstream code reads them via eq.psi_*
-    # without changing this function's positionally-unpacked return signature.
-    psi_axis, psi_edge, psi_core, psi_grid, psi_R_min, psi_R_max, psi_Z_min, psi_Z_max, psi_nR, psi_nZ = \
-        compute_flux_thresholds(eq, R0=1.0, a_minor=0.3)
-    eq.psi_axis, eq.psi_edge, eq.psi_core = psi_axis, psi_edge, psi_core
-    eq.psi_grid = psi_grid
-    eq.psi_R_min, eq.psi_R_max = psi_R_min, psi_R_max
-    eq.psi_Z_min, eq.psi_Z_max = psi_Z_min, psi_Z_max
-    eq.psi_nR, eq.psi_nZ = psi_nR, psi_nZ
+    _attach_flux_surfaces(eq, cfg)
+    psi_grid = eq.psi_grid
+    psi_core = eq.psi_core
+    psi_R_min, psi_R_max = eq.psi_R_min, eq.psi_R_max
+    psi_Z_min, psi_Z_max = eq.psi_Z_min, eq.psi_Z_max
+    psi_nR, psi_nZ = eq.psi_nR, eq.psi_nZ
+    print(f"[SYSTEM] Confined plasma volume from psi_edge surface: {eq.plasma_volume_m3:.3f} m^3")
 
     print(f"[SYSTEM] Initializing thermal background ({cfg.initial_thermal_count:,} particles at {cfg.T_thermal_keV} keV)...")
 
@@ -71,6 +101,10 @@ def initialize_oscillation_test(cfg):
     eq = MHDEquilibrium()
     eq.solve_grad_shafranov()
     
+    # Same psi surface the reactor uses, so check_confinement_flux has a boundary to test
+    # against here too (this test previously used the removed circular check_confinement).
+    _attach_flux_surfaces(eq)
+
     engine = ParticlePusher(equilibrium=eq, species="electron")
     engine.m *= cfg.macro_weight
     engine.q *= cfg.macro_weight

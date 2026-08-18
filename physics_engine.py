@@ -155,6 +155,10 @@ class ParticlePusher:
             
         return positions, velocities
 
+    # Both push wrappers return motion only -- (pos, v_parallel) and (pos, vel). They no
+    # longer report a confinement flag: the single authority on whether a particle is
+    # still inside the plasma is check_confinement_flux / check_confinement_torch, which
+    # test psi against psi_edge.
     def guiding_center_push(self, pos, v_parallel, mu, dt, E_vec, t=0.0, b_perturb=0.0, m_mode=2, n_mode=1, gamma=0.0):
         B_vec = self.eq.get_B_field(pos)
         # Tearing mode perturbation, if active
@@ -276,7 +280,8 @@ class ParticlePusher:
         # 5. Convert to reactor-scale MW (1 keV = 1.602e-16 J), scaled by a macro-particle
         # weight representing the full plasma volume.
         joules_per_kev = 1.602e-16
-        macro_weight = 5e17  # Volumetric scaling factor for this simulated tokamak
+        # Shared with the Lawson triple product so both describe the same plasma
+        macro_weight = cfg.MACRO_WEIGHT_REACTOR
 
         total_joules = total_energy_deposited_kev * joules_per_kev * macro_weight
 
@@ -309,21 +314,20 @@ def _jit_lorentz_push(pos, vel, B_vec, E_vec, m, q, dt):
         vel_new = v_plus + q_prime * E_vec
         pos_new = pos + vel_new * dt
 
-    R_new = np.sqrt(pos_new[0]**2 + pos_new[1]**2)
-    Z_new = abs(pos_new[2])
-
-    is_confined = True
-    if R_new < 0.7 or R_new > 1.3 or Z_new > 0.3:
-        is_confined = False
-
-    return pos_new, vel_new, is_confined
+    # No confinement test here. This kernel integrates motion and nothing else; whether a
+    # particle is still inside the plasma is decided exclusively by check_confinement_flux
+    # against the psi = psi_edge surface. The hard-coded box that used to live here
+    # (R < 0.7, R > 1.3, |Z| > 0.3) was a stale second boundary that disagreed with that
+    # surface -- the real one bulges to |Z| ~ 0.35 and R ~ 1.37 -- so it could only ever
+    # report a different answer than the loop it fed.
+    return pos_new, vel_new
 
 
 @njit(fastmath=True)
 def _jit_guiding_center_push(pos, v_parallel, mu, B_vec, grad_B, E_vec, m, q, dt):
     B_mag = np.linalg.norm(B_vec)
     if B_mag == 0:
-        return pos, v_parallel, False
+        return pos, v_parallel
 
     b_unit = B_vec / B_mag
     v_grad_B = (mu / (q * B_mag)) * np.cross(b_unit, grad_B)
@@ -341,14 +345,9 @@ def _jit_guiding_center_push(pos, v_parallel, mu, B_vec, grad_B, E_vec, m, q, dt
     v_total = v_parallel * b_unit + v_drift
 
     pos_new = pos + v_total * dt
-    R_new = np.sqrt(pos_new[0]**2 + pos_new[1]**2)
-    Z_new = abs(pos_new[2])
 
-    is_confined = True
-    if R_new < 0.7 or R_new > 1.3 or Z_new > 0.3:
-        is_confined = False
-
-    return pos_new, v_parallel, is_confined
+    # As in _jit_lorentz_push: motion only. Loss is check_confinement_flux's decision.
+    return pos_new, v_parallel
 
 
 @njit(fastmath=True)
@@ -1156,7 +1155,7 @@ def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
     total_energy_deposited_kev = float(torch.sum(deposited_kev).item())
 
     joules_per_kev = 1.602e-16
-    macro_weight = 5e17
+    macro_weight = cfg.MACRO_WEIGHT_REACTOR   # see config: shared with the Lawson math
     total_joules = total_energy_deposited_kev * joules_per_kev * macro_weight
     power_watts = total_joules / dt
     power_mw = power_watts / 1e6
@@ -1237,6 +1236,79 @@ def compute_flux_thresholds(eq, R0=1.0, a_minor=0.3, n_samples=128):
     return psi_axis, psi_edge, psi_core, psi_grid, R_min, R_max, Z_min, Z_max, nR_psi, nZ_psi
 
 
+def compute_flux_boundary_contour(psi_grid, psi_edge, R_min, R_max, Z_min, Z_max, nR, nZ,
+                                  n_theta=241, n_radial=2000):
+    # The psi = psi_edge contour as a closed (R, Z) polygon -- the SAME surface
+    # check_confinement_flux uses to declare a particle lost, so the plots can draw the
+    # wall where the physics actually puts it instead of at the legacy r = 0.3 circle.
+    #
+    # Traced by ray-marching outward from the magnetic axis rather than by contouring,
+    # which keeps the result ordered by poloidal angle and closed -- exactly the form the
+    # 3D renderer needs to revolve it into a surface of revolution. The psi dome is
+    # star-shaped about its own maximum, so one crossing per ray is well defined.
+    i_ax, j_ax = np.unravel_index(int(np.argmax(psi_grid)), psi_grid.shape)
+    dR = (R_max - R_min) / (nR - 1)
+    dZ = (Z_max - Z_min) / (nZ - 1)
+    R_axis = R_min + i_ax * dR
+    Z_axis = Z_min + j_ax * dZ
+
+    # endpoint=True so the polygon closes on itself for plotting
+    theta = np.linspace(0.0, 2.0 * np.pi, n_theta)
+    r_span = float(max(R_max - R_min, Z_max - Z_min))
+    r_samples = np.linspace(0.0, r_span, n_radial)
+
+    # Evaluate psi on every ray at once: (n_theta, n_radial)
+    RR = R_axis + r_samples[None, :] * np.cos(theta)[:, None]
+    ZZ = Z_axis + r_samples[None, :] * np.sin(theta)[:, None]
+    psi_rays = interpolate_psi_array(
+        np.ascontiguousarray(RR.ravel()), np.ascontiguousarray(ZZ.ravel()),
+        psi_grid, R_min, R_max, Z_min, Z_max, nR, nZ
+    ).reshape(n_theta, n_radial)
+
+    # First sample at or below psi_edge along each ray is the crossing. interpolate_psi
+    # returns 0.0 outside the solver box, which is below psi_edge, so a ray that never
+    # crosses inside the plasma still terminates at the domain edge.
+    below = psi_rays <= psi_edge
+    below[:, -1] = True
+    k_cross = np.argmax(below, axis=1)
+    k_cross = np.maximum(k_cross, 1)
+
+    # Linear interpolation between the bracketing samples for sub-sample accuracy
+    k_prev = k_cross - 1
+    rows = np.arange(n_theta)
+    psi_hi = psi_rays[rows, k_prev]
+    psi_lo = psi_rays[rows, k_cross]
+    r_hi = r_samples[k_prev]
+    r_lo = r_samples[k_cross]
+    denom = psi_hi - psi_lo
+    frac = np.where(np.abs(denom) > 1e-30, (psi_hi - psi_edge) / np.where(denom == 0, 1.0, denom), 0.0)
+    frac = np.clip(frac, 0.0, 1.0)
+    r_edge = r_hi + frac * (r_lo - r_hi)
+
+    R_wall = R_axis + r_edge * np.cos(theta)
+    Z_wall = Z_axis + r_edge * np.sin(theta)
+    return R_wall, Z_wall
+
+
+def compute_plasma_volume(R_wall, Z_wall):
+    # Volume enclosed by revolving the psi_edge contour about the Z axis (Pappus):
+    #     V = 2*pi * R_centroid * A_cross_section
+    # Using the real contour rather than 2*pi^2*R0*a^2 matters -- the flux surface is not
+    # the a = 0.3 circle, and the true volume is ~2.79 m^3 against that formula's 1.78.
+    R = np.asarray(R_wall, dtype=np.float64)
+    Z = np.asarray(Z_wall, dtype=np.float64)
+    if R[0] == R[-1] and Z[0] == Z[-1]:   # drop the duplicated closing vertex
+        R, Z = R[:-1], Z[:-1]
+
+    cross = R * np.roll(Z, -1) - np.roll(R, -1) * Z
+    A_signed = 0.5 * np.sum(cross)
+    if abs(A_signed) < 1e-30:
+        return 0.0
+    # Shoelace area centroid in R
+    R_centroid = np.sum((R + np.roll(R, -1)) * cross) / (6.0 * A_signed)
+    return float(2.0 * np.pi * R_centroid * abs(A_signed))
+
+
 def resample_grid_to(src_grid, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ,
                      dst_R_min, dst_R_max, dst_Z_min, dst_Z_max, dst_nR, dst_nZ):
     # Bilinearly resample a scalar field from the equilibrium's psi grid (60x60) onto the
@@ -1278,9 +1350,34 @@ def compute_poloidal_field_grids(eq, B0, R0=1.0, a_minor=0.3, q_target=2.0,
     B_R_raw = -dpsi_dZ / RR
     B_Z_raw = dpsi_dR / RR
 
-    # Rescale to the target q using a representative (near-edge) magnitude
-    B_pol_mag = np.sqrt(B_R_raw**2 + B_Z_raw**2)
-    B_pol_ref = float(np.percentile(B_pol_mag, 90))
+    # Rescale so that q at the PLASMA edge equals q_target.
+    #
+    # The reference magnitude must be sampled ON the r = a_minor flux surface. The
+    # previous 90th-percentile-over-the-whole-array reference did not: psi is pinned to 0
+    # by Dirichlet conditions on the rectangular solver box (R in [0.5, 1.5], Z in
+    # [-0.5, 0.5]), so |grad psi| -- and hence raw |B_pol| -- is steepest in the vacuum
+    # corridor between the plasma edge and that box, well outside r = a_minor. The 90th
+    # percentile therefore anchored on the SOLVER WALL, measured 1.86x the true edge
+    # value, and scaled the whole poloidal field down by that factor: B_pol(a) came out
+    # 0.97 T instead of 1.80 T, giving q(a) = 3.71 against the configured
+    # Q_SAFETY_TARGET = 2.0.
+    #
+    # Weak B_pol is directly a fast-ion confinement loss: the poloidal Larmor radius
+    # rho_pol = m*v/(q*B_pol) sets the banana-orbit width, so a 1.86x-too-weak B_pol
+    # doubles it. For 3.5 MeV alphas that moved the banana width from 0.150 m to 0.278 m
+    # against a 0.3 m minor radius -- i.e. from marginally confined to barely confined,
+    # and ~19% of alphas were lost to the wall as a result.
+    #
+    # Sampling the ring reproduces the documented q profile: 1.38 on axis rising
+    # monotonically to 2.00 at r = a, with q0 > 1 (kink-stable), as the config intends.
+    B_pol_mag = np.ascontiguousarray(np.sqrt(B_R_raw**2 + B_Z_raw**2))
+    theta_edge = np.linspace(0, 2 * np.pi, 128, endpoint=False)
+    R_edge = np.ascontiguousarray(R0 + a_minor * np.cos(theta_edge))
+    Z_edge = np.ascontiguousarray(a_minor * np.sin(theta_edge))
+    B_pol_edge = interpolate_psi_array(
+        R_edge, Z_edge, B_pol_mag, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ
+    )
+    B_pol_ref = float(np.mean(B_pol_edge))
     B_pol_target = (a_minor / R0) * B0 / q_target
     scale = B_pol_target / max(B_pol_ref, 1e-12)
 

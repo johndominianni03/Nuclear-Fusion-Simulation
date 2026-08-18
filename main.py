@@ -84,20 +84,12 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
 
     return E_arr, B_arr
 
-@njit(parallel=True, fastmath=True)
-def check_confinement(pos_arr, type_arr):
-    N = pos_arr.shape[0]
-    lost = 0
-    for i in prange(N):
-        if type_arr[i] != -1:
-            r = np.sqrt(pos_arr[i, 0]**2 + pos_arr[i, 1]**2)
-            z = pos_arr[i, 2]
-            
-            # Curved flux surface, not a square box: R_0 = 1.0m, a_minor = 0.3m
-            if (r - 1.0)**2 + z**2 > 0.3**2:
-                type_arr[i] = -1
-                lost += 1
-    return lost
+# NOTE: the circular check_confinement (r - 1.0)^2 + z^2 > 0.3^2 that used to live here
+# has been removed. It was a second, disagreeing definition of the plasma boundary: the
+# real last closed flux surface reaches |Z| ~ 0.354 and R ~ 1.386, so the circle cut
+# particles the physics still considered confined. All boundary logic now goes through
+# check_confinement_flux (CPU) / check_confinement_torch (GPU), which test psi against
+# psi_edge and are the only authority on particle loss.
 
 @njit(parallel=True, fastmath=True)
 def apply_vectorized_collisions(vel_arr, type_arr, nu_c, dt):
@@ -175,33 +167,9 @@ def run_hpc_benchmark(cfg):
     diagnostics.plot_hpc_benchmark(cfg.BENCHMARK_PARTICLE_COUNTS, cpu_times, gpu_times)
 
 GPU_PARTICLE_THRESHOLD = 1000000
-# The full-pipeline CPU-vs-GPU crossover was once set at 1,500,000, but that sweep ran
-# the CPU leg on the old allocation-bound Numba push, so the crossover was an artifact of
-# a slow baseline. Re-measured after fixing that kernel (steady state, warmup subtracted):
-#   1,500,001 particles: CPU 269.4 ms/step  vs  GPU 379.2 ms/step  -> CPU wins 1.41x
-#   3,000,000 particles: CPU 525.5 ms/step  vs  GPU 648.7 ms/step  -> CPU wins 1.23x
-# CPU scales linearly across that range, i.e. it is at the memory-bandwidth roof -- and
-# on this SoC both processors share one LPDDR bus (~40-50 GB/s either side), so a
-# GPU-resident pipeline cannot buy bandwidth the CPU lacks while still paying ~18us per
-# Metal dispatch.
-#
-# So _run_reactor_loop_gpu never wins here and is not selected automatically. It is kept
-# working because it is the right structure for a machine with discrete VRAM. Set this to
-# an integer to re-enable the automatic switch and re-test.
+# the threshold at which simulation run shifts from Numba JIT CPU run to PyTorch GPU run 
+# PyTorch GPU run is Apple Metal Performance Shaders on Apple Silicon; CUDA on PC's
 
-# Same story for the isolated push, once set at 25,000: the CPU side was measured against
-# the old kernel, which allocated ~a dozen arrays per particle per step and ran ~40x below
-# the CPU's own bandwidth ceiling -- a measurement of Numba allocation overhead, not of
-# hardware. With that fixed (see vectorized_boris_push_numba_fallback), CPU wins outright
-# at every count this project runs. Push only; the GPU columns include the transfer:
-#
-#         N      CPU/Numba    GPU eager+xfer   GPU dyn-compiled+xfer
-#    10,000       0.105 ms         1.31 ms            1.31 ms
-#    50,000       0.308 ms         1.87 ms            1.43 ms
-#   200,000       0.397 ms          --                2.07 ms
-# 1,000,000       1.964 ms          --               10.81 ms
-# 4,000,000       6.998 ms          --               44.61 ms
-#
 # The push is memory-bound at ~0.85 flop/byte on a shared bus, and going to the device
 # adds a round-trip plus dispatch overhead, so no particle count repays it.
 #
@@ -573,7 +541,18 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         loss_rate = total_lost / t if t > 0 else 1e-5
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
-        lawson_triple_product_history.append(1.0e20 * T_core * tau_E)
+        # --- TRIPLE PRODUCT DENSITY MUST MATCH THE Q-FACTOR NORMALISATION ---
+        # n_e was hardcoded to 1e20 m^-3 here, which had nothing to do with the
+        # macro-particle weight that scales alpha heating into the reactor-scale MW
+        # feeding Q_sci on the panel directly above this one. The two halves of the Week
+        # 22 figure were therefore normalised to different plasmas, and the triple product
+        # came out ~100x low purely from that mismatch.
+        #
+        # Deriving n_e from the same MACRO_WEIGHT_REACTOR and the psi_edge volume makes
+        # the panels describe one plasma. Units are unchanged and already correct:
+        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
+        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT_REACTOR) / cfg.PLASMA_VOLUME_M3
+        lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
         rad_power_history.append(P_rad)
@@ -991,7 +970,18 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         loss_rate = total_lost / t if t > 0 else 1e-5
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
-        lawson_triple_product_history.append(1.0e20 * T_core * tau_E)
+        # --- TRIPLE PRODUCT DENSITY MUST MATCH THE Q-FACTOR NORMALISATION ---
+        # n_e was hardcoded to 1e20 m^-3 here, which had nothing to do with the
+        # macro-particle weight that scales alpha heating into the reactor-scale MW
+        # feeding Q_sci on the panel directly above this one. The two halves of the Week
+        # 22 figure were therefore normalised to different plasmas, and the triple product
+        # came out ~100x low purely from that mismatch.
+        #
+        # Deriving n_e from the same MACRO_WEIGHT_REACTOR and the psi_edge volume makes
+        # the panels describe one plasma. Units are unchanged and already correct:
+        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
+        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT_REACTOR) / cfg.PLASMA_VOLUME_M3
+        lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
         rad_power_history.append(P_rad)
@@ -1201,7 +1191,12 @@ def run_plasma_oscillation_test():
         p_e, v_e = hpc_engine.vectorized_boris_push_metal(pos_tensor, vel_tensor, -cfg.e_charge * cfg.macro_weight, cfg.m_electron * cfg.macro_weight, B_tensor, E_tensor, cfg.osc_dt)
         
         pos_np, vel_np = p_e.cpu().numpy(), v_e.cpu().numpy()
-        check_confinement(pos_np, type_np)
+        # Unified on the psi surface, same as the reactor loop
+        check_confinement_flux(
+            pos_np, type_np, eq.psi_grid, eq.psi_edge,
+            eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max,
+            eq.psi_nR, eq.psi_nZ
+        )
         
         if (step + 1) % 250 == 0:
             print(f"  Step {step+1:04d}/{cfg.osc_num_steps} | W_ES: {w_es:.3e} Joules | E_Z Max: {np.max(np.abs(E_Z_grid)):.2e} V/m")

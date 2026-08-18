@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from visualizer import PlasmaVisualizer
+from physics_engine import interpolate_psi_array
 
 # =======================================================
 # TENSOR SCRUBBERS & NAN HANDLERS (Torch -> Numpy)
@@ -91,15 +92,43 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     Z_axis = np.linspace(cfg.Z_min, cfg.Z_max, cfg.nZ)
     R_mesh, Z_mesh = np.meshgrid(R_axis, Z_axis)
 
-    # The simulation domain is a rectangular solver grid, not the plasma's shape -- the
-    # real boundary is the curved flux surface (R-1.0)^2 + Z^2 = 0.3^2 that
-    # check_confinement uses. These frame the plots below around that geometry instead of
-    # drawing a box around a much smaller region.
+    # The simulation domain is a rectangular solver grid, not the plasma's shape. The real
+    # boundary is the last closed flux surface psi = psi_edge that check_confinement_flux
+    # tests against -- NOT the circle (R-1.0)^2 + Z^2 = 0.3^2 that used to be assumed
+    # here. That circle disagreed with the physics everywhere except the inboard midplane
+    # (the true surface reaches |Z| ~ 0.354 and R ~ 1.386), which is why wall strikes were
+    # drawn outside the wall they had struck.
+    #
+    # eq carries the contour and thresholds from initialization._attach_flux_surfaces.
+    # Falls back to the legacy circle if a caller passes an eq without them.
     TORUS_R0, TORUS_A_MINOR = 1.0, 0.3
-    _confinement_mask = (R_mesh - TORUS_R0)**2 + Z_mesh**2 > TORUS_A_MINOR**2
+    WALL_R = getattr(eq, "wall_R", None)
+    WALL_Z = getattr(eq, "wall_Z", None)
     _view_margin = 0.05
-    VIEW_XLIM = (TORUS_R0 - TORUS_A_MINOR - _view_margin, TORUS_R0 + TORUS_A_MINOR + _view_margin)
-    VIEW_YLIM = (-TORUS_A_MINOR - _view_margin, TORUS_A_MINOR + _view_margin)
+
+    if WALL_R is not None and WALL_Z is not None:
+        _psi_mesh = interpolate_psi_array(
+            np.ascontiguousarray(R_mesh.ravel().astype(np.float64)),
+            np.ascontiguousarray(Z_mesh.ravel().astype(np.float64)),
+            eq.psi_grid, eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max,
+            eq.psi_nR, eq.psi_nZ
+        ).reshape(R_mesh.shape)
+        # Outside the last closed flux surface == outside the plasma
+        _confinement_mask = _psi_mesh <= eq.psi_edge
+        VIEW_XLIM = (float(WALL_R.min()) - _view_margin, float(WALL_R.max()) + _view_margin)
+        VIEW_YLIM = (float(WALL_Z.min()) - _view_margin, float(WALL_Z.max()) + _view_margin)
+    else:
+        _confinement_mask = (R_mesh - TORUS_R0)**2 + Z_mesh**2 > TORUS_A_MINOR**2
+        VIEW_XLIM = (TORUS_R0 - TORUS_A_MINOR - _view_margin, TORUS_R0 + TORUS_A_MINOR + _view_margin)
+        VIEW_YLIM = (-TORUS_A_MINOR - _view_margin, TORUS_A_MINOR + _view_margin)
+
+    def _draw_wall(axis, label=None):
+        # One shared helper so every poloidal plot marks the same boundary.
+        if WALL_R is None or WALL_Z is None:
+            return
+        axis.plot(WALL_R, WALL_Z, color='white', linewidth=2.6, alpha=0.9, zorder=6)
+        axis.plot(WALL_R, WALL_Z, color='black', linewidth=1.2, alpha=0.85, zorder=7,
+                  linestyle='--', label=label)
 
     # --- 1. 2D CHARGE DENSITY MAP (percentile clipped) ---
     plt.figure(figsize=(7, 6))
@@ -113,6 +142,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.title("Week 11: Poloidal Charge Density Distribution (CIC)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
+    _draw_wall(plt.gca())
     plt.xlim(*VIEW_XLIM)
     plt.ylim(*VIEW_YLIM)
     plt.gca().set_aspect('equal')
@@ -133,6 +163,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.title("Week 11: Self-Consistent Potential Field (Poisson Solver)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
+    _draw_wall(plt.gca())
     plt.xlim(*VIEW_XLIM)
     plt.ylim(*VIEW_YLIM)
     plt.gca().set_aspect('equal')
@@ -159,10 +190,23 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     fig, ax = plt.subplots(figsize=(8, 8))
     eq.plot_equilibrium(ax=ax)
     
-    for p in active_particles:
+    # --- DRAW ORDER: LOST TRACES FIRST, SO THEY RENDER BEHIND THE CORE ---
+    # A lost fast ion is sampled every ALPHA_HISTORY_EVERY steps and traces a wide
+    # gyro-orbit on its way out, so each carries ~10x the vertices of a thermal track.
+    # Drawn last they composite over everything, and a couple of hundred of them were
+    # enough to bury thousands of confined blue/gold traces -- the plasma read as wiped
+    # out when >99% of it was in fact confined. Sorting lost first puts that ink at the
+    # back of the z-order in both this plot and the 3D view (cartesian_dfs is built in
+    # this same loop, so the two stay in lockstep).
+    #
+    # This reorders the list only. Every particle still contributes exactly one entry,
+    # and classifications[i] still pairs with cartesian_dfs[i].
+    _ordered_particles = sorted(active_particles, key=lambda p: 0 if p["status"] == "lost" else 1)
+
+    for p in _ordered_particles:
         traj = p["history"]
         if len(traj) < 2: continue
-            
+
         # Colour by FATE first, species second. Keying off p["type"] alone (which only
         # holds the species) left the crimson arm unreachable, so no wall strike was ever
         # drawn in red.
@@ -175,28 +219,34 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         Z_path = traj[:, 2]
 
         if lost:
-            ax.plot(R_path, Z_path, color='crimson', alpha=0.45, linewidth=0.9)
-            ax.plot(R_path[-1], Z_path[-1], marker='x', color='crimson', markersize=5, alpha=0.8)
+            ax.plot(R_path, Z_path, color='crimson', alpha=0.30, linewidth=0.7, zorder=1)
+            ax.plot(R_path[-1], Z_path[-1], marker='x', color='crimson', markersize=5, alpha=0.8, zorder=2)
         elif p["type"] == 1:
-            ax.plot(R_path, Z_path, color='gold', alpha=0.7, linewidth=1.2)
+            ax.plot(R_path, Z_path, color='gold', alpha=0.7, linewidth=1.2, zorder=4)
         else:
-            ax.plot(R_path, Z_path, color='dodgerblue', alpha=0.2, linewidth=0.8)
+            ax.plot(R_path, Z_path, color='dodgerblue', alpha=0.2, linewidth=0.8, zorder=3)
 
     # Framed to the curved confinement boundary, not the full solver grid
+    _draw_wall(ax)
     ax.set_xlim(*VIEW_XLIM)
     ax.set_ylim(*VIEW_YLIM)
     ax.set_aspect('equal')
-    
+
     ax.set_title("Week 11: Steady-State Reactor with Self-Consistent PIC")
     ax.set_xlabel("Major Radius R (m)")
     ax.set_ylabel("Height Z (m)")
-    
+
     custom_lines = [
         Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions (Injected)'),
         Line2D([0], [0], color='dodgerblue', lw=2, label='1 keV Thermal Core Plasma'),
-        Line2D([0], [0], color='crimson', lw=2, label='Particles Lost to Divertor Wall')
+        Line2D([0], [0], color='crimson', lw=2, label='Particles Lost to Divertor Wall'),
+        Line2D([0], [0], color='black', lw=1.4, linestyle='--',
+               label='Last Closed Flux Surface ($\\psi_{edge}$)')
     ]
-    ax.legend(handles=custom_lines, loc='upper right')
+    # zorder above the wall (6/7) and the traces, or the flux-surface line is drawn
+    # straight through the legend text now that the view is framed to the taller surface
+    _leg = ax.legend(handles=custom_lines, loc='upper right', framealpha=0.95)
+    _leg.set_zorder(20)
     plt.grid(True, alpha=0.3)
     plt.savefig("tokamak_reactor_2d.png", dpi=300)
     plt.show()
@@ -363,6 +413,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
                     classifications.append(2)
 
         # Framed to the actual curved confinement boundary, not the full rectangular solver grid.
+        _draw_wall(ax)
         ax.set_xlim(*VIEW_XLIM)
         ax.set_ylim(*VIEW_YLIM)
         ax.set_aspect('equal')
@@ -376,8 +427,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
             Line2D([0], [0], color='cyan', lw=2, label='Thermal Background Ion'),
             Line2D([0], [0], color='orange', lw=2, label='50 keV NBI Fast Ion')
         ]
-        ax.legend(handles=custom_lines, loc='upper right')
-        
+        _leg_a = ax.legend(handles=custom_lines, loc='upper right', framealpha=0.95)
+        _leg_a.set_zorder(20)
+
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig("alpha_orbits.png", dpi=300)
@@ -388,7 +440,11 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     print("--- RENDERING 3D STEADY-STATE TOKAMAK ---")
     try:
         viz = PlasmaVisualizer(cartesian_dfs)
-        viz.plot_3d_trajectory(output_file="tokamak_reactor_3d.png", classifications=classifications)
+        # Hand the 3D view the same psi_edge surface the 2D plots and the loss test use,
+        # so the vessel it draws is the boundary particles are actually flagged against.
+        _wall = (WALL_R, WALL_Z) if (WALL_R is not None and WALL_Z is not None) else None
+        viz.plot_3d_trajectory(output_file="tokamak_reactor_3d.png",
+                               classifications=classifications, wall_contour=_wall)
     except Exception as e:
         print(f"[WARNING] Skipping 3D visualization due to missing dependency or window issue: {e}")
 

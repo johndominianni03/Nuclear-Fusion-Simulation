@@ -151,6 +151,24 @@ class SimulationConfiguration:
         # stops heating
         self.THERMALIZATION_ENERGY_KEV = 15.0
 
+        # How many real ions each simulated macro-particle stands in for.
+        #
+        # SINGLE SOURCE OF TRUTH -- this was previously a bare 5e17 literal inside
+        # compute_alpha_heating_power (and its torch twin), used only to scale alpha
+        # heating into reactor-scale MW. The Lawson triple product meanwhile hardcoded a
+        # completely unrelated n_e = 1e20 m^-3. The two Week 22 panels were therefore
+        # describing different plasmas: the Q panel's normalisation implies
+        #   n_e = confined_macro_particles * MACRO_WEIGHT_REACTOR / PLASMA_VOLUME_M3
+        #       ~ 56,000 * 5e17 / 2.79  ~  1.0e22 m^-3,
+        # i.e. ~100x the density the triple product was assuming, which is exactly the
+        # two-decade shortfall seen on the bottom graph. Both now derive from this value.
+        self.MACRO_WEIGHT_REACTOR = 5e17
+
+        # Confined plasma volume (m^3). Filled in at runtime by revolving the actual
+        # psi = psi_edge flux surface (physics_engine.compute_plasma_volume); the value
+        # here is the circular-torus estimate 2*pi^2*R0*a^2 used only as a fallback.
+        self.PLASMA_VOLUME_M3 = 2.0 * np.pi**2 * self.R0_major * (0.3 ** 2)
+
         # ==========================================
         # RADIATION LOSS MODELS
         # ==========================================
