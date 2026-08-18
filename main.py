@@ -463,9 +463,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             cfg.SPI_TRIGGERED = True
             trigger_time = t
             T_core_baseline = T_core_kinetic
-            print(f"  [EMERGENCY] Magnetic Island exceeded {cfg.MAX_ISLAND_WIDTH_THRESHOLD*100}% minor radius!")
-            print(f"  [SYSTEM] Firing Shattered Pellet Injection (SPI) at t={t*1000:.2f} ms...")
-            print(f"  [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
+            print(f" [EMERGENCY] Magnetic Island exceeded {cfg.MAX_ISLAND_WIDTH_THRESHOLD*100}% minor radius!")
+            print(f" [SYSTEM] Firing Shattered Pellet Injection (SPI) at t={t*1000:.2f} ms...")
+            print(f" [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
 
         # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
         # Post-trigger T_core used to come from trigger_thermal_quench()'s analytic
