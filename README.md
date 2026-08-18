@@ -1,66 +1,30 @@
-# Hardware-Adaptive Tokamak Plasma PIC (Particle-In-Cell) Simulation
-
-> A 26-week High-Performance Computing (HPC) physics engine simulating multi-particle plasma dynamics, magnetic confinement, and D-T fusion ignition criteria.
-
-## Overview
-This project is a custom-built Particle-In-Cell (PIC) Tokamak reactor simulation. It models the complex kinetic behaviors of multi-species plasmas—including 1 keV Thermal Ions, 50 keV Neutral Beam Injection (NBI) Fast Ions, and 3.5 MeV Alpha particles—within a self-consistent Grad-Shafranov magnetic equilibrium. 
-
-Crucially, the simulation features a **hardware-adaptive hybrid backend**. It dynamically routes compute workloads between a highly multi-threaded CPU path (pure NumPy/Numba) and a massive GPU path (PyTorch via Apple Metal MPS or NVIDIA CUDA) based on real-time particle counts, thermal limitations, and memory bandwidth profiling.
-
----
-
-## Development Timeline & Physics Explanations
-
-### Phase I: Single Particle Kinematics & Boundaries
-* **Part 1:** Grad-Shafranov Grid Initialization & Field Interpolation. *(The Grad-Shafranov equation maps the steady-state magnetic flux surfaces, establishing the foundational magnetic equilibrium for the tokamak).*
-* **Part 2:** 3D Guiding Center / Boris Particle Pusher. *(The Boris algorithm is a symplectic numerical integrator used to solve the Lorentz force equations, implemented to accurately conserve energy and phase-space volume over long simulations, i.e. keeping the simulation as accurate as possible).*
-* **Part 3:** Numba JIT Acceleration & NumPy Vectorization. *(performs the calculations of the main loop using Numba JIT (Just-In-Time) by converting the Python code into C code, allowing the simulation to run faster. Numba is used for running the simulation on the CPU -- better for smaller sample sizes of particles.
-* **Part 4:** Maxwellian Thermal Tails & Divertor Wall-Loss Metrics. *(Initializes the thermal core plasma using a Maxwell-Boltzmann velocity distribution, accounting for statistical high-energy "tails").*
-
-### Phase II: Plasma Collisionality & External Heating
-* **Part 5:** Monte Carlo Coulomb Collisions (Pitch-Angle Scattering).
-* **Part 6:** Magnetic Trapping & Banana Orbit Diagnostics. *(The 1/R decay of the toroidal magnetic field creates a magnetic mirror effect, trapping specific particles on the outboard side of the torus and creating clearly defined "banana-shaped" drift trajectories (mirroring is the vertical bouncing of the particles)).*
-* **Part 7:** External Heating Models (Neutral Beam Injection - NBI). *(Simulates the injection of high-energy neutral atoms that penetrate the magnetic field before ionizing and transferring their kinetic energy to the bulk plasma). This is what actually causes fusion to take place, as the NBI Particles heat up the plasma to fusion temperatures.*
-* **Part 8:** Refactoring.
-
-### Phase III: Self-Consistent Electromagnetic Fields (PIC)
-* **Part 9:** Charge Density Mapping (Particle-to-Grid Weighting). *(Maps the actual densities/clustering of plasma particles/charges)*
-* **Part 10:** Poisson’s Equation Solver (Electric Field Generation). *(Maps the electric field potential of the plasma)*
-* **Part 11:** Particle-in-Cell (PIC) Integration. *(Particles are weighted to a spatial grid to map localized charge density rho, allowing the Poisson solver to dynamically calculate the self-consistent electrostatic potential $\phi$ at each timestep).*
-* **Part 12:** Debye Shielding & Plasma Oscillations. *(Demonstrates the plasma's natural tendency to shield electric charges, validated by electrostatic energy ringing perfectly at $2f_{pe}$, or twice the plasma frequency).*
-
-### Phase IV: Magnetohydrodynamics (MHD) & Instabilities
-* **Part 13:** Fluid Approximations (Density & Pressure Profiles).
-* **Part 14:** The Vlasov Equation & Kinetic-Fluid Bridging.
-* **Part 15:** Simulating Plasma Instabilities (e.g., Sawtooth / Tearing Modes). *(Models magnetohydrodynamic instabilities, such as the $m=2, n=1$ tearing mode, which creates magnetic islands and disrupts confinement).*
-* **Part 16:** Disruption Mitigation Diagnostics. *(Models Shattered Pellet Injection (SPI), where rapid injection of material causes a controlled thermal quench to radiate away energy and protect the reactor walls).*
-
-### Phase V: Nuclear Reaction Dynamics
-* **Part 17:** D-T Fusion Cross-Section Algorithms. *(Models the quantum tunneling probability of Deuterium-Tritium fusion, successfully capturing the resonance peak at ~8.6 keV center-of-mass collision energy).*
-* **Part 18:** Reactivity Matrices & Volumetric Fusion Rates.
-* **Part 19:** Alpha Particle Generation & Birth Trajectories (3.5 MeV).
-* **Part 20:** Alpha Heating (Self-Sustaining Ignition Metrics). *(Tracks the transition into a "Burning Plasma" regime, strictly defined as the threshold where internal 3.5 MeV alpha self-heating officially exceeds external auxiliary heating).*
-
-### Phase VI: Advanced Reactor Engineering & HPC Polish
-* **Part 21:** Bremsstrahlung & Cyclotron Radiation Loss Models.
-* **Part 22:** The Lawson Criterion & Q-Factor Calculation. *(Accurately calculates both Scientific Gain $Q_{sci}$ and Engineering Gain $Q_{eng}$. The simulation mathematically respects thermodynamics by forcing $Q_{eng}$ to be lower than $Q_{sci}$ due to heating system inefficiencies and thermal-to-electric conversion losses).*
-* **Part 23:** Multi-Core Processing & Universal GPU Acceleration (Numba/MPS/CUDA).
-
----
-
-## HPC Architecture & Hardware Scaling
-The physics engine is designed around the fundamental HPC principle of **Arithmetic Intensity**. Because the Boris particle push relies on heavy data movement ($\sim 72$ bytes per particle) but minimal floating-point operations ($\sim 40$ FLOPs, for a ratio of 0.55 FLOPs/byte), the simulation is strictly **memory-bandwidth bound**, not compute-bound.
-
-To maximize throughput across completely different silicon architectures, the engine utilizes dynamic dispatch thresholds:
-* **CPU Path (Numba `prange`):** Used for standard runs. Utilizes 100% of available CPU cores with zero Python interpreter overhead to bypass GPU dispatch tolls entirely.
-* **GPU Path (PyTorch MPS/CUDA):** Used for massive array processing. Bypasses the CPU to load multi-gigabyte tensors directly into unified memory or discrete VRAM to saturate massive memory pipelines.
-
-
----
-
-## Installation & Usage
-
-### 1. Clone the Repository
-```bash
-git clone [https://github.com/johndominianni03/Nuclear-Fusion-Simulation.git](https://github.com/johndominianni03/Nuclear-Fusion-Simulation.git)
-cd Nuclear-Fusion-Simulation
+Development Timeline & Physics Explanations
+Phase I: Single Particle Kinematics & Boundaries
+Part 1: Grad-Shafranov Grid Initialization & Field Interpolation. The Grad-Shafranov equation maps the steady-state magnetic flux surfaces of the reactor. This is included to establish the foundational magnetic equilibrium, shaping the plasma into a realistic, stable "D-shape" torus rather than a simple, unphysical cylinder.
+Part 2: 3D Guiding Center / Boris Particle Pusher. Standard movement algorithms gradually add artificial energy to simulations, causing the virtual particles to artificially speed up and ruin the data. The Boris algorithm is implemented because it is a symplectic integrator; it strictly conserves energy and phase-space volume, allowing the simulation to remain perfectly stable and physically accurate across millions of computational steps.
+Part 3: Numba JIT Acceleration & NumPy Vectorization. Python is inherently too slow for multi-particle physics. This optimization compiles the main loops into raw C code Just-In-Time (JIT), unlocking massive data parallelism on the CPU to handle complex particle tracking without bottlenecking the system.
+Part 4: Maxwellian Thermal Tails & Divertor Wall-Loss Metrics. Plasmas do not operate at one uniform temperature. This module initializes the core plasma using a statistical Maxwell-Boltzmann distribution to account for high-energy "tails." This is vital because these rare, ultra-fast outlier particles are the ones most likely to overcome the Coulomb barrier and actually fuse.
+Phase II: Plasma Collisionality & External Heating
+Part 5: Monte Carlo Coulomb Collisions (Pitch-Angle Scattering). In reality, charged particles constantly deflect off one another's electric fields. This module introduces randomized scattering, which is essential for modeling realistic confinement degradation as particles knock each other off their ideal orbits and into the reactor walls.
+Part 6: Magnetic Trapping & Banana Orbit Diagnostics. Because a tokamak's magnetic field decays over a 1/R distance, it creates a "magnetic mirror" effect. Particles on the outer edge of the torus get bounced back and forth by the tightening magnetic field, creating clearly defined "banana-shaped" trajectories. Modeling this is crucial for understanding how certain particles remain trapped instead of flowing smoothly around the ring.
+Part 7: External Heating Models (Neutral Beam Injection - NBI). You cannot use magnets to push more heat into a magnetic cage. This module simulates shooting high-energy neutral atoms (which ignore magnetic fields) straight into the core. Once inside, they ionize, become trapped, and violently collide with the bulk plasma, successfully raising the core temperature to fusion-ready levels.
+Part 8: Codebase Refactoring & Energy Conservation Audits. A structural milestone to clean the architecture, remove redundant code, and verify that no energy is being artificially created or destroyed during the complex heating phases.
+Phase III: Self-Consistent Electromagnetic Fields (PIC)
+Part 9: Charge Density Mapping (Particle-to-Grid Weighting). Rather than calculating the electric field between every single millions of particles (which would crash any computer), this module maps the discrete particles to a continuous spatial grid to efficiently locate where electrical charge is pooling up.
+Part 10: Poisson’s Equation Solver (Electric Field Generation). Once the charge density grid is established, this solver translates those localized clusters of charge into a macroscopic electric field, mapping exactly how the plasma's own energy is warping the space inside the reactor.
+Part 11: Particle-in-Cell (PIC) Integration. This ties the entire loop together. Particles move and create charge -> the charge creates an electric field -> the electric field pushes back on the particles. This makes the simulation "self-consistent," meaning the plasma dynamically reacts to its own internal forces.
+Part 12: Debye Shielding & Plasma Oscillations. Demonstrates the plasma's natural tendency to rearrange its electrons to instantly cancel out rogue electric charges, preventing internal electric fields from tearing the confinement apart.
+Phase IV: Magnetohydrodynamics (MHD) & Instabilities
+Part 13: Fluid Approximations (Density & Pressure Profiles). While tracking individual particles is great for micro-physics, reactors are ultimately governed by macro-physics. This module models the bulk plasma as a continuous, compressible fluid to analyze global pressure gradients.
+Part 14: The Vlasov Equation & Kinetic-Fluid Bridging. This acts as the translation layer between the micro-scale particle tracking and the macro-scale fluid dynamics, ensuring both models mathematically agree and do not contradict each other as the simulation evolves.
+Part 15: Simulating Plasma Instabilities (e.g., Sawtooth / Tearing Modes). Plasmas are chaotic and actively fight confinement. This module introduces magnetohydrodynamic instabilities (such as magnetic islands) which act as "potholes" in the magnetic field, forcing the simulation to deal with realistic energy bleed-out and structural disruptions.
+Part 16: Disruption Mitigation Diagnostics. When a plasma loses control, it can melt the physical reactor walls. This module acts as the emergency brake, simulating Shattered Pellet Injection (SPI) to rapidly introduce heavy materials, forcing a controlled thermal quench to safely radiate away the energy before a catastrophic impact.
+Phase V: Nuclear Reaction Dynamics
+Part 17: D-T Fusion Cross-Section Algorithms. Particles naturally repel each other and shouldn't fuse. This module calculates the quantum tunneling probability of Deuterium and Tritium, mathematically allowing particles with enough speed to "cheat" the repulsion barrier and successfully fuse together.
+Part 18: Reactivity Matrices & Volumetric Fusion Rates. This scales the individual quantum fusion probabilities up to a macroscopic level, calculating exactly how many megawatts of fusion power are being generated per cubic meter of the reactor in real-time.
+Part 19: Alpha Particle Generation & Birth Trajectories. When D-T fusion occurs, it leaves behind a Helium nucleus (an Alpha particle). This module spawns these new particles dynamically at a massive 3.5 MeV of kinetic energy and tracks their extreme, wide-looping birth trajectories.
+Part 20: Alpha Heating (Self-Sustaining Ignition Metrics). This is the holy grail of nuclear fusion. This module tracks the exact threshold where the internal heat generated by the newly born Alpha particles completely overtakes the external NBI heating, officially achieving a self-sustaining "Burning Plasma" state.
+Phase VI: Advanced Reactor Engineering & HPC Polish
+Part 21: Bremsstrahlung & Cyclotron Radiation Loss Models. Plasmas glow and emit massive amounts of X-rays and microwave radiation, bleeding off heat. This module continuously subtracts this radiated thermal energy, preventing the simulation from artificially overheating and enforcing realistic thermodynamic limits.
+Part 22: The Lawson Criterion & Q-Factor Calculation. The final scorecard for the reactor. It mathematically balances the heat generated against the energy lost, calculating both the Scientific Gain and the Engineering Gain. It strictly enforces realistic system inefficiencies (like thermal-to-electric conversion losses) to prove whether the reactor is truly generating net-positive power.
+Part 23: Multi-Core Processing & Universal GPU Acceleration. Dynamically bypasses CPU limitations. By routing memory-heavy array workloads directly to PyTorch CUDA or Apple Metal Performance Shaders (Apple MPS), the engine completely saturates discrete GPU VRAM pipelines, dropping processing times from minutes down to seconds for massive particle counts.
