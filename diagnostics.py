@@ -232,7 +232,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     ax.set_ylim(*VIEW_YLIM)
     ax.set_aspect('equal')
 
-    ax.set_title("Week 11: Steady-State Reactor with Self-Consistent PIC")
+    ax.set_title("Steady-State Reactor with Self-Consistent PIC")
     ax.set_xlabel("Major Radius R (m)")
     ax.set_ylabel("Height Z (m)")
 
@@ -339,7 +339,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
     # --- ALPHA PARTICLE TRAJECTORIES ---
     if alpha_particles is not None and len(alpha_particles) > 0:
-        print("--- RENDERING WEEK 19 ALPHA ORBITS ---")
+        print("--- RENDERING ALPHA ORBITS ---")
         fig, ax = plt.subplots(figsize=(8, 8))
         eq.plot_equilibrium(ax=ax)
 
@@ -502,7 +502,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         ax1.axhline(1.0, color='gold', linestyle='-', linewidth=2, label='Break-Even (Q=1)')
         ax1.fill_between(time_array, q_sci_history, 1.0, where=(q_sci_history >= 1.0), interpolate=True, color='lightgreen', alpha=0.2)
                          
-        ax1.set_title("Week 22: Reactor Performance & Gain (Q-Factors)")
+        ax1.set_title("Reactor Performance & Gain (Q-Factors)")
         ax1.set_ylabel("Gain Factor (Q)")
         ax1.grid(True, linestyle=':', alpha=0.6)
         ax1.legend(loc='upper left')
@@ -572,7 +572,7 @@ def plot_disruption_mitigation(time_history, temp_history, rad_power_history, tr
     if trigger_time is not None:
         ax1.axvline(x=trigger_time * 1000, color='black', linestyle='--', label='SPI Triggered')
         
-    ax1.set_title("Week 16: Active Disruption Mitigation (Shattered Pellet Injection)")
+    ax1.set_title("Active Disruption Mitigation (Shattered Pellet Injection)")
     ax1.set_ylabel("Core Temperature (keV)")
     ax1.grid(True, linestyle=':', alpha=0.6)
     ax1.legend(loc='upper right')
