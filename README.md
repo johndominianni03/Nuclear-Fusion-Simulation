@@ -16,9 +16,10 @@ HOW TO USE
 3. Run the simulation
      python main.py
 4. Toggling between Numba JIT and PyTorch for running the simulation
-   Adjust the GPU_PARTICLE_THRESHOLD variable in config.py
-   any initial particle count >= the threshold will trigger PyTorch
-   any initial particle count < the threshold will trigger Numba JIT
+   Adjust the initial_thermal_particle_count in config.py
+   Adjust the GPU_PARTICLE_THRESHOLD variable in main.py
+      any initial particle count >= the threshold will trigger PyTorch
+      any initial particle count < the threshold will trigger Numba JIT
 
 
 
