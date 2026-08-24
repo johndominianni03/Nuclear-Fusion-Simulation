@@ -1,3 +1,29 @@
+HOW TO USE
+1. Clone the Repository
+   - NOTE: It is STRONGLY RECOMMENDED to run the simulation in a virtual environment
+    git clone https://github.com/johndominianni03/Nuclear-Fusion-Simulation.git
+    cd Nuclear-Fusion-Simulation
+2. Set up the Environment
+   - For Mac/Linux (Mac uses Apple Metal Performance Shaders for PyTorch)
+     python3.9 -m venv venv
+     source venv/bin/activate
+     pip install -r requirements.txt
+   - For Windows (Windows uses NVIDIA CUDA for PyTorch)
+     python -m venv venv
+     venv\Scripts\activate
+     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+     pip install numba numpy pandas matplotlib scipy
+3. Run the simulation
+     python main.py
+4. Toggling between Numba JIT and PyTorch for running the simulation
+   Adjust the GPU_PARTICLE_THRESHOLD variable in config.py
+   any initial particle count >= the threshold will trigger PyTorch
+   any initial particle count < the threshold will trigger Numba JIT
+
+
+
+
+
 Development Timeline & Physics Explanations
 
 Phase I: Single Particle Kinematics & Boundaries
