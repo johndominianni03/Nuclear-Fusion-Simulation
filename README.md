@@ -1,3 +1,30 @@
+HOW TO USE
+1. Clone the Repository
+   - NOTE: It is STRONGLY RECOMMENDED to run the simulation in a virtual environment
+    git clone https://github.com/johndominianni03/Nuclear-Fusion-Simulation.git
+    cd Nuclear-Fusion-Simulation
+2. Set up the Environment
+   - For Mac/Linux (Mac uses Apple Metal Performance Shaders for PyTorch)
+     python3.9 -m venv venv
+     source venv/bin/activate
+     pip install -r requirements.txt
+   - For Windows (Windows uses NVIDIA CUDA for PyTorch)
+     python -m venv venv
+     venv\Scripts\activate
+     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+     pip install numba numpy pandas matplotlib scipy
+3. Run the simulation
+     python main.py
+4. Toggling between Numba JIT and PyTorch for running the simulation
+   Adjust the initial_thermal_particle_count in config.py
+   Adjust the GPU_PARTICLE_THRESHOLD variable in main.py
+      any initial particle count >= the threshold will trigger PyTorch
+      any initial particle count < the threshold will trigger Numba JIT
+
+
+IMPORTANT: One of the most beneficial features of the simulation is that the simulation's performance scales with the hardware of the user. For those with more powerful CPU's, the simulation will run and finish faster when toggling on Numba JIT as opposed to slower CPU's. For those with powerful GPU's, the simulation will run and finish far faster than those with slower GPU's. Furthermore, the PyTorch simulation run will almost universally perform better on Windows as opposed to Mac, as even with high-end Macs, the unified chip means that the calculations/simulation cannot be fully offloaded to the GPU, whereas on Windows PC's, the simulation is fully offloaded to the GPU as PC's have a discrete GPU -- meaning it is completely separate from the CPU due to the PC's non-unified architecture. For those using Macs, the PyTorch model runs far faster on models with a higher memory bus/throughput (measured in GB/s).
+
+
 Development Timeline & Physics Explanations
 
 Phase I: Single Particle Kinematics & Boundaries
