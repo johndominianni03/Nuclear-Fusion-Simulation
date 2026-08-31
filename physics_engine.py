@@ -54,7 +54,7 @@ class ParticlePusher:
         )
         return rho_grid
         
-    def solve_fields(self, rho_grid, R_min, R_max, Z_min, Z_max, phi_init=None):
+    def solve_fields(self, rho_grid, R_min, R_max, Z_min, Z_max, phi_init=None, return_iters=False):
         nR, nZ = rho_grid.shape
         dR = (R_max - R_min) / (nR - 1)
         dZ = (Z_max - Z_min) / (nZ - 1)
@@ -64,8 +64,12 @@ class ParticlePusher:
         if phi_init is None:
             phi_init = np.zeros((nR, nZ), dtype=np.float64)
 
-        phi = solve_poisson_sor_cylindrical(rho_grid, R_min, R_max, Z_min, Z_max, phi_init)
+        phi, sor_iters = solve_poisson_sor_cylindrical(rho_grid, R_min, R_max, Z_min, Z_max, phi_init)
         E_R, E_Z = compute_electric_field(phi, dR, dZ)
+        # Default return shape is unchanged for every existing caller;
+        # return_iters is opt-in for the profiler.
+        if return_iters:
+            return phi, E_R, E_Z, sor_iters
         return phi, E_R, E_Z
 
     def inject_neutral_beam(self, num_ions, E_keV=50.0, R_target=1.05, Z_target=0.0):
@@ -467,7 +471,10 @@ def solve_poisson_sor_cylindrical(rho, R_min, R_max, Z_min, Z_max, phi_init, max
                 if diff > max_diff: max_diff = diff
                     
         if max_diff < tol: break
-    return phi
+    # Iteration count is returned so a profiled run can tell a warm-started
+    # solve that exits in a handful of sweeps from one pinned at max_iter.
+    # Diagnostic only -- phi is bit-for-bit what it always was.
+    return phi, it + 1
 
 
 @njit(fastmath=True)
@@ -522,6 +529,69 @@ def gather_electric_field(pos, E_R_grid, E_Z_grid, R_min, R_max, Z_min, Z_max, n
     ey = er * np.sin(phi_p)
     
     return np.array([ex, ey, ez], dtype=np.float64)
+
+
+@njit(fastmath=True)
+def gather_electric_field_scalar(px, py, pz, E_R_grid, E_Z_grid,
+                                 R_min, R_max, Z_min, Z_max, nR, nZ,
+                                 cos_phi, sin_phi):
+    """Scalar, allocation-free twin of gather_electric_field.
+
+    Same bilinear gather and the same cylindrical -> Cartesian rotation, but
+    it returns a 3-tuple of floats instead of a freshly allocated 3-element
+    array. Called once per particle per step from the prange loop in
+    main.vectorized_gather_and_B, that allocation was the dominant cost of
+    the stage -- and an array return keeps numba from vectorizing the loop.
+
+    cos_phi / sin_phi are passed in rather than derived from an arctan2 here:
+    the caller already needs phi to build the toroidal and poloidal B, so the
+    sqrt and arctan2 are computed once per particle and shared.
+
+    Arithmetic is float32 throughout, matching the caller's E_arr/B_arr, so
+    storing a result costs no per-element downcast.
+
+    gather_electric_field is deliberately left in place unchanged: main.py
+    imports it directly, and it remains the reference for this one.
+    """
+    r_p = np.float32(np.sqrt(px * px + py * py))
+    z_p = np.float32(pz)
+
+    zero = np.float32(0.0)
+    if r_p < R_min or r_p > R_max or z_p < Z_min or z_p > Z_max:
+        return zero, zero, zero
+
+    dR = np.float32((R_max - R_min) / (nR - 1))
+    dZ = np.float32((Z_max - Z_min) / (nZ - 1))
+
+    r_idx = (r_p - np.float32(R_min)) / dR
+    z_idx = (z_p - np.float32(Z_min)) / dZ
+
+    i = int(np.floor(r_idx))
+    j = int(np.floor(z_idx))
+
+    if i >= nR - 1 or j >= nZ - 1 or i < 0 or j < 0:
+        return zero, zero, zero
+
+    wR = r_idx - np.float32(i)
+    wZ = z_idx - np.float32(j)
+    one = np.float32(1.0)
+
+    w00 = (one - wR) * (one - wZ)
+    w10 = wR * (one - wZ)
+    w01 = (one - wR) * wZ
+    w11 = wR * wZ
+
+    er = (np.float32(E_R_grid[i, j]) * w00 +
+          np.float32(E_R_grid[i + 1, j]) * w10 +
+          np.float32(E_R_grid[i, j + 1]) * w01 +
+          np.float32(E_R_grid[i + 1, j + 1]) * w11)
+
+    ez = (np.float32(E_Z_grid[i, j]) * w00 +
+          np.float32(E_Z_grid[i + 1, j]) * w10 +
+          np.float32(E_Z_grid[i, j + 1]) * w01 +
+          np.float32(E_Z_grid[i + 1, j + 1]) * w11)
+
+    return er * cos_phi, er * sin_phi, ez
 
 
 @njit(fastmath=True)

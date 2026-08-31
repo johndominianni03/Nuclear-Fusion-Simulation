@@ -1,9 +1,32 @@
+import os
+
+import matplotlib
+
+# --- Headless mode ---------------------------------------------------------
+# Set FUSION_HEADLESS=1 to run without an interactive display (CI, batch runs,
+# automated tests). matplotlib.use() must be called before pyplot is imported,
+# so this block stays above the pyplot import below. Every savefig() still runs
+# in headless mode; only the blocking show() is suppressed.
+_HEADLESS_OFF = {"", "0", "false", "no", "off"}
+FUSION_HEADLESS = os.environ.get("FUSION_HEADLESS", "").strip().lower() not in _HEADLESS_OFF
+
+if FUSION_HEADLESS:
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from visualizer import PlasmaVisualizer
 from physics_engine import interpolate_psi_array
+
+
+def _show():
+    """plt.show(), or a no-op under FUSION_HEADLESS so runs never block."""
+    if FUSION_HEADLESS:
+        return
+    plt.show()
+
 
 # =======================================================
 # TENSOR SCRUBBERS & NAN HANDLERS (Torch -> Numpy)
@@ -59,7 +82,8 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
     plt.legend(loc='upper left')
     plt.tight_layout()
     plt.savefig("benchmark_scaling.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
@@ -149,7 +173,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.grid(True, linestyle=':', alpha=0.5)
     plt.tight_layout()
     plt.savefig("charge_density_map.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
     # --- ELECTROSTATIC POTENTIAL MAP (percentile clipped) ---
     plt.figure(figsize=(7, 6))
@@ -170,7 +195,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.grid(True, linestyle=':', alpha=0.5)
     plt.tight_layout()
     plt.savefig("potential_field_map.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
     # --- STORED ENERGY WAVEFORM ---
     plt.figure(figsize=(8, 4))
@@ -181,7 +207,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig("plasma_stored_energy_time.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
     # --- TOKAMAK TRAJECTORIES (2D, axes locked) ---
     cartesian_dfs = []
@@ -249,7 +276,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     _leg.set_zorder(20)
     plt.grid(True, alpha=0.3)
     plt.savefig("tokamak_reactor_2d.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
     # --- 3D TOKAMAK RENDERING MOVED ---
     # Runs after section 10 so the alpha trajectories are in cartesian_dfs first. Alphas
@@ -276,7 +304,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.title("Macroscopic Fluid Approximations (Density & Pressure)")
         fig.tight_layout()
         plt.savefig("radial_profiles.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # --- PHASE-SPACE DISTRIBUTION ---
     if R_phase is not None and v_parallel_phase is not None and len(R_phase) > 0:
@@ -298,7 +327,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.grid(True, linestyle=':', alpha=0.6)
         plt.tight_layout()
         plt.savefig("phase_space_map.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # --- MHD INSTABILITY EXPONENTIAL GROWTH ---
     if instability_amp_history is not None and len(instability_amp_history) > 0:
@@ -313,7 +343,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.tight_layout()
         plt.savefig("instability_growth.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # --- VOLUMETRIC FUSION POWER HEATMAP (percentile clipped) ---
     if P_fusion_grid is not None:
@@ -335,7 +366,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.grid(True, linestyle=':', alpha=0.5)
         plt.tight_layout()
         plt.savefig("fusion_power_density.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # --- ALPHA PARTICLE TRAJECTORIES ---
     if alpha_particles is not None and len(alpha_particles) > 0:
@@ -416,7 +448,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig("alpha_orbits.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # --- 3D TOKAMAK RENDERING ---
     # Runs here so cartesian_dfs already carries the alpha orbits.
@@ -453,7 +486,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         
         plt.tight_layout()
         plt.savefig("alpha_heating_balance.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
         
     # =======================================================
     # RADIATION LOSS PROFILE
@@ -484,7 +518,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         
         plt.tight_layout()
         plt.savefig("radiation_loss_profile.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
     # =======================================================
     # Q-FACTORS & LAWSON CRITERION
@@ -520,7 +555,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         
         plt.tight_layout()
         plt.savefig("lawson_q_factor.png", dpi=300)
-        plt.show()
+        _show()
+        plt.close()
 
 def run_oscillation_diagnostics(cfg, time_arr, w_es_history):
     time_arr = _scrub_1d(time_arr) * 1e9
@@ -558,7 +594,8 @@ def run_oscillation_diagnostics(cfg, time_arr, w_es_history):
     
     plt.tight_layout()
     plt.savefig("plasma_oscillation_frequency.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
 def plot_disruption_mitigation(time_history, temp_history, rad_power_history, trigger_time=None):
     time_history = _scrub_1d(time_history)
@@ -589,7 +626,8 @@ def plot_disruption_mitigation(time_history, temp_history, rad_power_history, tr
     
     plt.tight_layout()
     plt.savefig("disruption_mitigation.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()
 
 def plot_fusion_cross_section(E_kev_arr, sigma_arr):
     plt.figure(figsize=(8, 5))
@@ -612,4 +650,5 @@ def plot_fusion_cross_section(E_kev_arr, sigma_arr):
     
     plt.tight_layout()
     plt.savefig("fusion_cross_section.png", dpi=300)
-    plt.show()
+    _show()
+    plt.close()

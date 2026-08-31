@@ -1,6 +1,29 @@
+import os
+
+import matplotlib
+
+# --- Headless mode ---------------------------------------------------------
+# Set FUSION_HEADLESS=1 to run without an interactive display (CI, batch runs,
+# automated tests). matplotlib.use() must be called before pyplot is imported,
+# so this block stays above the pyplot import below. Every savefig() still runs
+# in headless mode; only the blocking show() is suppressed.
+_HEADLESS_OFF = {"", "0", "false", "no", "off"}
+FUSION_HEADLESS = os.environ.get("FUSION_HEADLESS", "").strip().lower() not in _HEADLESS_OFF
+
+if FUSION_HEADLESS:
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+
+def _show():
+    """plt.show(), or a no-op under FUSION_HEADLESS so runs never block."""
+    if FUSION_HEADLESS:
+        return
+    plt.show()
+
 
 class PlasmaVisualizer:
     def __init__(self, df_list: list):
@@ -124,6 +147,7 @@ class PlasmaVisualizer:
         plt.savefig(output_file, dpi=300)
         print(f"[VISUALIZATION] Saved plot to {output_file}")
 
-        print("[VISUALIZATION] Launching interactive tokamak viewer...")
-        plt.show()
+        if not FUSION_HEADLESS:
+            print("[VISUALIZATION] Launching interactive tokamak viewer...")
+        _show()
         plt.close()

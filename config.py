@@ -92,6 +92,12 @@ class SimulationConfiguration:
         self.MAX_ISLAND_WIDTH_THRESHOLD = 1.2e-4
         self.SPI_TRIGGERED = False              # Emergency-system flag
 
+        # Per-stage wall-clock instrumentation in the reactor loops. Purely
+        # additive: it reads clocks and accumulates floats, and touches no
+        # array, no RNG and no control flow, so a profiled run and an
+        # unprofiled one produce identical numbers.
+        self.PROFILE = False
+
         # Shattered Pellet Injection (SPI) constants
         self.IMPURITY_DENSITY_NZ = 5.0e19       # Injected Neon/Argon density (m^-3)
         self.RADIATIVE_COOLING_COEFF = 1.5e-32  # Simplified L_z(T_e) [W * m^3]

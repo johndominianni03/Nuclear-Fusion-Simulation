@@ -1,10 +1,13 @@
 import numpy as np
 import time
+import numba
+import sys
 import torch
 from numba import njit, prange
 
 from physics_engine import (
     gather_electric_field,
+    gather_electric_field_scalar,   # allocation-free scalar twin, used by the prange gather
     compute_electrostatic_energy,
     compute_radiative_cooling_power,
     compute_dt_cross_section,
@@ -32,50 +35,297 @@ from config import SimulationConfiguration
 import initialization
 import diagnostics
 
+
+# =======================================================
+# PER-STAGE WALL-CLOCK INSTRUMENTATION (cfg.PROFILE)
+# =======================================================
+# Purely additive. Every hook is a clock read plus a float add into a dict:
+# no array is touched, no RNG is drawn, no branch that the physics can see
+# is taken. With cfg.PROFILE False, mark() returns None and add() returns
+# immediately, so a profiled run and an unprofiled one produce bit-identical
+# results -- which tests/test_regression.py checks in both modes.
+#
+# On the GPU path the profiler is constructed with a sync callable. MPS and
+# CUDA both queue work asynchronously, so a bare perf_counter() around a
+# GPU op measures how fast the CPU enqueued it, not how long it ran. The
+# sync is called immediately before every clock read, on both ends of the
+# interval, so the elapsed time brackets work that has actually finished.
+
+
+class StageProfiler:
+    """Accumulates wall time per named stage."""
+
+    def __init__(self, enabled, sync=None, label=""):
+        self.enabled = bool(enabled)
+        self.label = label
+        # sync is only invoked when profiling: it must never slow, or
+        # otherwise perturb, an unprofiled run.
+        self._sync = sync if self.enabled else None
+        self.totals = {}
+        self.counts = {}
+        self._order = []
+
+    def mark(self):
+        """Timestamp for the start of a stage (None when disabled)."""
+        if not self.enabled:
+            return None
+        if self._sync is not None:
+            self._sync()
+        return time.perf_counter()
+
+    def add(self, name, t0):
+        """Charge the elapsed time since t0 to `name`."""
+        if not self.enabled or t0 is None:
+            return
+        if self._sync is not None:
+            self._sync()
+        elapsed = time.perf_counter() - t0
+        if name not in self.totals:
+            self.totals[name] = 0.0
+            self.counts[name] = 0
+            self._order.append(name)
+        self.totals[name] += elapsed
+        self.counts[name] += 1
+
+    def total(self):
+        return sum(self.totals.values())
+
+    def report(self, wall_total=None, title=None, min_percent=0.0):
+        """Print the stage table, sorted by share of wall time."""
+        if not self.enabled or not self.totals:
+            return
+        denom = wall_total if wall_total is not None else self.total()
+        if denom <= 0:
+            denom = self.total() or 1.0
+
+        heading = title or f"STAGE TIMING{(' -- ' + self.label) if self.label else ''}"
+        print("")
+        print("=" * 78)
+        print(f" {heading}")
+        print("=" * 78)
+        print(f" {'stage':<34}{'seconds':>11}{'% wall':>9}{'calls':>9}{'ms/call':>12}")
+        print(" " + "-" * 76)
+
+        for name in sorted(self.totals, key=lambda k: self.totals[k], reverse=True):
+            seconds = self.totals[name]
+            percent = 100.0 * seconds / denom
+            if percent < min_percent:
+                continue
+            calls = self.counts[name]
+            per_call_ms = 1000.0 * seconds / calls if calls else 0.0
+            # Truncate rather than let a long stage name shove the numeric
+            # columns out of alignment.
+            label = name if len(name) <= 33 else name[:32] + "\u2026"
+            print(f" {label:<34}{seconds:>11.3f}{percent:>8.1f}%{calls:>9,}{per_call_ms:>12.4f}")
+
+        print(" " + "-" * 76)
+        measured = self.total()
+        print(f" {'measured':<34}{measured:>11.3f}{100.0 * measured / denom:>8.1f}%")
+        if wall_total is not None:
+            unmeasured = wall_total - measured
+            print(f" {'unmeasured (loop overhead, etc.)':<34}"
+                  f"{unmeasured:>11.3f}{100.0 * unmeasured / denom:>8.1f}%")
+            print(f" {'WALL TOTAL':<34}{wall_total:>11.3f}{100.0:>8.1f}%")
+        print("=" * 78)
+
+
+def _profile_header(cfg, path_label, n_particles):
+    """One-line provenance for a profiled run.
+
+    numba's thread count is printed and NOT pinned: apply_vectorized_collisions
+    draws RNG inside a prange, so the thread count changes the answer -- but
+    forcing single-threaded here would misrepresent production performance.
+    The report says which count produced it instead.
+    """
+    print("")
+    print("=" * 78)
+    print(f" PROFILING RUN -- {path_label}")
+    print("=" * 78)
+    print(f"   particles (initial) : {n_particles:,}")
+    print(f"   steps               : {cfg.reactor_num_steps:,}")
+    print(f"   numba threads       : {numba.get_num_threads()} "
+          f"(of {numba.config.NUMBA_NUM_THREADS} available)")
+    print(f"   device              : {cfg.HPC_DEVICE}")
+    print("=" * 78)
+
+
+def _peak_rss_bytes():
+    """Peak resident set size of this process, or None if unavailable."""
+    try:
+        import resource
+    except ImportError:                      # not POSIX
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes; Linux reports kilobytes.
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def _report_gs_provenance(eq):
+    """Say whether psi came from the disk cache or a fresh solve.
+
+    A cold miss and a warm hit differ by seconds; without this line the
+    initialize_reactor row in the table is easy to misread as loop-adjacent
+    cost when it is really just the Grad-Shafranov solve.
+    """
+    source = getattr(eq, "last_solve_source", None)
+    backend = getattr(eq, "last_solve_backend", None)
+    if source is None:
+        print("[PROFILE] Grad-Shafranov: provenance unavailable")
+        return
+    if source == "cache-hit":
+        print(f"[PROFILE] Grad-Shafranov: CACHE HIT (backend '{backend}') -- "
+              "no SOR iteration ran; initialize_reactor excludes the solve cost.")
+    else:
+        print(f"[PROFILE] Grad-Shafranov: COLD SOLVE on the '{backend}' backend -- "
+              "initialize_reactor below INCLUDES the full solve.")
+
+
+def _log_device_memory(device, step, final=False):
+    """Current GPU allocation, sampled every 500 steps on the GPU path."""
+    tag = "final" if final else f"step {step:,}"
+    try:
+        if device.type == "mps":
+            allocated = torch.mps.current_allocated_memory()
+            driver = getattr(torch.mps, "driver_allocated_memory", None)
+            extra = f", driver {driver() / (1024 ** 3):.3f} GiB" if driver else ""
+            print(f"[PROFILE][MPS] {tag}: allocated "
+                  f"{allocated / (1024 ** 3):.3f} GiB{extra}")
+        elif device.type == "cuda":
+            print(f"[PROFILE][CUDA] {tag}: allocated "
+                  f"{torch.cuda.memory_allocated() / (1024 ** 3):.3f} GiB, "
+                  f"peak {torch.cuda.max_memory_allocated() / (1024 ** 3):.3f} GiB")
+        else:
+            print(f"[PROFILE] {tag}: device {device.type} exposes no allocator query")
+    except Exception as exc:                 # never let instrumentation break a run
+        print(f"[PROFILE] {tag}: device memory query failed ({exc})")
+
+
+def _report_peak_rss(prefix="[PROFILE]"):
+    peak = _peak_rss_bytes()
+    if peak is None:
+        print(f"{prefix} peak RSS: unavailable on this platform")
+        return
+    print(f"{prefix} peak RSS: {peak / (1024 ** 3):.3f} GiB")
+
+
+def _report_sor_histogram(iter_counts, max_iter=500):
+    """Histogram of Poisson SOR iterations per step.
+
+    The question this answers: does the warm start let the solve exit in a
+    handful of sweeps, or is it pinned against the iteration cap?
+    """
+    if not iter_counts:
+        return
+    counts = np.asarray(iter_counts, dtype=np.int64)
+    print("")
+    print("=" * 78)
+    print(" POISSON SOR ITERATIONS PER STEP")
+    print("=" * 78)
+    print(f"   solves      : {counts.size:,}")
+    print(f"   min / median / max : {counts.min()} / "
+          f"{int(np.median(counts))} / {counts.max()}")
+    print(f"   mean        : {counts.mean():.2f}")
+    at_cap = int(np.sum(counts >= max_iter))
+    print(f"   at the {max_iter}-iteration cap : {at_cap:,} "
+          f"({100.0 * at_cap / counts.size:.1f}%)")
+    print("")
+
+    edges = [1, 2, 3, 4, 5, 6, 8, 11, 16, 26, 51, 101, 201, max_iter, max_iter + 1]
+    widest = 0
+    rows = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        n = int(np.sum((counts >= lo) & (counts < hi)))
+        if n == 0:
+            continue
+        label = f"{lo}" if hi == lo + 1 else f"{lo}-{hi - 1}"
+        rows.append((label, n))
+        widest = max(widest, n)
+    for label, n in rows:
+        bar = "#" * max(1, int(round(46.0 * n / widest)))
+        print(f"   {label:>9} iters | {n:>7,}  {bar}")
+    print("=" * 78)
+
+
 # =======================================================
 # HYBRID SOLVER NUMBA KERNELS (CPU -> GPU BRIDGE)
 # =======================================================
 @njit(parallel=True, fastmath=True)
 def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
                             R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma):
+    # r, phi and its cos/sin are computed ONCE per particle and shared between the
+    # E gather and the B construction. The previous version called
+    # gather_electric_field, which redid the sqrt and an arctan2 of its own and
+    # returned a freshly allocated 3-element float64 array per particle -- one
+    # heap allocation per particle per step, and an array return that stopped the
+    # prange body from vectorizing. gather_electric_field_scalar returns a tuple
+    # instead and this writes straight into E_arr[i, 0..2].
+    #
+    # All arithmetic is float32, matching E_arr/B_arr, so no per-element downcast
+    # happens on store. B0/R0/t and the tearing-mode parameters are cast once here
+    # rather than promoting the whole B expression to float64 per particle.
+    #
+    # Call paths: the reactor loops pass live E grids and b_perturb > 0;
+    # package_reactor_results passes zero E grids and b_perturb = 0.0 for the
+    # phase-space projection. Both are handled by the same branches as before --
+    # the b_perturb > 0.0 guard is unchanged, and zero E grids simply gather zero.
     N = pos_arr.shape[0]
     E_arr = np.zeros((N, 3), dtype=np.float32)
     B_arr = np.zeros((N, 3), dtype=np.float32)
 
-    for i in prange(N):
-        E_arr[i] = gather_electric_field(pos_arr[i], E_R_grid, E_Z_grid, R_min, R_max, Z_min, Z_max, nR, nZ)
+    B0_f = np.float32(B0)
+    R0_f = np.float32(R0)
+    zero_f = np.float32(0.0)
+    amplitude = np.float32(b_perturb * np.exp(gamma * t))
+    m_f = np.float32(m_mode)
+    n_f = np.float32(n_mode)
 
-        r = np.sqrt(pos_arr[i, 0]**2 + pos_arr[i, 1]**2)
-        phi = np.arctan2(pos_arr[i, 1], pos_arr[i, 0])
-        z = pos_arr[i, 2]
+    for i in prange(N):
+        px = pos_arr[i, 0]
+        py = pos_arr[i, 1]
+        pz = pos_arr[i, 2]
+
+        r = np.float32(np.sqrt(px * px + py * py))
+        phi = np.float32(np.arctan2(py, px))
+        cos_phi = np.float32(np.cos(phi))
+        sin_phi = np.float32(np.sin(phi))
+        z = np.float32(pz)
+
+        ex, ey, ez = gather_electric_field_scalar(
+            px, py, pz, E_R_grid, E_Z_grid,
+            R_min, R_max, Z_min, Z_max, nR, nZ,
+            cos_phi, sin_phi
+        )
+        E_arr[i, 0] = ex
+        E_arr[i, 1] = ey
+        E_arr[i, 2] = ez
 
         # 1. Toroidal field B_phi = B0 * R0 / R. R0 must match the value used by the
         # confinement centre, tearing mode and poloidal field.
-        b_mag_tor = B0 * (R0 / r) if r > 0 else B0
-        Bx = -b_mag_tor * np.sin(phi)
-        By = b_mag_tor * np.cos(phi)
-        Bz = 0.0
+        b_mag_tor = B0_f * (R0_f / r) if r > zero_f else B0_f
+        Bx = -b_mag_tor * sin_phi
+        By = b_mag_tor * cos_phi
+        Bz = zero_f
 
         # 2. Poloidal field, interpolated from the psi-derived B_R / B_Z grids
         # (B_R = -(1/R) dpsi/dZ, B_Z = (1/R) dpsi/dR). The old linear-in-position
         # stand-in had no gradient structure and so no magnetic mirror; this follows the
         # same flux surfaces the confinement check uses as the loss boundary.
-        if r > 0:
-            B_R_pol = interpolate_psi(r, z, B_R_pol_grid, R_min, R_max, Z_min, Z_max, nR, nZ)
-            B_Z_pol = interpolate_psi(r, z, B_Z_pol_grid, R_min, R_max, Z_min, Z_max, nR, nZ)
+        if r > zero_f:
+            B_R_pol = np.float32(interpolate_psi(r, z, B_R_pol_grid, R_min, R_max, Z_min, Z_max, nR, nZ))
+            B_Z_pol = np.float32(interpolate_psi(r, z, B_Z_pol_grid, R_min, R_max, Z_min, Z_max, nR, nZ))
 
-            Bx += B_R_pol * np.cos(phi)
-            By += B_R_pol * np.sin(phi)
+            Bx += B_R_pol * cos_phi
+            By += B_R_pol * sin_phi
             Bz += B_Z_pol
 
         # 3. Tearing mode perturbation
         if b_perturb > 0.0:
-            amplitude = b_perturb * np.exp(gamma * t)
-            theta = np.arctan2(z, r - R0) if r != R0 else 0.0
-            dB_R = amplitude * np.sin(m_mode * theta - n_mode * phi)
-            dB_Z = amplitude * np.cos(m_mode * theta - n_mode * phi)
-            Bx += dB_R * np.cos(phi)
-            By += dB_R * np.sin(phi)
+            theta = np.float32(np.arctan2(z, r - R0_f)) if r != R0_f else zero_f
+            angle = m_f * theta - n_f * phi
+            dB_R = amplitude * np.float32(np.sin(angle))
+            dB_Z = amplitude * np.float32(np.cos(angle))
+            Bx += dB_R * cos_phi
+            By += dB_R * sin_phi
             Bz += dB_Z
 
         B_arr[i, 0] = Bx
@@ -236,6 +486,19 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
     print("[SYSTEM] Igniting time-domain reactor loop on CPU/Numba (fastest path at this particle count)...")
 
+    # --- Profiling state (inert unless cfg.PROFILE) ---
+    profiling = bool(getattr(cfg, "PROFILE", False))
+    prof = StageProfiler(profiling, label="CPU path")
+    # Sub-stages of the deuteron push, on their own profiler so they do not
+    # double-count inside the main table. The push "stage" is not just the
+    # push: it also pays for the mask, four fancy-index gathers (pos, vel,
+    # B, E) and two masked scatters, all over the full particle array.
+    push_prof = StageProfiler(profiling, label="deuteron push breakdown")
+    sor_iter_counts = []
+    if profiling:
+        _profile_header(cfg, "CPU / Numba path", len(pos_np))
+    loop_wall_start = time.perf_counter() if profiling else None
+
     for step in range(cfg.reactor_num_steps):
         t = step * cfg.reactor_dt
         time_history.append(t)
@@ -244,6 +507,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # A fixed batch forever meant inventory only climbed and no steady state was
         # reachable. The source decays as exp(-step/tau), with fractional rates realised
         # stochastically so the beam thins out smoothly.
+        _t = prof.mark()
         if step % cfg.inject_every_n_steps == 0 and step > 0:
             nbi_rate = cfg.NBI_BATCH_SIZE * np.exp(-step / cfg.NBI_DECAY_TAU_STEPS)
             batch_size = int(nbi_rate)
@@ -273,7 +537,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                         tracked_lastvel[pid] = vel_np[idx].copy()
                         tracked_nbis += 1
 
+        prof.add("NBI injection", _t)
+
         # --- BATCH ALPHA INJECTION ---
+        _t = prof.mark()
         if step % (cfg.inject_every_n_steps * 2) == 0 and step > 0:
             alpha_batch = 1
             phi_pos = np.random.uniform(0, 2 * np.pi, alpha_batch)
@@ -308,35 +575,62 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     tracked_lastvel[pid] = vel_np[idx].copy()
                     tracked_alphas += 1
 
+        prof.add("alpha injection", _t)
+
+        _t = prof.mark()
         mask_valid = (type_np == 0) | (type_np == 1)
         R_coords = np.sqrt(pos_np[mask_valid, 0]**2 + pos_np[mask_valid, 1]**2)
         Z_coords = pos_np[mask_valid, 2]
         charges = np.full(np.sum(mask_valid), cfg.e_charge)
         rho_grid = compute_cic_charge_density(R_coords, Z_coords, charges, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, False)
+        prof.add("CIC deposition", _t)
 
+        _t = prof.mark()
         if step > 0:
             # Warm-start the Poisson SOR solve from last step's converged phi: same
             # answer within the same tol, far fewer iterations to reach it.
-            phi_grid, E_R_grid, E_Z_grid = engine.solve_fields(rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, phi_init=phi_grid)
+            phi_grid, E_R_grid, E_Z_grid, _sor_iters = engine.solve_fields(
+                rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
+                phi_init=phi_grid, return_iters=True)
+            if profiling:
+                sor_iter_counts.append(_sor_iters)
+        prof.add("solve_fields (Poisson)", _t)
 
+        _t = prof.mark()
         E_np, B_np = vectorized_gather_and_B(
             pos_np, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
             cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
             cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
         )
+        prof.add("vectorized_gather_and_B", _t)
 
         # --- PARTICLE PUSH: Numba/CPU below PUSH_GPU_THRESHOLD, eager-GPU above it ---
+        _t = prof.mark()
+        _ts = push_prof.mark()
         mask_d = (type_np == 0) | (type_np == 1)
         if np.any(mask_d):
             pos_d = pos_np[mask_d].copy()
             vel_d = vel_np[mask_d].copy()
+            push_prof.add("mask + pos/vel gather", _ts)
+
+            _ts = push_prof.mark()
             _boris_push_adaptive(pos_d, vel_d, cfg.e_charge, cfg.m_deuterium, B_np[mask_d], E_np[mask_d], cfg.reactor_dt, cfg.HPC_DEVICE)
+            # Includes evaluating B_np[mask_d] and E_np[mask_d] as arguments:
+            # two more full-array fancy-index gathers, not part of the kernel.
+            push_prof.add("push call (+ B/E gather)", _ts)
+
+            _ts = push_prof.mark()
             pos_np[mask_d] = pos_d
             vel_np[mask_d] = vel_d
+            push_prof.add("masked write-back", _ts)
+        else:
+            push_prof.add("mask + pos/vel gather", _ts)
+        prof.add("deuteron Boris push", _t)
 
         # Alphas are sub-stepped: at 3.5 MeV they cover ~1.3e-2 m per global 1 ns step
         # against a ~2.2e-2 m Larmor radius, under two samples per gyro-arc. Deuterons
         # stay on the single global step (Larmor radius ~5e-4 m, already resolved).
+        _t = prof.mark()
         mask_a = type_np == 2
         if np.any(mask_a):
             pos_a = np.ascontiguousarray(pos_np[mask_a], dtype=np.float32)
@@ -348,17 +642,24 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             )
             pos_np[mask_a] = pos_a
             vel_np[mask_a] = vel_a
+        prof.add("alpha substep push", _t)
 
+        _t = prof.mark()
         vel_np = apply_vectorized_collisions(vel_np, type_np, cfg.nu_c, cfg.reactor_dt)
+        prof.add("apply_vectorized_collisions", _t)
+
         # Confinement against the psi flux surface, not a circle
+        _t = prof.mark()
         newly_lost = check_confinement_flux(
             pos_np, type_np, engine.eq.psi_grid, engine.eq.psi_edge,
             engine.eq.psi_R_min, engine.eq.psi_R_max, engine.eq.psi_Z_min, engine.eq.psi_Z_max,
             engine.eq.psi_nR, engine.eq.psi_nZ
         )
+        prof.add("check_confinement_flux", _t)
         total_lost += newly_lost
 
         # --- WALL LOSS COMPACTION ---
+        _t = prof.mark()
         # check_confinement_flux only FLAGS wall strikes (type = -1). Leaving them in the
         # arrays meant the pools only ever grew, every kernel paid for dead particles, and
         # the confined count could never fall. Trajectory history is pid-keyed, so it
@@ -383,8 +684,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             vel_np = np.ascontiguousarray(vel_np[alive])
             type_np = np.ascontiguousarray(type_np[alive])
             pid_np = np.ascontiguousarray(pid_np[alive])
+        prof.add("wall-loss compaction", _t)
 
         # --- TRAJECTORY SAMPLING (pid-keyed, so removal cannot corrupt it) ---
+        _t = prof.mark()
         # Alphas are sampled far more often than thermals: their orbit is only ~2.2e-2 m
         # across, so a 20-step cadence (~0.26 m of travel) aliases it away.
         sample_thermal = (step % 20 == 0)
@@ -404,7 +707,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     history_tracks[pid].append(pos_np[r].copy())
                     tracked_lastpos[pid] = pos_np[r].copy()
                     tracked_lastvel[pid] = vel_np[r].copy()
+        prof.add("trajectory sampling", _t)
 
+        _t = prof.mark()
         mask_alphas = type_np == 2
         alpha_deposited_kev = 0.0
         if np.any(mask_alphas):
@@ -520,8 +825,11 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
         # ledger, not retroactively in this one.
 
+        prof.add("alpha heating + energy transfer", _t)
+
         # One vectorized Numba call over the whole grid, replacing nR*nZ Python-level
         # calls into compute_radiation_losses.
+        _t = prof.mark()
         n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
         max_n_e = np.max(n_e_grid_raw)
         scale_factor = 1.0e20 / (max_n_e + 1e-10)
@@ -553,10 +861,20 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         temp_history.append(T_core)
         rad_power_history.append(P_rad)
+        prof.add("radiation + Q-factor diagnostics", _t)
 
         if (step + 1) % 500 == 0:
             max_rho, max_phi = np.max(rho_grid), np.max(np.abs(phi_grid))
             print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max Rho: {max_rho:.3e} | Max |Phi|: {max_phi:.2e} V")
+
+    if profiling:
+        loop_wall = time.perf_counter() - loop_wall_start
+        prof.report(wall_total=loop_wall,
+                    title="STAGE TIMING -- reactor loop (CPU / Numba)")
+        push_prof.report(wall_total=prof.totals.get("deuteron Boris push"),
+                         title="BREAKDOWN -- deuteron Boris push stage")
+        _report_sor_histogram(sor_iter_counts)
+        _report_peak_rss("[PROFILE][CPU]")
 
     # Tracked-particle metadata is returned as pid-keyed dicts, which removal cannot
     # corrupt -- row indices no longer survive a step now that losses are compacted out.
@@ -635,6 +953,26 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     bremsstrahlung_power_history_MW, cyclotron_power_history_MW = [], []
     q_sci_history, q_eng_history, lawson_triple_product_history = [], [], []
 
+    # --- Profiling state (inert unless cfg.PROFILE) ---
+    # MPS/CUDA queue work asynchronously, so every clock read on this path is
+    # preceded by a device synchronize -- otherwise the numbers measure how
+    # fast the CPU enqueued the work, not how long the GPU took to do it.
+    profiling = bool(getattr(cfg, "PROFILE", False))
+    _sync = None
+    if profiling:
+        if device.type == "mps":
+            _sync = torch.mps.synchronize
+        elif device.type == "cuda":
+            _sync = torch.cuda.synchronize
+    prof = StageProfiler(profiling, sync=_sync, label="GPU path")
+    sor_iter_counts = []
+    if profiling:
+        _profile_header(cfg, f"GPU path ({device.type})", pos_tensor.shape[0])
+        if _sync is None:
+            print("   [WARN] no synchronize for this device: GPU stage times "
+                  "will measure enqueue, not execution.")
+    loop_wall_start = time.perf_counter() if profiling else None
+
     print("[SYSTEM] Igniting time-domain reactor loop on GPU (fastest path at this particle count)...")
     if device.type == "mps":
         print("[SYSTEM] First step will pause briefly — torch.compile is fusing the field-gather")
@@ -647,6 +985,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- BATCH NBI INJECTION (tapering source) ---
         # Same decaying source as the CPU path, driven by the same two cfg knobs:
         # exp(-step/tau), with fractional rates realised stochastically.
+        _t = prof.mark()
         if step % cfg.inject_every_n_steps == 0 and step > 0:
             nbi_rate = cfg.NBI_BATCH_SIZE * np.exp(-step / cfg.NBI_DECAY_TAU_STEPS)
             batch_size = int(nbi_rate)
@@ -675,7 +1014,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
                 next_pid += batch_size
 
+        prof.add("NBI injection", _t)
+
         # --- BATCH ALPHA INJECTION ---
+        _t = prof.mark()
         if step % (cfg.inject_every_n_steps * 2) == 0 and step > 0:
             alpha_batch = 1
             phi_pos = np.random.uniform(0, 2 * np.pi, alpha_batch)
@@ -711,7 +1053,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             next_pid += alpha_batch
 
+        prof.add("alpha injection", _t)
+
         # --- CHARGE DENSITY MAPPING (GPU, eager) ---
+        _t = prof.mark()
         mask_valid = (type_tensor == 0) | (type_tensor == 1)
         R_coords = torch.sqrt(pos_tensor[mask_valid, 0]**2 + pos_tensor[mask_valid, 1]**2)
         Z_coords = pos_tensor[mask_valid, 2]
@@ -722,11 +1067,19 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # Only the small (nR x nZ) grid crosses to the CPU -- the SOR Poisson solve is
         # inherently serial and stays on Numba/CPU whatever the particle count.
         rho_grid = rho_grid_t.cpu().numpy().astype(np.float64)
+        prof.add("CIC deposition", _t)
 
+        _t = prof.mark()
         if step > 0:
             # Warm-start from last step's converged phi, as in the CPU path
-            phi_grid, E_R_grid, E_Z_grid = engine.solve_fields(rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, phi_init=phi_grid)
+            phi_grid, E_R_grid, E_Z_grid, _sor_iters = engine.solve_fields(
+                rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
+                phi_init=phi_grid, return_iters=True)
+            if profiling:
+                sor_iter_counts.append(_sor_iters)
+        prof.add("solve_fields (Poisson)", _t)
 
+        _t = prof.mark()
         E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
         E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
 
@@ -739,20 +1092,24 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
             cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
         )
+        prof.add("vectorized_gather_and_B", _t)
 
         # --- PARTICLE PUSH (GPU; see the note at the top of this function) ---
+        _t = prof.mark()
         mask_d = (type_tensor == 0) | (type_tensor == 1)
         if torch.any(mask_d):
             _push = _vectorized_boris_push_metal_dynamic or _vectorized_boris_push_metal_impl
             p_d, v_d = _push(pos_tensor[mask_d], vel_tensor[mask_d], cfg.e_charge, cfg.m_deuterium, B_tensor[mask_d], E_tensor[mask_d], cfg.reactor_dt)
             pos_tensor[mask_d] = p_d
             vel_tensor[mask_d] = v_d
+        prof.add("deuteron Boris push", _t)
 
         # Alphas are sub-stepped: at 3.5 MeV they cover ~1.3e-2 m per global 1 ns step
         # against a ~2.2e-2 m Larmor radius, under two samples per gyro-arc. Deuterons
         # stay on the single global step. E and B are held fixed across the sub-steps --
         # the point is to resolve gyration about the local B, not to re-gather the field.
         # Stays on-device; boris_push_substeps_torch re-enters the same MPS kernel.
+        _t = prof.mark()
         mask_a = type_tensor == 2
         if torch.any(mask_a):
             p_a, v_a = boris_push_substeps_torch(
@@ -761,17 +1118,24 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             )
             pos_tensor[mask_a] = p_a
             vel_tensor[mask_a] = v_a
+        prof.add("alpha substep push", _t)
 
         # --- COLLISIONS + CONFINEMENT CHECK (GPU, eager; psi-surface, not circular) ---
+        _t = prof.mark()
         vel_tensor = apply_vectorized_collisions_torch(vel_tensor, type_tensor, cfg.nu_c, cfg.reactor_dt)
+        prof.add("apply_vectorized_collisions", _t)
+
+        _t = prof.mark()
         type_tensor, newly_lost = check_confinement_torch(
             pos_tensor, type_tensor, psi_tensor, engine.eq.psi_edge,
             engine.eq.psi_R_min, engine.eq.psi_R_max, engine.eq.psi_Z_min, engine.eq.psi_Z_max,
             engine.eq.psi_nR, engine.eq.psi_nZ
         )
+        prof.add("check_confinement_flux", _t)
         total_lost += newly_lost
 
         # --- WALL LOSS COMPACTION (GPU) ---
+        _t = prof.mark()
         # check_confinement_torch only FLAGS wall strikes (type = -1). Leaving them in the
         # tensors meant the pools only ever grew, every kernel paid for dead particles,
         # and the confined count could never fall. Boolean-mask indexing keeps the removal
@@ -802,12 +1166,14 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             vel_tensor = vel_tensor[alive]
             type_tensor = type_tensor[alive]
             pid_tensor = pid_tensor[alive]
+        prof.add("wall-loss compaction", _t)
 
         # Pull only the tracked particles (<=2000) needed for trajectory plots, never the
         # full inventory. Keyed by stable pid via searchsorted, so the row shift from the
         # compaction above cannot silently re-point a track at a different particle.
         # Alphas are sampled far more often than thermals: their orbit is only ~2.2e-2 m
         # across, so a 20-step cadence (~0.26 m of travel) aliases it away.
+        _t = prof.mark()
         sample_thermal = (step % 20 == 0)
         sample_alpha = (step % cfg.ALPHA_HISTORY_EVERY == 0)
         if (sample_thermal or sample_alpha) and len(history_tracks) > 0 and pid_tensor.numel() > 0:
@@ -827,7 +1193,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     tracked_lastpos[pid] = subset_pos[k].copy()
                     tracked_lastvel[pid] = subset_vel[k].copy()
 
+        prof.add("trajectory sampling", _t)
+
         # --- ALPHA HEATING (GPU, eager) ---
+        _t = prof.mark()
         mask_alphas = type_tensor == 2
         alpha_deposited_kev = 0.0
         if torch.any(mask_alphas):
@@ -942,9 +1311,12 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             # No impurities before SPI fires, so nothing radiates
             P_rad = 0.0
 
+        prof.add("alpha heating + energy transfer", _t)
+
         # energy_history_keV / T_core_kinetic above are recorded BEFORE the drain, which
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
         # ledger, not retroactively in this one.
+        _t = prof.mark()
         n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
         max_n_e = np.max(n_e_grid_raw)
         scale_factor = 1.0e20 / (max_n_e + 1e-10)
@@ -979,10 +1351,24 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         temp_history.append(T_core)
         rad_power_history.append(P_rad)
+        prof.add("radiation + Q-factor diagnostics", _t)
+
+        if profiling and (step + 1) % 500 == 0:
+            _log_device_memory(device, step + 1)
 
         if (step + 1) % 500 == 0:
             max_rho, max_phi = np.max(rho_grid), np.max(np.abs(phi_grid))
             print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max Rho: {max_rho:.3e} | Max |Phi|: {max_phi:.2e} V")
+
+    if profiling:
+        if _sync is not None:
+            _sync()
+        loop_wall = time.perf_counter() - loop_wall_start
+        prof.report(wall_total=loop_wall,
+                    title=f"STAGE TIMING -- reactor loop (GPU / {device.type})")
+        _report_sor_histogram(sor_iter_counts)
+        _log_device_memory(device, cfg.reactor_num_steps, final=True)
+        _report_peak_rss("[PROFILE][GPU]")
 
     # --- Leave the GPU only here, at the end of the loop ---
     pos_np = pos_tensor.cpu().numpy()
@@ -999,45 +1385,34 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             q_sci_history, q_eng_history, lawson_triple_product_history, rho_grid, phi_grid)
 
 
-def run_reactor_steady_state():
-    print("==================================================")
-    print("      PIC FULL CYCLE (LORENTZ PUSH)      ")
-    print("==================================================")
+def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
+                            pos_np, vel_np, type_np,
+                            history_tracks, tracked_type, tracked_lastpos,
+                            tracked_lastvel, tracked_lost,
+                            rho_grid, T_core, prof=None):
+    """Turns the reactor loop's raw output into the arrays diagnostics plots.
 
-    cfg = SimulationConfiguration()
-    eq, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid = initialization.initialize_reactor(cfg)
+    Lifted verbatim out of run_reactor_steady_state so a regression test can
+    reach these products without rendering anything: the loop is the physics,
+    this is the packaging, and rendering is a third step. run_reactor_steady_state
+    calls this and forwards the contents to diagnostics exactly as before.
 
-    # The psi-derived poloidal B field, resampled onto the solver grid so the pusher's B
-    # lookup reuses the indices/weights the E gather computes. Without it the pusher sees
-    # a purely toroidal B whose only gradient is the smooth 1/R falloff -- no mirror ratio
-    # along a field line, so nothing is trapped and the v_parallel-vs-R map collapses to
-    # the injected Maxwellian.
-    B_R_pol_grid, B_Z_pol_grid, pol_scale, B_pol_target = compute_poloidal_field_grids(
-        eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
-        dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min, dst_Z_max=cfg.Z_max,
-        dst_nR=cfg.nR, dst_nZ=cfg.nZ
-    )
-    print(f"[SYSTEM] Poloidal field from Grad-Shafranov psi: B_pol ~ {B_pol_target:.3f} T "
-          f"(q = {cfg.Q_SAFETY_TARGET:.1f}, psi rescale x{pol_scale:.3e})")
+    `eq` is not read here today -- the poloidal field it produced arrives
+    already resampled as B_R_pol_grid/B_Z_pol_grid. It stays in the signature
+    so callers pass the same equilibrium object they pass everywhere else, and
+    so a future moment that needs psi does not change every call site.
 
-    # GPU_PARTICLE_THRESHOLD is None by default -- the CPU loop measured faster at every
-    # count tested, up to 3,000,000. See its definition for the numbers.
-    loop_fn = (_run_reactor_loop_gpu
-               if GPU_PARTICLE_THRESHOLD is not None and cfg.initial_thermal_count >= GPU_PARTICLE_THRESHOLD
-               else _run_reactor_loop_cpu)
-    (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
-     tracked_lost,
-     total_injected, total_lost,
-     inventory_history, energy_history_keV, instability_amp_history, time_history,
-     temp_history, rad_power_history, trigger_time, T_core,
-     alpha_heating_power_history_MW, external_heating_power_history_MW,
-     bremsstrahlung_power_history_MW, cyclotron_power_history_MW,
-     q_sci_history, q_eng_history, lawson_triple_product_history, rho_grid, phi_grid
-     ) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
+    Returns a dict of exactly the products the caller forwards onward.
 
+    `prof` is an optional StageProfiler. When None (the default, and what
+    tests/test_regression.py passes) every hook below is a no-op.
+    """
+    if prof is None:
+        prof = StageProfiler(False)
     dR, dZ = (cfg.R_max - cfg.R_min) / (cfg.nR - 1), (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
 
     print("[SYSTEM] Packaging particle arrays for Graphing Utilities...")
+    _t = prof.mark()
 
     # history_tracks is keyed by particle ID, not row index: lost particles are compacted
     # out of pos_np/vel_np, so indexing those by a track key would read an unrelated
@@ -1066,11 +1441,22 @@ def run_reactor_steady_state():
         else:
             mock_active.append(p_dict)
 
-    final_active = [{"status": "confined", "pos": p, "vel": v} for p, v, typ in zip(pos_np, vel_np, type_np) if typ != -1]
+    prof.add("pkg: history_tracks -> mock_active/mock_alphas", _t)
 
+    # NOTE: this builds one Python dict per surviving particle, then
+    # compute_fluid_moments walks that list in Python. There is no
+    # array-based path here yet, so at 1M particles both lines below are a
+    # real chunk of wall clock -- they are timed separately to make that
+    # visible rather than to hide it inside one "packaging" number.
+    _t = prof.mark()
+    final_active = [{"status": "confined", "pos": p, "vel": v} for p, v, typ in zip(pos_np, vel_np, type_np) if typ != -1]
+    prof.add("pkg: final_active (dict per particle)", _t)
+
+    _t = prof.mark()
     R_centers, density_profile, pressure_profile = engine.compute_fluid_moments(
         final_active, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.num_radial_bins
     )
+    prof.add("pkg: compute_fluid_moments", _t)
 
     # --- TRUE v_parallel FOR THE PHASE-SPACE MAP ---
     # (x*vy - y*vx)/R is v_TOROIDAL, which only equals v_parallel if B is purely toroidal
@@ -1078,6 +1464,7 @@ def run_reactor_steady_state():
     # trapped from passing. Projecting onto the real local b_hat (toroidal + psi-derived
     # poloidal) is what makes that boundary appear instead of a Gaussian blob.
     print("[SYSTEM] Projecting velocities onto local field lines for phase-space map...")
+    _t = prof.mark()
     alive_mask = type_np != -1
     R_phase, v_parallel_phase = [], []
     if np.any(alive_mask):
@@ -1100,7 +1487,10 @@ def run_reactor_steady_state():
         R_phase = R_all[keep].tolist()
         v_parallel_phase = v_par_all[keep].tolist()
 
+    prof.add("pkg: v_parallel phase-space projection", _t)
+
     print("[SYSTEM] Mapping Volumetric Fusion Power ")
+    _t = prof.mark()
     n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
     scale_factor = 1.0e20 / (np.max(n_e_grid_raw) + 1e-10)
     n_e_grid_scaled = n_e_grid_raw * scale_factor
@@ -1115,9 +1505,95 @@ def run_reactor_steady_state():
         for j in range(cfg.nZ):
             total_fusion_power_watts += P_fusion_grid[i, j] * cell_volume
             
+    prof.add("pkg: fusion power grid + volume integral", _t)
+
     print("==================================================")
     print(f" TOTAL INTEGRATED FUSION POWER: {total_fusion_power_watts / 1e6:.2f} MW ")
     print("==================================================")
+
+    return {
+        "mock_active": mock_active,
+        "mock_alphas": mock_alphas,
+        "final_active": final_active,
+        "R_centers": R_centers,
+        "density_profile": density_profile,
+        "pressure_profile": pressure_profile,
+        "R_phase": R_phase,
+        "v_parallel_phase": v_parallel_phase,
+        "P_fusion_grid": P_fusion_grid,
+        "total_fusion_power_watts": total_fusion_power_watts,
+    }
+
+
+def run_reactor_steady_state():
+    print("==================================================")
+    print("      PIC FULL CYCLE (LORENTZ PUSH)      ")
+    print("==================================================")
+
+    cfg = SimulationConfiguration()
+
+    # Out-of-loop phases are timed on their own profiler, so the loop table
+    # stays a table about the loop.
+    outer = StageProfiler(bool(getattr(cfg, "PROFILE", False)), label="out-of-loop")
+
+    _t = outer.mark()
+    eq, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid = initialization.initialize_reactor(cfg)
+    outer.add("initialize_reactor", _t)
+
+    # The psi-derived poloidal B field, resampled onto the solver grid so the pusher's B
+    # lookup reuses the indices/weights the E gather computes. Without it the pusher sees
+    # a purely toroidal B whose only gradient is the smooth 1/R falloff -- no mirror ratio
+    # along a field line, so nothing is trapped and the v_parallel-vs-R map collapses to
+    # the injected Maxwellian.
+    _t = outer.mark()
+    B_R_pol_grid, B_Z_pol_grid, pol_scale, B_pol_target = compute_poloidal_field_grids(
+        eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
+        dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min, dst_Z_max=cfg.Z_max,
+        dst_nR=cfg.nR, dst_nZ=cfg.nZ
+    )
+    outer.add("compute_poloidal_field_grids", _t)
+    print(f"[SYSTEM] Poloidal field from Grad-Shafranov psi: B_pol ~ {B_pol_target:.3f} T "
+          f"(q = {cfg.Q_SAFETY_TARGET:.1f}, psi rescale x{pol_scale:.3e})")
+
+    # GPU_PARTICLE_THRESHOLD is None by default -- the CPU loop measured faster at every
+    # count tested, up to 3,000,000. See its definition for the numbers.
+    loop_fn = (_run_reactor_loop_gpu
+               if GPU_PARTICLE_THRESHOLD is not None and cfg.initial_thermal_count >= GPU_PARTICLE_THRESHOLD
+               else _run_reactor_loop_cpu)
+    (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
+     tracked_lost,
+     total_injected, total_lost,
+     inventory_history, energy_history_keV, instability_amp_history, time_history,
+     temp_history, rad_power_history, trigger_time, T_core,
+     alpha_heating_power_history_MW, external_heating_power_history_MW,
+     bremsstrahlung_power_history_MW, cyclotron_power_history_MW,
+     q_sci_history, q_eng_history, lawson_triple_product_history, rho_grid, phi_grid
+     ) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
+
+    _t = outer.mark()
+    packaged = package_reactor_results(
+        cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
+        pos_np, vel_np, type_np,
+        history_tracks, tracked_type, tracked_lastpos,
+        tracked_lastvel, tracked_lost,
+        rho_grid, T_core, prof=outer,
+    )
+    outer.add("package_reactor_results (total)", _t)
+
+    if outer.enabled:
+        _report_gs_provenance(eq)
+        # package_reactor_results' sub-stages are charged to `outer` as well,
+        # so its own "(total)" row overlaps them -- read that row as the
+        # roll-up, not as another slice to add in.
+        outer.report(title="STAGE TIMING -- out-of-loop phases")
+    mock_active = packaged["mock_active"]
+    mock_alphas = packaged["mock_alphas"]
+    R_centers = packaged["R_centers"]
+    density_profile = packaged["density_profile"]
+    pressure_profile = packaged["pressure_profile"]
+    R_phase = packaged["R_phase"]
+    v_parallel_phase = packaged["v_parallel_phase"]
+    P_fusion_grid = packaged["P_fusion_grid"]
 
     diagnostics.run_steady_state_diagnostics(
         cfg, eq, rho_grid, phi_grid, energy_history_keV, 
