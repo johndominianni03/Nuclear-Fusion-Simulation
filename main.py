@@ -250,17 +250,29 @@ def _report_sor_histogram(iter_counts, max_iter=500):
 # HYBRID SOLVER NUMBA KERNELS (CPU -> GPU BRIDGE)
 # =======================================================
 @njit(parallel=True, fastmath=True)
-def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
-                            R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma):
+def vectorized_gather_and_B_into(pos_arr, E_out, B_out,
+                                 E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+                                 R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma):
+    # Out-parameter form: E_out and B_out are (>=N, 3) float32 arrays supplied by
+    # the caller, and every row this touches is written in full, so they need not
+    # be zeroed first. Nothing is returned. Allocating the pair here cost 24 MB of
+    # allocate-and-free per step at 1M particles, ~10,000 times over a full run;
+    # _run_reactor_loop_cpu now owns one pair of buffers and passes [:n] slices.
+    # vectorized_gather_and_B (just below) is the allocating wrapper for the
+    # callers that run once per run rather than once per step.
+    #
+    # NOTE: N comes from pos_arr, and numba does not bounds-check these stores --
+    # E_out/B_out must have at least pos_arr.shape[0] rows.
+    #
     # r, phi and its cos/sin are computed ONCE per particle and shared between the
     # E gather and the B construction. The previous version called
     # gather_electric_field, which redid the sqrt and an arctan2 of its own and
     # returned a freshly allocated 3-element float64 array per particle -- one
     # heap allocation per particle per step, and an array return that stopped the
     # prange body from vectorizing. gather_electric_field_scalar returns a tuple
-    # instead and this writes straight into E_arr[i, 0..2].
+    # instead and this writes straight into E_out[i, 0..2].
     #
-    # All arithmetic is float32, matching E_arr/B_arr, so no per-element downcast
+    # All arithmetic is float32, matching E_out/B_out, so no per-element downcast
     # happens on store. B0/R0/t and the tearing-mode parameters are cast once here
     # rather than promoting the whole B expression to float64 per particle.
     #
@@ -269,8 +281,6 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
     # phase-space projection. Both are handled by the same branches as before --
     # the b_perturb > 0.0 guard is unchanged, and zero E grids simply gather zero.
     N = pos_arr.shape[0]
-    E_arr = np.zeros((N, 3), dtype=np.float32)
-    B_arr = np.zeros((N, 3), dtype=np.float32)
 
     B0_f = np.float32(B0)
     R0_f = np.float32(R0)
@@ -295,9 +305,9 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
             R_min, R_max, Z_min, Z_max, nR, nZ,
             cos_phi, sin_phi
         )
-        E_arr[i, 0] = ex
-        E_arr[i, 1] = ey
-        E_arr[i, 2] = ez
+        E_out[i, 0] = ex
+        E_out[i, 1] = ey
+        E_out[i, 2] = ez
 
         # 1. Toroidal field B_phi = B0 * R0 / R. R0 must match the value used by the
         # confinement centre, tearing mode and poloidal field.
@@ -328,10 +338,29 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
             By += dB_R * sin_phi
             Bz += dB_Z
 
-        B_arr[i, 0] = Bx
-        B_arr[i, 1] = By
-        B_arr[i, 2] = Bz
+        B_out[i, 0] = Bx
+        B_out[i, 1] = By
+        B_out[i, 2] = Bz
 
+
+def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+                            R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma):
+    """Allocating wrapper around vectorized_gather_and_B_into.
+
+    Same signature and same (E_arr, B_arr) return as before the out-parameter
+    split, for the callers that run once per run rather than once per step --
+    package_reactor_results' phase-space projection and the plasma-oscillation
+    test -- where one pair of (N,3) arrays is not worth a reused buffer. The
+    reactor loop calls the _into form directly against buffers it owns.
+    """
+    N = pos_arr.shape[0]
+    E_arr = np.empty((N, 3), dtype=np.float32)
+    B_arr = np.empty((N, 3), dtype=np.float32)
+    vectorized_gather_and_B_into(
+        pos_arr, E_arr, B_arr,
+        E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+        R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma
+    )
     return E_arr, B_arr
 
 # NOTE: the circular check_confinement (r - 1.0)^2 + z^2 > 0.3^2 that used to live here
@@ -474,6 +503,17 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # tracked_type holds the species.
     tracked_lost = set()
 
+    # Per-step field buffers, allocated once and reused. vectorized_gather_and_B
+    # used to return a fresh pair of (N, 3) float32 arrays every step -- 24 MB
+    # allocated and freed per step at 1M particles, ~10,000 times over a full run.
+    # The loop now owns the storage and passes [:n] views to the _into kernel,
+    # which writes every row it is given, so stale rows past n are never read.
+    # Capacity starts above the initial count (NBI and alpha injection grow the
+    # pools) and doubles only if the live count outruns it.
+    field_capacity = n_init + n_init // 4 + 1024
+    E_buf = np.empty((field_capacity, 3), dtype=np.float32)
+    B_buf = np.empty((field_capacity, 3), dtype=np.float32)
+
     total_injected = cfg.initial_thermal_count
     total_lost = 0
     inventory_history, energy_history_keV, instability_amp_history = [], [], []
@@ -597,8 +637,19 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("solve_fields (Poisson)", _t)
 
         _t = prof.mark()
-        E_np, B_np = vectorized_gather_and_B(
-            pos_np, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+        n_live = len(pos_np)
+        if n_live > field_capacity:
+            while field_capacity < n_live:
+                field_capacity *= 2
+            E_buf = np.empty((field_capacity, 3), dtype=np.float32)
+            B_buf = np.empty((field_capacity, 3), dtype=np.float32)
+        # Views, not copies: the masked gathers below index these exactly as they
+        # did the freshly allocated arrays.
+        E_np = E_buf[:n_live]
+        B_np = B_buf[:n_live]
+        vectorized_gather_and_B_into(
+            pos_np, E_np, B_np,
+            E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
             cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
             cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
         )
