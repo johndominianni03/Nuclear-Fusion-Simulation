@@ -1576,12 +1576,27 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     }
 
 
-def run_reactor_steady_state():
+def run_reactor_steady_state(save_plots=None):
+    """Run the reactor loop end to end.
+
+    save_plots gates only the PNG-writing diagnostic calls at the tail. None
+    (the default) resolves to `not cfg.PROFILE`, so a profiling run never
+    overwrites the committed plots in the repo root; pass True to force the
+    plots out of a profiling run, False to suppress them in a normal one.
+
+    The diagnostic *computation* is deliberately not gated:
+    package_reactor_results (final_active, compute_fluid_moments, the
+    phase-space projection) runs either way, so profile numbers stay
+    comparable to the step 4/5/6 baselines.
+    """
     print("==================================================")
     print("      PIC FULL CYCLE (LORENTZ PUSH)      ")
     print("==================================================")
 
     cfg = SimulationConfiguration()
+
+    if save_plots is None:
+        save_plots = not bool(getattr(cfg, "PROFILE", False))
 
     # Out-of-loop phases are timed on their own profiler, so the loop table
     # stays a table about the loop.
@@ -1646,21 +1661,28 @@ def run_reactor_steady_state():
     v_parallel_phase = packaged["v_parallel_phase"]
     P_fusion_grid = packaged["P_fusion_grid"]
 
-    diagnostics.run_steady_state_diagnostics(
-        cfg, eq, rho_grid, phi_grid, energy_history_keV, 
-        mock_active, total_injected, total_lost, inventory_history,
-        R_centers, density_profile, pressure_profile,
-        R_phase, v_parallel_phase, instability_amp_history, P_fusion_grid,
-        alpha_particles=mock_alphas, 
-        alpha_power_history=alpha_heating_power_history_MW,
-        ext_power_history=external_heating_power_history_MW,
-        brem_power_history=bremsstrahlung_power_history_MW, 
-        cyc_power_history=cyclotron_power_history_MW,        
-        q_sci_history=q_sci_history, q_eng_history=q_eng_history, lawson_history=lawson_triple_product_history 
-    )
+    # Every diagnostic below writes a PNG into the repo root under its fixed
+    # name (plot_manifest.py's baseline depends on those names), so they are
+    # the only thing save_plots gates.
+    if not save_plots:
+        print("[SYSTEM] save_plots is off -- skipping diagnostic plots "
+              "(no PNGs written).")
+    else:
+        diagnostics.run_steady_state_diagnostics(
+            cfg, eq, rho_grid, phi_grid, energy_history_keV, 
+            mock_active, total_injected, total_lost, inventory_history,
+            R_centers, density_profile, pressure_profile,
+            R_phase, v_parallel_phase, instability_amp_history, P_fusion_grid,
+            alpha_particles=mock_alphas, 
+            alpha_power_history=alpha_heating_power_history_MW,
+            ext_power_history=external_heating_power_history_MW,
+            brem_power_history=bremsstrahlung_power_history_MW, 
+            cyc_power_history=cyclotron_power_history_MW,        
+            q_sci_history=q_sci_history, q_eng_history=q_eng_history, lawson_history=lawson_triple_product_history 
+        )
 
-    if cfg.SPI_TRIGGERED:
-        diagnostics.plot_disruption_mitigation(time_history, temp_history, rad_power_history, trigger_time)
+        if cfg.SPI_TRIGGERED:
+            diagnostics.plot_disruption_mitigation(time_history, temp_history, rad_power_history, trigger_time)
 
 
 def run_plasma_oscillation_test():
@@ -1738,6 +1760,8 @@ def run_nuclear_reaction_dynamics():
 if __name__ == "__main__":
     cfg = SimulationConfiguration()
     run_hpc_benchmark(cfg)
-    run_reactor_steady_state()
+    # The full-artifact entry point: it exists to regenerate the plots, so it
+    # asks for them explicitly rather than inheriting the cfg.PROFILE default.
+    run_reactor_steady_state(save_plots=True)
     run_plasma_oscillation_test()
     run_nuclear_reaction_dynamics()

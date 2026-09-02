@@ -510,7 +510,9 @@ import main
 # four entry points, not from the reactor run alone.
 cfg = config.SimulationConfiguration()
 main.run_hpc_benchmark(cfg)
-main.run_reactor_steady_state()
+# save_plots=True for the same reason main.py's __main__ passes it: the
+# manifest baseline needs the reactor PNGs whatever cfg.PROFILE is set to.
+main.run_reactor_steady_state(save_plots=True)
 main.run_plasma_oscillation_test()
 main.run_nuclear_reaction_dynamics()
 """
