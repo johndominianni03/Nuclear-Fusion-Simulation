@@ -445,9 +445,23 @@ def run_hpc_benchmark(cfg):
     print("[SYSTEM] HPC Benchmark Complete! Handing off to diagnostics...")
     diagnostics.plot_hpc_benchmark(cfg.BENCHMARK_PARTICLE_COUNTS, cpu_times, gpu_times)
 
-GPU_PARTICLE_THRESHOLD = 1000000
-# the threshold at which simulation run shifts from Numba JIT CPU run to PyTorch GPU run 
-# PyTorch GPU run is Apple Metal Performance Shaders on Apple Silicon; CUDA on PC's
+GPU_PARTICLE_THRESHOLD = None
+# The particle count at which the reactor run shifts from the Numba JIT CPU loop
+# (_run_reactor_loop_cpu) to the PyTorch GPU loop (_run_reactor_loop_gpu): Apple Metal
+# Performance Shaders on Apple Silicon, CUDA on PC.
+#
+# None means "always take the CPU loop". It held 1,000,000 from the initial commit
+# through step 6, which silently sent every 1M-particle run down the slower path:
+# measured at 1,000,000 particles / 200 steps during step 6, the GPU loop took 69.6 s
+# wall against ~32-36 s for the CPU loop. The CPU loop measured faster at every count
+# tested, up to 3,000,000.
+#
+# NOT a deprecation of the GPU path -- step 12 optimizes that loop and step 13 reassesses
+# this number. To force the GPU loop, set this to an int <= cfg.initial_thermal_count,
+# either by editing this line (what README.md documents) or at runtime without editing:
+#     import main; main.GPU_PARTICLE_THRESHOLD = 0; main.run_reactor_steady_state()
+# The dispatch reads this global when run_reactor_steady_state is called, so the runtime
+# form works; `cfg.PROFILE = True` prints which loop was chosen.
 
 # The push is memory-bound at ~0.85 flop/byte on a shared bus, and going to the device
 # adds a round-trip plus dispatch overhead, so no particle count repays it.
@@ -940,10 +954,12 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
 
 def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid):
-    # GPU-resident pipeline for large particle counts (>= GPU_PARTICLE_THRESHOLD, e.g.
-    # 1,000,000). The particle tensors never leave the device inside the loop, apart from
-    # the small (nR x nZ) field grid the CPU Poisson solver needs and the tracked-particle
-    # subset pulled every 20 steps for plotting.
+    # GPU-resident pipeline, selected only when GPU_PARTICLE_THRESHOLD is set to an int
+    # <= cfg.initial_thermal_count. It is None by default, so this loop is opt-in -- see
+    # that constant's definition for the numbers and for how to force it. The particle
+    # tensors never leave the device inside the loop, apart from the small (nR x nZ) field
+    # grid the CPU Poisson solver needs and the tracked-particle subset pulled every 20
+    # steps for plotting.
     #
     # The push uses the DYNAMIC-shape compiled kernel where available, falling back to
     # eager if that compile failed at import. STATIC compile is wrong here: this loop's
@@ -1621,8 +1637,11 @@ def run_reactor_steady_state(save_plots=None):
     print(f"[SYSTEM] Poloidal field from Grad-Shafranov psi: B_pol ~ {B_pol_target:.3f} T "
           f"(q = {cfg.Q_SAFETY_TARGET:.1f}, psi rescale x{pol_scale:.3e})")
 
-    # GPU_PARTICLE_THRESHOLD is None by default -- the CPU loop measured faster at every
-    # count tested, up to 3,000,000. See its definition for the numbers.
+    # GPU_PARTICLE_THRESHOLD is None, so this always selects the CPU loop: the CPU loop
+    # measured faster at every count tested, up to 3,000,000 (step 6, at 1,000,000
+    # particles / 200 steps: GPU loop 69.6 s wall vs CPU loop ~32-36 s). The `is not None`
+    # guard short-circuits before the comparison, so None never reaches the `>=`.
+    # See the constant's definition for how to force the GPU loop.
     loop_fn = (_run_reactor_loop_gpu
                if GPU_PARTICLE_THRESHOLD is not None and cfg.initial_thermal_count >= GPU_PARTICLE_THRESHOLD
                else _run_reactor_loop_cpu)
