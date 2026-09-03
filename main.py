@@ -486,6 +486,278 @@ def _boris_push_adaptive(pos, vel, q, m, B, E, dt, device):
         vectorized_boris_push_numba_fallback(pos, vel, q, m, B, E, dt)
 
 
+# Hard ceiling on plotted trajectories: 1000 initial thermals plus the
+# tracked_nbis and tracked_alphas caps of 1000 each, all three enforced at the
+# injection sites. _TrackStore raises rather than silently overrunning.
+_MAX_TRACKED_SLOTS = 3000
+
+
+def _pid_capacity_bound(cfg, n_init):
+    """Upper bound on the largest pid a run can reach, plus headroom.
+
+    Sizing the pid -> row map from the initial particle count is WRONG: pids are
+    handed out monotonically and never reused, so injection walks them past
+    n_init and a map sized that way overruns partway through a long run (a
+    5,200-step disruption run reaches ~n_init + 34,000). The bound below counts
+    the injections the loop can actually perform:
+
+      NBI    -- one batch every cfg.inject_every_n_steps steps, and a batch is
+                int(rate) plus at most one more from the stochastic remainder,
+                with rate <= cfg.NBI_BATCH_SIZE because the exponential taper
+                only ever shrinks it.
+      alphas -- exactly one every cfg.inject_every_n_steps * 2 steps.
+
+    _ensure_pid_capacity still grows the arrays if anything ever exceeds this,
+    so the bound is a sizing hint and not a correctness assumption.
+    """
+    steps = int(cfg.reactor_num_steps)
+    nbi_events = steps // max(1, int(cfg.inject_every_n_steps)) + 1
+    alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
+    nbi_max = int(cfg.NBI_BATCH_SIZE) + 1
+    return int(n_init + nbi_events * nbi_max + alpha_events) + 1024
+
+
+def _ensure_pid_capacity(capacity, pid_row, pid_slot, needed):
+    """Grow the dense pid -> row / pid -> slot maps to hold pid `needed - 1`.
+
+    _pid_capacity_bound already sizes for the whole run, so this is a tripwire
+    rather than a hot path: it fires only if the injection schedule ever exceeds
+    that bound, and grows instead of letting a pid index off the end of the map.
+    Returns the (possibly new) capacity and arrays; callers must rebind all three.
+    """
+    if needed <= capacity:
+        return capacity, pid_row, pid_slot
+    grown = capacity
+    while grown < needed:
+        grown *= 2
+    new_row = np.full(grown, -1, dtype=np.int64)
+    new_row[:capacity] = pid_row
+    new_slot = np.full(grown, -1, dtype=np.int64)
+    new_slot[:capacity] = pid_slot
+    return grown, new_row, new_slot
+
+
+def _ensure_pid_capacity_gpu(capacity, pid_row_t, pid_slot, needed, device):
+    """Device-tensor twin of _ensure_pid_capacity. Same tripwire role."""
+    if needed <= capacity:
+        return capacity, pid_row_t, pid_slot
+    grown = capacity
+    while grown < needed:
+        grown *= 2
+    new_row = torch.full((grown,), -1, device=device, dtype=torch.int64)
+    new_row[:capacity] = pid_row_t
+    new_slot = np.full(grown, -1, dtype=np.int64)
+    new_slot[:capacity] = pid_slot
+    return grown, new_row, new_slot
+
+
+class _TrackStore:
+    """Array-backed storage for the plotted particle trajectories.
+
+    Replaces four pid-keyed dicts (history_tracks / tracked_type /
+    tracked_lastpos / tracked_lastvel) and a set (tracked_lost), plus the Python
+    loop that appended one (3,) copy per tracked pid per sampling tick -- up to
+    3,000 dict lookups and copies every second step, on the order of 10^7 Python
+    iterations over a full run.
+
+    SLOTS, not pids, index every array here: a pid gets the next free slot when
+    it starts being tracked. Sampled vertices go into ONE flat buffer as
+    (slot, xyz) pairs appended in step order, and are regrouped per track once,
+    at the end of the run, by a stable argsort on the slot column. Stable is
+    load-bearing -- it is the only thing keeping each track's vertices in
+    chronological order.
+
+    Two vertices are held apart from that buffer because they are not on the
+    sampling cadence:
+      * the injection vertex, always a track's first, and
+      * the wall-impact vertex, always a track's last -- the particle is dead
+        from that step on, so it can never be sampled again. This is what makes
+        the crimson wall-strike traces terminate at the wall in
+        tokamak_reactor_2d.png / tokamak_reactor_3d.png.
+    Both are stored per slot in host arrays, so to_dicts can splice them onto
+    the ends without disturbing the sort.
+
+    device=None keeps sampled coordinates in a numpy buffer (CPU loop). Pass a
+    torch device and they accumulate in a device tensor instead, so the GPU loop
+    never routes a sample through the host: one transfer at end of run replaces
+    two per sampling step. The slot column stays on the host either way, because
+    slot ids are host-side bookkeeping in both loops -- which is also what lets
+    the host advance the write pointer without a device sync.
+
+    host_dtype exists to preserve each loop's existing vertex values exactly.
+    The CPU loop reads its injection vertex back out of the float32 pos_np; the
+    GPU loop reads it straight from the float64 array
+    inject_neutral_beam_cartesian returns, before it is cast down onto the
+    device. Those are different values, and both are what their path recorded
+    before this rewrite.
+    """
+
+    def __init__(self, slot_capacity, device=None, host_dtype=np.float32,
+                 vertex_capacity=4096):
+        self.device = device
+        self.slot_capacity = int(slot_capacity)
+        self.n_slots = 0
+
+        self.pids = np.full(self.slot_capacity, -1, dtype=np.int64)
+        self.species = np.zeros(self.slot_capacity, dtype=np.int8)
+        self.lost = np.zeros(self.slot_capacity, dtype=bool)
+
+        self.init_xyz = np.zeros((self.slot_capacity, 3), dtype=host_dtype)
+        self.final_xyz = np.zeros((self.slot_capacity, 3), dtype=host_dtype)
+        self.has_final = np.zeros(self.slot_capacity, dtype=bool)
+
+        # last_pos / last_vel have two sources. Injection and wall impact are
+        # host-side, sampling is device-side on the GPU path; last_is_host says
+        # which one currently holds the live value for a slot.
+        self.last_pos_host = np.zeros((self.slot_capacity, 3), dtype=host_dtype)
+        self.last_vel_host = np.zeros((self.slot_capacity, 3), dtype=host_dtype)
+        self.last_is_host = np.ones(self.slot_capacity, dtype=bool)
+
+        self.v_slot = np.empty(int(vertex_capacity), dtype=np.int32)
+        self.n_verts = 0
+        if device is None:
+            self.v_xyz = np.empty((int(vertex_capacity), 3), dtype=np.float32)
+            self.last_pos_dev = None
+            self.last_vel_dev = None
+        else:
+            self.v_xyz = torch.empty((int(vertex_capacity), 3),
+                                     dtype=torch.float32, device=device)
+            self.last_pos_dev = torch.zeros((self.slot_capacity, 3),
+                                            dtype=torch.float32, device=device)
+            self.last_vel_dev = torch.zeros((self.slot_capacity, 3),
+                                            dtype=torch.float32, device=device)
+
+    # -- slot bookkeeping -------------------------------------------------
+    def add_slots(self, pids, species, init_pos, init_vel):
+        """Start tracking pids. Returns the slot indices assigned, in order."""
+        n = len(pids)
+        if n == 0:
+            return np.empty(0, dtype=np.int64)
+        if self.n_slots + n > self.slot_capacity:
+            raise AssertionError(
+                f"_TrackStore slot overflow: {self.n_slots} + {n} > "
+                f"{self.slot_capacity}; the 1000-each tracked_nbis/tracked_alphas "
+                f"caps should have prevented this")
+        slots = np.arange(self.n_slots, self.n_slots + n, dtype=np.int64)
+        self.pids[slots] = pids
+        self.species[slots] = species
+        self.init_xyz[slots] = init_pos
+        self.last_pos_host[slots] = init_pos
+        self.last_vel_host[slots] = init_vel
+        self.last_is_host[slots] = True
+        self.n_slots += n
+        return slots
+
+    # -- vertex accumulation ----------------------------------------------
+    def _reserve(self, m):
+        need = self.n_verts + m
+        if need <= self.v_slot.shape[0]:
+            return
+        cap = self.v_slot.shape[0]
+        while cap < need:
+            cap *= 2
+        self.v_slot = np.resize(self.v_slot, cap)
+        if self.device is None:
+            grown = np.empty((cap, 3), dtype=np.float32)
+            grown[:self.n_verts] = self.v_xyz[:self.n_verts]
+        else:
+            grown = torch.empty((cap, 3), dtype=torch.float32, device=self.device)
+            grown[:self.n_verts] = self.v_xyz[:self.n_verts]
+        self.v_xyz = grown
+
+    def append_samples(self, slots_np, xyz):
+        """Append one sampled vertex per slot. xyz is numpy (CPU) or a device
+        tensor (GPU) with one row per entry of slots_np, already in slot order."""
+        m = len(slots_np)
+        if m == 0:
+            return
+        self._reserve(m)
+        w = self.n_verts
+        self.v_slot[w:w + m] = slots_np
+        self.v_xyz[w:w + m] = xyz
+        self.n_verts = w + m
+
+    def set_last_host(self, slots_np, pos, vel):
+        self.last_pos_host[slots_np] = pos
+        self.last_vel_host[slots_np] = vel
+        self.last_is_host[slots_np] = True
+
+    def set_last_device(self, slots_np, slots_t, pos_t, vel_t):
+        self.last_pos_dev[slots_t] = pos_t
+        self.last_vel_dev[slots_t] = vel_t
+        self.last_is_host[slots_np] = False
+
+    def record_impact(self, slots_np, pos, vel):
+        """Wall strike: the terminal vertex, off the sampling cadence."""
+        if len(slots_np) == 0:
+            return
+        self.final_xyz[slots_np] = pos
+        self.has_final[slots_np] = True
+        self.lost[slots_np] = True
+        self.set_last_host(slots_np, pos, vel)
+
+    # -- slot selection ----------------------------------------------------
+    def slots_due(self, sample_thermal, sample_alpha):
+        """Slot indices due to be sampled this step, by species cadence."""
+        n = self.n_slots
+        if n == 0:
+            return np.empty(0, dtype=np.int64)
+        if sample_thermal and sample_alpha:
+            return np.arange(n, dtype=np.int64)
+        is_alpha = self.species[:n] == 2
+        return np.nonzero(is_alpha if sample_alpha else ~is_alpha)[0]
+
+    # -- teardown ----------------------------------------------------------
+    def to_dicts(self):
+        """Rebuild the dict-of-lists payload the return signature still uses.
+
+        Runs once, after the loop. On the GPU path this is the ONLY place the
+        sampled vertices and the device-side last_pos/last_vel cross back to the
+        host.
+        """
+        n = self.n_verts
+        v_xyz = self.v_xyz[:n]
+        last_pos_dev = last_vel_dev = None
+        if self.device is not None:
+            v_xyz = v_xyz.cpu().numpy()
+            last_pos_dev = self.last_pos_dev[:self.n_slots].cpu().numpy()
+            last_vel_dev = self.last_vel_dev[:self.n_slots].cpu().numpy()
+
+        slots = self.v_slot[:n]
+        order = np.argsort(slots, kind="stable")
+        counts = (np.bincount(slots, minlength=self.n_slots) if n
+                  else np.zeros(self.n_slots, dtype=np.int64))
+
+        history_tracks, tracked_type = {}, {}
+        tracked_lastpos, tracked_lastvel = {}, {}
+        tracked_lost = set()
+
+        offset = 0
+        for s in range(self.n_slots):
+            pid = int(self.pids[s])
+            c = int(counts[s])
+            verts = [self.init_xyz[s].copy()]
+            if c:
+                verts.extend(v_xyz[order[offset:offset + c]])
+                offset += c
+            if self.has_final[s]:
+                verts.append(self.final_xyz[s].copy())
+
+            history_tracks[pid] = verts
+            tracked_type[pid] = int(self.species[s])
+            if self.last_is_host[s] or last_pos_dev is None:
+                tracked_lastpos[pid] = self.last_pos_host[s].copy()
+                tracked_lastvel[pid] = self.last_vel_host[s].copy()
+            else:
+                tracked_lastpos[pid] = last_pos_dev[s].copy()
+                tracked_lastvel[pid] = last_vel_dev[s].copy()
+            if self.lost[s]:
+                tracked_lost.add(pid)
+
+        return (history_tracks, tracked_type, tracked_lastpos,
+                tracked_lastvel, tracked_lost)
+
+
 def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid,
                           B_R_pol_grid, B_Z_pol_grid):
     # The whole per-step pipeline runs on Numpy/Numba. At this particle count (~10k-20k,
@@ -499,23 +771,35 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
     # Stable per-particle IDs. Lost particles are physically removed from the pools, not
     # just flagged type=-1, which shifts every row index -- so trajectory bookkeeping
-    # cannot be keyed on array position. pid_np stays sorted ascending (IDs are monotonic
-    # and compaction preserves order), so pid -> row is a searchsorted away.
+    # cannot be keyed on array position.
     n_init = len(pos_np)
     pid_np = np.arange(n_init, dtype=np.int64)
     next_pid = n_init
 
+    # pid -> current row, dense. This replaces np.searchsorted(pid_np, want),
+    # which was correct only because pid_np happened to be sorted ascending
+    # (monotonic ids, and compaction preserves order). Step 9 splits the bulk and
+    # alpha pools and retires that invariant permanently, at which point a
+    # searchsorted would not fail loudly -- it would silently return the wrong
+    # row and re-point a track at an unrelated particle. A dense map makes the
+    # lookup one gather and assumes no ordering at all.
+    # Sized from the largest pid the run can reach, NOT from n_init: pids are
+    # never reused, so injection walks them past the initial count.
+    pid_capacity = _pid_capacity_bound(cfg, n_init)
+    pid_row = np.full(pid_capacity, -1, dtype=np.int64)
+    pid_row[:n_init] = np.arange(n_init, dtype=np.int64)
+    # pid -> track slot, -1 when the pid is not plotted. Replaces the
+    # `dpid in history_tracks` dict membership test in the compaction below.
+    pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
+
     n_track = min(1000, n_init)
-    history_tracks = {int(pid_np[i]): [pos_np[i].copy()] for i in range(n_track)}
-    tracked_type = {int(pid_np[i]): 0 for i in range(n_track)}
-    tracked_lastpos = {int(pid_np[i]): pos_np[i].copy() for i in range(n_track)}
-    tracked_lastvel = {int(pid_np[i]): vel_np[i].copy() for i in range(n_track)}
+    # 1000 initial thermals + the 1000-each NBI and alpha caps below.
+    tracks = _TrackStore(_MAX_TRACKED_SLOTS, device=None, host_dtype=np.float32)
+    init_slots = tracks.add_slots(pid_np[:n_track], 0,
+                                  pos_np[:n_track], vel_np[:n_track])
+    pid_slot[pid_np[:n_track]] = init_slots
     tracked_nbis = 0
     tracked_alphas = 0
-    # Tracked pids that struck the wall. The type_np == -1 flag is erased by the
-    # compaction below in the same step, so the fate is recorded here instead;
-    # tracked_type holds the species.
-    tracked_lost = set()
 
     # Per-step field buffers, allocated once and reused. vectorized_gather_and_B
     # used to return a fresh pair of (N, 3) float32 arrays every step -- 24 MB
@@ -578,18 +862,23 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
                 new_pids = np.arange(next_pid, next_pid + batch_size, dtype=np.int64)
                 pid_np = np.append(pid_np, new_pids)
+                base_row = len(type_np) - batch_size
+                pid_capacity, pid_row, pid_slot = _ensure_pid_capacity(
+                    pid_capacity, pid_row, pid_slot, next_pid + batch_size)
+                pid_row[new_pids] = np.arange(base_row, base_row + batch_size,
+                                              dtype=np.int64)
                 next_pid += batch_size
                 total_injected += batch_size
 
-                for i in range(batch_size):
-                    if tracked_nbis < 1000:
-                        idx = len(type_np) - batch_size + i
-                        pid = int(new_pids[i])
-                        history_tracks[pid] = [pos_np[idx].copy()]
-                        tracked_type[pid] = 1
-                        tracked_lastpos[pid] = pos_np[idx].copy()
-                        tracked_lastvel[pid] = vel_np[idx].copy()
-                        tracked_nbis += 1
+                # The old loop tracked the first (1000 - tracked_nbis) of the
+                # batch and skipped the rest; take that same prefix.
+                n_new = min(batch_size, 1000 - tracked_nbis)
+                if n_new > 0:
+                    rows = np.arange(base_row, base_row + n_new, dtype=np.int64)
+                    slots = tracks.add_slots(new_pids[:n_new], 1,
+                                             pos_np[rows], vel_np[rows])
+                    pid_slot[new_pids[:n_new]] = slots
+                    tracked_nbis += n_new
 
         prof.add("NBI injection", _t)
 
@@ -617,17 +906,20 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             new_pids = np.arange(next_pid, next_pid + alpha_batch, dtype=np.int64)
             pid_np = np.append(pid_np, new_pids)
+            base_row = len(type_np) - alpha_batch
+            pid_capacity, pid_row, pid_slot = _ensure_pid_capacity(
+                pid_capacity, pid_row, pid_slot, next_pid + alpha_batch)
+            pid_row[new_pids] = np.arange(base_row, base_row + alpha_batch,
+                                          dtype=np.int64)
             next_pid += alpha_batch
 
-            for i in range(alpha_batch):
-                if tracked_alphas < 1000:
-                    idx = len(type_np) - alpha_batch + i
-                    pid = int(new_pids[i])
-                    history_tracks[pid] = [pos_np[idx].copy()]
-                    tracked_type[pid] = 2
-                    tracked_lastpos[pid] = pos_np[idx].copy()
-                    tracked_lastvel[pid] = vel_np[idx].copy()
-                    tracked_alphas += 1
+            n_new = min(alpha_batch, 1000 - tracked_alphas)
+            if n_new > 0:
+                rows = np.arange(base_row, base_row + n_new, dtype=np.int64)
+                slots = tracks.add_slots(new_pids[:n_new], 2,
+                                         pos_np[rows], vel_np[rows])
+                pid_slot[new_pids[:n_new]] = slots
+                tracked_alphas += n_new
 
         prof.add("alpha injection", _t)
 
@@ -732,23 +1024,30 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         if newly_lost > 0:
             alive = type_np != -1
             # Preserve the last known state of any tracked particle before it is dropped
-            dead_pids = pid_np[~alive]
-            if len(dead_pids) > 0:
-                dead_rows = np.nonzero(~alive)[0]
-                for k, dpid in zip(dead_rows, dead_pids):
-                    dpid = int(dpid)
-                    if dpid in history_tracks:
-                        tracked_lastpos[dpid] = pos_np[k].copy()
-                        tracked_lastvel[dpid] = vel_np[k].copy()
-                        tracked_lost.add(dpid)
-                        # Append the impact point so the red trace ends at the wall,
-                        # not at the last 20-step sampling tick
-                        history_tracks[dpid].append(pos_np[k].copy())
+            dead_rows = np.nonzero(~alive)[0]
+            if dead_rows.size > 0:
+                dead_pids = pid_np[dead_rows]
+                dead_slots = pid_slot[dead_pids]
+                is_tracked = dead_slots >= 0
+                if np.any(is_tracked):
+                    t_rows = dead_rows[is_tracked]
+                    t_slots = dead_slots[is_tracked]
+                    impact_pos = pos_np[t_rows]
+                    # The impact point, off the normal sampling cadence, so the
+                    # crimson trace ends at the wall rather than at the last
+                    # 20-step tick. Always a track's final vertex: pid_row goes
+                    # to -1 below, so the sampler can never touch it again.
+                    tracks.record_impact(t_slots, impact_pos, vel_np[t_rows])
+                pid_row[dead_pids] = -1
 
             pos_np = np.ascontiguousarray(pos_np[alive])
             vel_np = np.ascontiguousarray(vel_np[alive])
             type_np = np.ascontiguousarray(type_np[alive])
             pid_np = np.ascontiguousarray(pid_np[alive])
+            # Compaction renumbers every surviving row, so the map is rebuilt
+            # here. One scatter over the live pids replaces the per-track
+            # searchsorted the sampler used to do every other step.
+            pid_row[pid_np] = np.arange(len(pid_np), dtype=np.int64)
         prof.add("wall-loss compaction", _t)
 
         # --- TRAJECTORY SAMPLING (pid-keyed, so removal cannot corrupt it) ---
@@ -757,21 +1056,21 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # across, so a 20-step cadence (~0.26 m of travel) aliases it away.
         sample_thermal = (step % 20 == 0)
         sample_alpha = (step % cfg.ALPHA_HISTORY_EVERY == 0)
-        if (sample_thermal or sample_alpha) and len(history_tracks) > 0 and len(pid_np) > 0:
-            want = np.fromiter(history_tracks.keys(), dtype=np.int64, count=len(history_tracks))
-            rows = np.searchsorted(pid_np, want)
-            np.clip(rows, 0, len(pid_np) - 1, out=rows)
-            live = pid_np[rows] == want
-            for k in range(len(want)):
-                if not live[k]:
-                    continue
-                pid = int(want[k])
-                is_alpha = tracked_type.get(pid, 0) == 2
-                if (is_alpha and sample_alpha) or ((not is_alpha) and sample_thermal):
-                    r = rows[k]
-                    history_tracks[pid].append(pos_np[r].copy())
-                    tracked_lastpos[pid] = pos_np[r].copy()
-                    tracked_lastvel[pid] = vel_np[r].copy()
+        if (sample_thermal or sample_alpha) and tracks.n_slots > 0 and len(pid_np) > 0:
+            # One mask for (due this step AND still alive), then a single fancy
+            # index for every sampled position. The old form looped in Python
+            # over up to 3,000 tracked pids with a dict lookup and two .copy()
+            # calls each, every second step.
+            due = tracks.slots_due(sample_thermal, sample_alpha)
+            if due.size > 0:
+                rows = pid_row[tracks.pids[due]]
+                keep = rows >= 0
+                sel_slots = due[keep]
+                sel_rows = rows[keep]
+                if sel_rows.size > 0:
+                    sampled_pos = pos_np[sel_rows]
+                    tracks.append_samples(sel_slots, sampled_pos)
+                    tracks.set_last_host(sel_slots, sampled_pos, vel_np[sel_rows])
         prof.add("trajectory sampling", _t)
 
         _t = prof.mark()
@@ -943,6 +1242,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
     # Tracked-particle metadata is returned as pid-keyed dicts, which removal cannot
     # corrupt -- row indices no longer survive a step now that losses are compacted out.
+    # The loop accumulates into flat arrays; the dicts are rebuilt once, here, so the
+    # return signature and package_reactor_results are unchanged.
+    (history_tracks, tracked_type, tracked_lastpos,
+     tracked_lastvel, tracked_lost) = tracks.to_dicts()
     return (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
             tracked_lost,
             total_injected, total_lost,
@@ -999,16 +1302,34 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pid_tensor = torch.arange(n_init, device=device, dtype=torch.int64)
     next_pid = n_init
 
+    # pid -> current row, dense and ON DEVICE. Same reasoning as the CPU path:
+    # torch.searchsorted needs pid_tensor sorted ascending, an invariant step 9
+    # retires. Keeping the map on the device means compaction can renumber it
+    # with a scatter and the sampler can gather rows without a sync.
+    pid_capacity = _pid_capacity_bound(cfg, n_init)
+    pid_row_t = torch.full((pid_capacity,), -1, device=device, dtype=torch.int64)
+    pid_row_t[:n_init] = torch.arange(n_init, device=device, dtype=torch.int64)
+    # Liveness and slot assignment stay on the HOST. That is what lets the host
+    # know how many rows a sample will write without asking the device, so the
+    # vertex write pointer advances with no .item() sync. Tracked particles die
+    # only at the wall, and the compaction below already pulls exactly that
+    # (small, pid-gated) set across, so the host copy stays in step cheaply.
+    pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
+    slot_alive = np.zeros(_MAX_TRACKED_SLOTS, dtype=bool)
+
     n_track = min(1000, n_init)
-    history_tracks = {i: [pos_np_init[i].copy()] for i in range(n_track)}
-    tracked_type = {i: 0 for i in range(n_track)}
-    tracked_lastpos = {i: pos_np_init[i].copy() for i in range(n_track)}
-    tracked_lastvel = {i: vel_np_init[i].copy() for i in range(n_track)}
+    # host_dtype float64: this path records its injection vertex straight from
+    # the float64 array inject_neutral_beam_cartesian returns, before the cast
+    # onto the device, and that is the value it recorded before this rewrite.
+    tracks = _TrackStore(_MAX_TRACKED_SLOTS, device=device, host_dtype=np.float64)
+    init_pids = np.arange(n_track, dtype=np.int64)
+    init_slots = tracks.add_slots(init_pids, 0,
+                                  pos_np_init[:n_track], vel_np_init[:n_track])
+    pid_slot[init_pids] = init_slots
+    slot_alive[init_slots] = True
     tracked_nbis = 0
     tracked_alphas = 0
     max_tracked_pid = n_track - 1
-    # See the CPU path: tracked_type holds the species, this holds the fate
-    tracked_lost = set()
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
@@ -1069,15 +1390,20 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 pid_tensor = torch.cat([pid_tensor, new_pids], dim=0)
                 total_injected += batch_size
 
-                for i in range(batch_size):
-                    if tracked_nbis < 1000:
-                        pid = next_pid + i
-                        history_tracks[pid] = [p_nbi[i].copy()]
-                        tracked_type[pid] = 1
-                        tracked_lastpos[pid] = p_nbi[i].copy()
-                        tracked_lastvel[pid] = v_nbi[i].copy()
-                        max_tracked_pid = max(max_tracked_pid, pid)
-                        tracked_nbis += 1
+                base_row = pid_tensor.shape[0] - batch_size
+                pid_capacity, pid_row_t, pid_slot = _ensure_pid_capacity_gpu(
+                    pid_capacity, pid_row_t, pid_slot, next_pid + batch_size, device)
+                pid_row_t[new_pids] = torch.arange(base_row, base_row + batch_size,
+                                                   device=device, dtype=torch.int64)
+
+                n_new = min(batch_size, 1000 - tracked_nbis)
+                if n_new > 0:
+                    host_pids = np.arange(next_pid, next_pid + n_new, dtype=np.int64)
+                    slots = tracks.add_slots(host_pids, 1, p_nbi[:n_new], v_nbi[:n_new])
+                    pid_slot[host_pids] = slots
+                    slot_alive[slots] = True
+                    max_tracked_pid = max(max_tracked_pid, int(host_pids[-1]))
+                    tracked_nbis += n_new
 
                 next_pid += batch_size
 
@@ -1108,15 +1434,20 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             new_pids = torch.arange(next_pid, next_pid + alpha_batch, device=device, dtype=torch.int64)
             pid_tensor = torch.cat([pid_tensor, new_pids], dim=0)
 
-            for i in range(alpha_batch):
-                if tracked_alphas < 1000:
-                    pid = next_pid + i
-                    history_tracks[pid] = [p_alpha[i].copy()]
-                    tracked_type[pid] = 2
-                    tracked_lastpos[pid] = p_alpha[i].copy()
-                    tracked_lastvel[pid] = v_alpha[i].copy()
-                    max_tracked_pid = max(max_tracked_pid, pid)
-                    tracked_alphas += 1
+            base_row = pid_tensor.shape[0] - alpha_batch
+            pid_capacity, pid_row_t, pid_slot = _ensure_pid_capacity_gpu(
+                pid_capacity, pid_row_t, pid_slot, next_pid + alpha_batch, device)
+            pid_row_t[new_pids] = torch.arange(base_row, base_row + alpha_batch,
+                                               device=device, dtype=torch.int64)
+
+            n_new = min(alpha_batch, 1000 - tracked_alphas)
+            if n_new > 0:
+                host_pids = np.arange(next_pid, next_pid + n_new, dtype=np.int64)
+                slots = tracks.add_slots(host_pids, 2, p_alpha[:n_new], v_alpha[:n_new])
+                pid_slot[host_pids] = slots
+                slot_alive[slots] = True
+                max_tracked_pid = max(max_tracked_pid, int(host_pids[-1]))
+                tracked_alphas += n_new
 
             next_pid += alpha_batch
 
@@ -1220,19 +1551,27 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 d_pids = pid_tensor[d_rows].cpu().numpy()
                 d_pos = pos_tensor[d_rows].cpu().numpy()
                 d_vel = vel_tensor[d_rows].cpu().numpy()
-                for k in range(len(d_pids)):
-                    dpid = int(d_pids[k])
-                    if dpid in history_tracks:
-                        tracked_lastpos[dpid] = d_pos[k].copy()
-                        tracked_lastvel[dpid] = d_vel[k].copy()
-                        tracked_lost.add(dpid)
-                        # End the red trace at the wall, not at the last sampling tick
-                        history_tracks[dpid].append(d_pos[k].copy())
+                d_slots = pid_slot[d_pids]
+                is_tracked = d_slots >= 0
+                if np.any(is_tracked):
+                    t_slots = d_slots[is_tracked]
+                    # End the crimson trace at the wall, not at the last sampling
+                    # tick. Always terminal: slot_alive goes False here, so the
+                    # sampler never selects the slot again.
+                    tracks.record_impact(t_slots, d_pos[is_tracked], d_vel[is_tracked])
+                    slot_alive[t_slots] = False
 
+            dead_pids_t = pid_tensor[~alive]
             pos_tensor = pos_tensor[alive]
             vel_tensor = vel_tensor[alive]
             type_tensor = type_tensor[alive]
             pid_tensor = pid_tensor[alive]
+            # Renumber the device-side pid -> row map: dead pids to -1, then one
+            # scatter giving every survivor its new row. Replaces the per-step
+            # torch.searchsorted the sampler used to run.
+            pid_row_t[dead_pids_t] = -1
+            pid_row_t[pid_tensor] = torch.arange(pid_tensor.shape[0],
+                                                 device=device, dtype=torch.int64)
         prof.add("wall-loss compaction", _t)
 
         # Pull only the tracked particles (<=2000) needed for trajectory plots, never the
@@ -1243,22 +1582,24 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         _t = prof.mark()
         sample_thermal = (step % 20 == 0)
         sample_alpha = (step % cfg.ALPHA_HISTORY_EVERY == 0)
-        if (sample_thermal or sample_alpha) and len(history_tracks) > 0 and pid_tensor.numel() > 0:
-            want_list = list(history_tracks.keys())
-            want_t = torch.tensor(want_list, device=device, dtype=torch.int64)
-            rows = torch.searchsorted(pid_tensor, want_t).clamp(max=pid_tensor.numel() - 1)
-            live = pid_tensor[rows] == want_t
-            subset_pos = pos_tensor[rows].cpu().numpy()
-            subset_vel = vel_tensor[rows].cpu().numpy()
-            live_np = live.cpu().numpy()
-            for k, pid in enumerate(want_list):
-                if not live_np[k]:
-                    continue
-                is_alpha = tracked_type.get(pid, 0) == 2
-                if (is_alpha and sample_alpha) or ((not is_alpha) and sample_thermal):
-                    history_tracks[pid].append(subset_pos[k].copy())
-                    tracked_lastpos[pid] = subset_pos[k].copy()
-                    tracked_lastvel[pid] = subset_vel[k].copy()
+        if (sample_thermal or sample_alpha) and tracks.n_slots > 0 and pid_tensor.numel() > 0:
+            # The whole selection -- which slots are due, which are still alive,
+            # and therefore HOW MANY rows this sample writes -- is decided on the
+            # host, from slot_alive. That is what keeps the write pointer free of
+            # any .item() sync. Only the gather runs on the device, and the
+            # sampled coordinates stay there: the old form downloaded two
+            # (n_tracked, 3) arrays every sampling step and walked them in Python.
+            due = tracks.slots_due(sample_thermal, sample_alpha)
+            if due.size > 0:
+                sel_slots = due[slot_alive[due]]
+                if sel_slots.size > 0:
+                    sel_slots_t = torch.from_numpy(sel_slots).to(device)
+                    track_pids_t = torch.from_numpy(tracks.pids[sel_slots]).to(device)
+                    rows_t = pid_row_t[track_pids_t]
+                    sampled_pos = pos_tensor[rows_t]
+                    tracks.append_samples(sel_slots, sampled_pos)
+                    tracks.set_last_device(sel_slots, sel_slots_t,
+                                           sampled_pos, vel_tensor[rows_t])
 
         prof.add("trajectory sampling", _t)
 
@@ -1442,6 +1783,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     vel_np = vel_tensor.cpu().numpy()
     type_np = type_tensor.cpu().numpy()
 
+    # Flat-array accumulation -> the dict payload, once. This is the only place
+    # the sampled vertices and the device-side last_pos/last_vel cross to the host.
+    (history_tracks, tracked_type, tracked_lastpos,
+     tracked_lastvel, tracked_lost) = tracks.to_dicts()
     return (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
             tracked_lost,
             total_injected, total_lost,
