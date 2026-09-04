@@ -25,6 +25,15 @@ HOW TO USE
 IMPORTANT: One of the most beneficial features of the simulation is that the simulation's performance scales with the hardware of the user. For those with more powerful CPU's, the simulation will run and finish faster when toggling on Numba JIT as opposed to slower CPU's. For those with powerful GPU's, the simulation will run and finish far faster than those with slower GPU's. Furthermore, the PyTorch simulation run will almost universally perform better on Windows as opposed to Mac, as even with high-end Macs, the unified chip means that the calculations/simulation cannot be fully offloaded to the GPU, whereas on Windows PC's, the simulation is fully offloaded to the GPU as PC's have a discrete GPU -- meaning it is completely separate from the CPU due to the PC's non-unified architecture. For those using Macs, the PyTorch model runs far faster on models with a higher memory bus/throughput (measured in GB/s).
 
 
+Scope and limitations
+
+The reactor path models magnetic confinement with collisional transport. The
+electrostatic field is not self-consistent: the plasma is quasi-neutral by
+construction with no separate electron population, and the 50x50 grid
+under-resolves the Debye length by ~870x, so a resolved electrostatic solve
+isn't meaningful at this scale. Fusion power, radiation losses, and Lawson
+diagnostics are computed independently and are unaffected.
+
 Development Timeline & Physics Explanations
 
 Phase I: Single Particle Kinematics & Boundaries
