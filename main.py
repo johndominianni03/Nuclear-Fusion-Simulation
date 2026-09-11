@@ -562,8 +562,13 @@ class _ParticlePool:
         return self.pos[:n], self.vel[:n], self.type[:n], self.pid[:n]
 
     def _require(self, extra):
+        # RuntimeError, not assert: `python -O` strips assert statements, and
+        # AssertionError is what an assert raises, so either form would make this
+        # guard optional at runtime. It must not be. The thing it stands in front
+        # of is an out-of-range write in a numba kernel that does not bounds-check
+        # -- silent memory corruption, not an IndexError.
         if self.n_live + extra > self.capacity:
-            raise AssertionError(
+            raise RuntimeError(
                 f"_ParticlePool overflow: n_live={self.n_live} + {extra} exceeds "
                 f"capacity={self.capacity}. The capacity comes from "
                 f"_pid_capacity_bound, which is meant to be a hard ceiling on the "
@@ -647,7 +652,10 @@ def _require_pid_capacity(next_pid, batch, capacity, where):
     would raise a step later anyway. Fail here, naming the site.
     """
     if next_pid + batch > capacity:
-        raise AssertionError(
+        # RuntimeError rather than assert: see _ParticlePool._require. Stripped
+        # under `python -O`, this guard would hand an out-of-range index straight
+        # to the pid maps.
+        raise RuntimeError(
             f"pid capacity exceeded at {where}: next_pid={next_pid} + {batch} > "
             f"capacity={capacity}. _pid_capacity_bound is meant to be a hard "
             f"ceiling on the injection schedule; fix the bound rather than "
@@ -737,7 +745,8 @@ class _TrackStore:
         if n == 0:
             return np.empty(0, dtype=np.int64)
         if self.n_slots + n > self.slot_capacity:
-            raise AssertionError(
+            # RuntimeError rather than assert: see _ParticlePool._require.
+            raise RuntimeError(
                 f"_TrackStore slot overflow: {self.n_slots} + {n} > "
                 f"{self.slot_capacity}; the 1000-each tracked_nbis/tracked_alphas "
                 f"caps should have prevented this")

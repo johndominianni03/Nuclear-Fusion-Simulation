@@ -96,7 +96,7 @@ class SimulationConfiguration:
         # additive: it reads clocks and accumulates floats, and touches no
         # array, no RNG and no control flow, so a profiled run and an
         # unprofiled one produce identical numbers.
-        self.PROFILE = False
+        self.PROFILE = True
 
         # Shattered Pellet Injection (SPI) constants
         self.IMPURITY_DENSITY_NZ = 5.0e19       # Injected Neon/Argon density (m^-3)
