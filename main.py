@@ -486,6 +486,122 @@ def _boris_push_adaptive(pos, vel, q, m, B, E, dt, device):
         vectorized_boris_push_numba_fallback(pos, vel, q, m, B, E, dt)
 
 
+@njit(cache=True)
+def _compact_pool_numba(pos, vel, typ, pid, idx, m):
+    """In-place stream compaction of the four particle arrays.
+
+    idx holds the surviving row indices in ASCENDING order, so idx[k] >= k for
+    every k: the destination has always already been read by the time it is
+    written. That is what makes this safe to do in place with no temporary,
+    where `pool.pos[:m] = pool.pos[idx]` would materialise an (m, 3) copy first.
+
+    Sequential on purpose -- do NOT prange this. The read/write overlap that
+    makes the forward pass safe depends on the strict k ordering, and under
+    parallel execution one thread can write row k_A while another still needs it
+    as the source idx[k_B] = k_A for some k_B < k_A.
+    """
+    for k in range(m):
+        src = idx[k]
+        pos[k, 0] = pos[src, 0]
+        pos[k, 1] = pos[src, 1]
+        pos[k, 2] = pos[src, 2]
+        vel[k, 0] = vel[src, 0]
+        vel[k, 1] = vel[src, 1]
+        vel[k, 2] = vel[src, 2]
+        typ[k] = typ[src]
+        pid[k] = pid[src]
+
+
+class _ParticlePool:
+    """Capacity-backed particle storage: pos/vel/type/pid allocated once, with an
+    n_live write pointer.
+
+    Both loops used to grow by full reallocation -- np.vstack/np.append on the
+    CPU path, torch.cat on the GPU path -- once every cfg.inject_every_n_steps.
+    At 1,000,000 particles that copied ~36 MB per event (12 MB pos + 12 MB vel +
+    4 MB type + 8 MB pid), about 5,000 times over a production run, and churned
+    the MPS allocator badly on the GPU side.
+
+    The capacity is a HARD CEILING, not a guess: _pid_capacity_bound counts every
+    particle the injection schedule can source, and losses only ever compact
+    downward, so n_live can never legitimately exceed it. add() therefore RAISES
+    on overflow instead of reallocating. A silent grow would paper over a broken
+    bound, and the bound is also what sizes pid_row/pid_slot/pid_pool -- so if it
+    were wrong, the quiet failure being hidden is an out-of-range write in a numba
+    kernel that does not bounds-check.
+
+    device=None keeps the arrays in numpy (CPU loop); pass a torch device and the
+    same structure holds device tensors instead.
+    """
+
+    def __init__(self, capacity, device=None):
+        self.capacity = int(capacity)
+        self.device = device
+        self.n_live = 0
+        if device is None:
+            self.pos = np.empty((self.capacity, 3), dtype=np.float32)
+            self.vel = np.empty((self.capacity, 3), dtype=np.float32)
+            self.type = np.empty(self.capacity, dtype=np.int32)
+            self.pid = np.empty(self.capacity, dtype=np.int64)
+        else:
+            self.pos = torch.empty((self.capacity, 3), dtype=torch.float32, device=device)
+            self.vel = torch.empty((self.capacity, 3), dtype=torch.float32, device=device)
+            self.type = torch.empty(self.capacity, dtype=torch.int32, device=device)
+            self.pid = torch.empty(self.capacity, dtype=torch.int64, device=device)
+
+    def views(self):
+        """The live prefix of each array.
+
+        A leading-axis slice of a C-contiguous array is itself C-contiguous, so
+        every numba signature and every torch kernel sees exactly what it saw
+        before the pools existed -- no recompilation, no hidden copy. Kernels
+        that mutate in place (the Boris push, check_confinement_flux,
+        apply_vectorized_collisions) write straight through into the pool.
+        """
+        n = self.n_live
+        return self.pos[:n], self.vel[:n], self.type[:n], self.pid[:n]
+
+    def _require(self, extra):
+        if self.n_live + extra > self.capacity:
+            raise AssertionError(
+                f"_ParticlePool overflow: n_live={self.n_live} + {extra} exceeds "
+                f"capacity={self.capacity}. The capacity comes from "
+                f"_pid_capacity_bound, which is meant to be a hard ceiling on the "
+                f"injection schedule -- reaching it means that bound is wrong. "
+                f"Fix the bound; do not grow the pool here.")
+
+    def add(self, pos_block, vel_block, type_value, pid_block):
+        """Append a batch. Returns the first row written."""
+        batch = len(pid_block)
+        if batch == 0:
+            return self.n_live
+        self._require(batch)
+        start, end = self.n_live, self.n_live + batch
+        self.pos[start:end] = pos_block
+        self.vel[start:end] = vel_block
+        self.type[start:end] = type_value
+        self.pid[start:end] = pid_block
+        self.n_live = end
+        return start
+
+    def compact(self, alive_idx):
+        """Keep only alive_idx (ascending), in place. Returns the new n_live."""
+        m = len(alive_idx)
+        if self.device is None:
+            _compact_pool_numba(self.pos, self.vel, self.type, self.pid,
+                                alive_idx, m)
+        else:
+            # index_select allocates one temporary per array. Left as is on
+            # purpose: wall-loss compaction measures 0.0% of loop wall, so the
+            # contortion to avoid it would buy nothing.
+            self.pos[:m] = self.pos.index_select(0, alive_idx)
+            self.vel[:m] = self.vel.index_select(0, alive_idx)
+            self.type[:m] = self.type.index_select(0, alive_idx)
+            self.pid[:m] = self.pid.index_select(0, alive_idx)
+        self.n_live = m
+        return m
+
+
 # Hard ceiling on plotted trajectories: 1000 initial thermals plus the
 # tracked_nbis and tracked_alphas caps of 1000 each, all three enforced at the
 # injection sites. _TrackStore raises rather than silently overrunning.
@@ -507,8 +623,11 @@ def _pid_capacity_bound(cfg, n_init):
                 only ever shrinks it.
       alphas -- exactly one every cfg.inject_every_n_steps * 2 steps.
 
-    _ensure_pid_capacity still grows the arrays if anything ever exceeds this,
-    so the bound is a sizing hint and not a correctness assumption.
+    Step 8 makes this bound load-bearing in a second way: it also sizes the
+    _ParticlePool row capacity, because max rows and max pid are the same
+    quantity (n_init + everything injection can source, since losses only
+    compact downward). The pool RAISES on overflow rather than growing, so a
+    wrong bound surfaces immediately instead of being absorbed.
     """
     steps = int(cfg.reactor_num_steps)
     nbi_events = steps // max(1, int(cfg.inject_every_n_steps)) + 1
@@ -517,38 +636,22 @@ def _pid_capacity_bound(cfg, n_init):
     return int(n_init + nbi_events * nbi_max + alpha_events) + 1024
 
 
-def _ensure_pid_capacity(capacity, pid_row, pid_slot, needed):
-    """Grow the dense pid -> row / pid -> slot maps to hold pid `needed - 1`.
+def _require_pid_capacity(next_pid, batch, capacity, where):
+    """Tripwire for the pid maps, which share the pool's hard ceiling.
 
-    _pid_capacity_bound already sizes for the whole run, so this is a tripwire
-    rather than a hot path: it fires only if the injection schedule ever exceeds
-    that bound, and grows instead of letting a pid index off the end of the map.
-    Returns the (possibly new) capacity and arrays; callers must rebind all three.
+    Replaces the pair of _ensure_pid_capacity helpers that used to DOUBLE the
+    maps on overflow. Growing was the wrong response: pid_capacity comes from
+    _pid_capacity_bound, which counts every particle the injection schedule can
+    source, so overflowing it means that bound is wrong -- and quietly enlarging
+    the map hides the bug while _ParticlePool.add, sized from the same number,
+    would raise a step later anyway. Fail here, naming the site.
     """
-    if needed <= capacity:
-        return capacity, pid_row, pid_slot
-    grown = capacity
-    while grown < needed:
-        grown *= 2
-    new_row = np.full(grown, -1, dtype=np.int64)
-    new_row[:capacity] = pid_row
-    new_slot = np.full(grown, -1, dtype=np.int64)
-    new_slot[:capacity] = pid_slot
-    return grown, new_row, new_slot
-
-
-def _ensure_pid_capacity_gpu(capacity, pid_row_t, pid_slot, needed, device):
-    """Device-tensor twin of _ensure_pid_capacity. Same tripwire role."""
-    if needed <= capacity:
-        return capacity, pid_row_t, pid_slot
-    grown = capacity
-    while grown < needed:
-        grown *= 2
-    new_row = torch.full((grown,), -1, device=device, dtype=torch.int64)
-    new_row[:capacity] = pid_row_t
-    new_slot = np.full(grown, -1, dtype=np.int64)
-    new_slot[:capacity] = pid_slot
-    return grown, new_row, new_slot
+    if next_pid + batch > capacity:
+        raise AssertionError(
+            f"pid capacity exceeded at {where}: next_pid={next_pid} + {batch} > "
+            f"capacity={capacity}. _pid_capacity_bound is meant to be a hard "
+            f"ceiling on the injection schedule; fix the bound rather than "
+            f"growing the map here.")
 
 
 class _TrackStore:
@@ -765,15 +868,14 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # per-step kernels (gather, CIC, collisions, confinement) costs more in Metal
     # command-buffer overhead than the math itself. Pull the tensors to Numpy once here
     # and never touch torch inside the hot loop.
-    pos_np = pos_tensor.cpu().numpy()
-    vel_np = vel_tensor.cpu().numpy()
-    type_np = type_tensor.cpu().numpy()
+    pos_init = pos_tensor.cpu().numpy()
+    vel_init = vel_tensor.cpu().numpy()
+    type_init = type_tensor.cpu().numpy()
 
     # Stable per-particle IDs. Lost particles are physically removed from the pools, not
     # just flagged type=-1, which shifts every row index -- so trajectory bookkeeping
     # cannot be keyed on array position.
-    n_init = len(pos_np)
-    pid_np = np.arange(n_init, dtype=np.int64)
+    n_init = len(pos_init)
     next_pid = n_init
 
     # pid -> current row, dense. This replaces np.searchsorted(pid_np, want),
@@ -791,6 +893,24 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # pid -> track slot, -1 when the pid is not plotted. Replaces the
     # `dpid in history_tracks` dict membership test in the compaction below.
     pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
+    # pid -> which pool the particle lives in. Only one pool exists today, so
+    # every live pid maps to 0; step 9 splits bulk (0) from alpha (1) and this
+    # becomes the thing that says which pool a row index is relative to.
+    # Added now rather than in step 9 so the birth sites are touched once.
+    #
+    # WRITE-ONCE, at birth. It is deliberately NOT updated by compaction, and
+    # that is sound rather than an oversight: species never migrates. type is
+    # written only at birth (0/1/2) and at death (-1) -- THERMALIZATION_ENERGY_KEV
+    # gates whether an alpha keeps heating, it does not reclassify it -- so a
+    # particle can never change pool. pid_row already carries -1 for the dead.
+    pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
+    pid_pool[:n_init] = 0
+
+    # Capacity-backed storage, replacing the vstack/append growth below.
+    pool = _ParticlePool(pid_capacity, device=None)
+    pool.add(pos_init, vel_init, 0, np.arange(n_init, dtype=np.int64))
+    pos_np, vel_np, type_np, pid_np = pool.views()
+    type_np[:] = type_init          # preserve any non-zero species from init
 
     n_track = min(1000, n_init)
     # 1000 initial thermals + the 1000-each NBI and alpha caps below.
@@ -808,9 +928,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # which writes every row it is given, so stale rows past n are never read.
     # Capacity starts above the initial count (NBI and alpha injection grow the
     # pools) and doubles only if the live count outruns it.
-    field_capacity = n_init + n_init // 4 + 1024
-    E_buf = np.empty((field_capacity, 3), dtype=np.float32)
-    B_buf = np.empty((field_capacity, 3), dtype=np.float32)
+    # Sized from the pool's capacity rather than a second, independently-grown
+    # number. Two capacities that can disagree is exactly the bug this avoids:
+    # vectorized_gather_and_B_into does not bounds-check its E_out/B_out stores,
+    # so a field buffer shorter than n_live is a silent out-of-range write, not
+    # an IndexError.
+    E_buf = np.empty((pool.capacity, 3), dtype=np.float32)
+    B_buf = np.empty((pool.capacity, 3), dtype=np.float32)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
@@ -856,17 +980,17 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 psi_bounds = (engine.eq.psi_grid, engine.eq.psi_core, engine.eq.psi_R_min, engine.eq.psi_R_max,
                               engine.eq.psi_Z_min, engine.eq.psi_Z_max, engine.eq.psi_nR, engine.eq.psi_nZ)
                 p_nbi, v_nbi = engine.inject_neutral_beam_cartesian(num_ions=batch_size, E_keV=cfg.nbi_energy_keV, psi_bounds=psi_bounds)
-                pos_np = np.vstack((pos_np, p_nbi)).astype(np.float32)
-                vel_np = np.vstack((vel_np, v_nbi)).astype(np.float32)
-                type_np = np.append(type_np, np.full(batch_size, 1)).astype(np.int32)
-
+                _require_pid_capacity(next_pid, batch_size, pid_capacity, "CPU NBI injection")
                 new_pids = np.arange(next_pid, next_pid + batch_size, dtype=np.int64)
-                pid_np = np.append(pid_np, new_pids)
-                base_row = len(type_np) - batch_size
-                pid_capacity, pid_row, pid_slot = _ensure_pid_capacity(
-                    pid_capacity, pid_row, pid_slot, next_pid + batch_size)
+                # Writes into rows [n_live : n_live+batch] -- no reallocation.
+                # Assigning float64 p_nbi into the float32 pool rounds exactly as
+                # the old vstack(...).astype(np.float32) did; verified
+                # bit-identical on real injector output before this change.
+                base_row = pool.add(p_nbi, v_nbi, 1, new_pids)
+                pos_np, vel_np, type_np, pid_np = pool.views()
                 pid_row[new_pids] = np.arange(base_row, base_row + batch_size,
                                               dtype=np.int64)
+                pid_pool[new_pids] = 0
                 next_pid += batch_size
                 total_injected += batch_size
 
@@ -900,17 +1024,14 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             v_alpha[:, 1] = avR * np.sin(phi_pos) + avphi * np.cos(phi_pos)
             v_alpha[:, 2] = avZ
 
-            pos_np = np.vstack((pos_np, p_alpha)).astype(np.float32)
-            vel_np = np.vstack((vel_np, v_alpha)).astype(np.float32)
-            type_np = np.append(type_np, np.full(alpha_batch, 2)).astype(np.int32)
-
+            _require_pid_capacity(next_pid, alpha_batch, pid_capacity, "CPU alpha injection")
             new_pids = np.arange(next_pid, next_pid + alpha_batch, dtype=np.int64)
-            pid_np = np.append(pid_np, new_pids)
-            base_row = len(type_np) - alpha_batch
-            pid_capacity, pid_row, pid_slot = _ensure_pid_capacity(
-                pid_capacity, pid_row, pid_slot, next_pid + alpha_batch)
+            base_row = pool.add(p_alpha, v_alpha, 2, new_pids)
+            pos_np, vel_np, type_np, pid_np = pool.views()
             pid_row[new_pids] = np.arange(base_row, base_row + alpha_batch,
                                           dtype=np.int64)
+            # Still pool 0: step 9 is what makes alphas their own pool.
+            pid_pool[new_pids] = 0
             next_pid += alpha_batch
 
             n_new = min(alpha_batch, 1000 - tracked_alphas)
@@ -943,12 +1064,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("solve_fields (Poisson)", _t)
 
         _t = prof.mark()
-        n_live = len(pos_np)
-        if n_live > field_capacity:
-            while field_capacity < n_live:
-                field_capacity *= 2
-            E_buf = np.empty((field_capacity, 3), dtype=np.float32)
-            B_buf = np.empty((field_capacity, 3), dtype=np.float32)
+        n_live = pool.n_live
+        # No growth check: the buffers are pool.capacity rows, and pool.add
+        # raises before n_live could ever exceed that.
         # Views, not copies: the masked gathers below index these exactly as they
         # did the freshly allocated arrays.
         E_np = E_buf[:n_live]
@@ -1002,6 +1120,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("alpha substep push", _t)
 
         _t = prof.mark()
+        # The numba kernel mutates vel_arr in place and returns the same array, so
+        # this rebinding is a no-op and vel_np stays the pool view. Do not replace
+        # it with anything that allocates -- see the torch twin in the GPU loop.
         vel_np = apply_vectorized_collisions(vel_np, type_np, cfg.nu_c, cfg.reactor_dt)
         prof.add("apply_vectorized_collisions", _t)
 
@@ -1040,13 +1161,16 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     tracks.record_impact(t_slots, impact_pos, vel_np[t_rows])
                 pid_row[dead_pids] = -1
 
-            pos_np = np.ascontiguousarray(pos_np[alive])
-            vel_np = np.ascontiguousarray(vel_np[alive])
-            type_np = np.ascontiguousarray(type_np[alive])
-            pid_np = np.ascontiguousarray(pid_np[alive])
+            # In-place forward compaction into the same buffers, replacing four
+            # full-array reallocations. alive_rows is ascending, so every
+            # destination has been read before it is written.
+            alive_rows = np.nonzero(alive)[0]
+            pool.compact(alive_rows)
+            pos_np, vel_np, type_np, pid_np = pool.views()
             # Compaction renumbers every surviving row, so the map is rebuilt
             # here. One scatter over the live pids replaces the per-track
-            # searchsorted the sampler used to do every other step.
+            # searchsorted the sampler used to do every other step. pid_pool is
+            # NOT touched: a particle cannot change pool, only rows move.
             pid_row[pid_np] = np.arange(len(pid_np), dtype=np.int64)
         prof.add("wall-loss compaction", _t)
 
@@ -1299,7 +1423,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # cannot be keyed on row position. pid_tensor stays sorted ascending (IDs are
     # monotonic, mask compaction preserves order), so pid -> row is a searchsorted away.
     n_init = pos_tensor.shape[0]
-    pid_tensor = torch.arange(n_init, device=device, dtype=torch.int64)
     next_pid = n_init
 
     # pid -> current row, dense and ON DEVICE. Same reasoning as the CPU path:
@@ -1309,12 +1432,24 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pid_capacity = _pid_capacity_bound(cfg, n_init)
     pid_row_t = torch.full((pid_capacity,), -1, device=device, dtype=torch.int64)
     pid_row_t[:n_init] = torch.arange(n_init, device=device, dtype=torch.int64)
+
+    # Device-resident capacity pool, replacing the torch.cat growth below. Same
+    # hard-ceiling contract as the CPU path: add() raises rather than growing.
+    pool = _ParticlePool(pid_capacity, device=device)
+    pool.add(pos_tensor, vel_tensor, 0,
+             torch.arange(n_init, device=device, dtype=torch.int64))
+    pool.type[:n_init] = type_tensor
+    pos_tensor, vel_tensor, type_tensor, pid_tensor = pool.views()
     # Liveness and slot assignment stay on the HOST. That is what lets the host
     # know how many rows a sample will write without asking the device, so the
     # vertex write pointer advances with no .item() sync. Tracked particles die
     # only at the wall, and the compaction below already pulls exactly that
     # (small, pid-gated) set across, so the host copy stays in step cheaply.
     pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
+    # pid -> pool, host-side and write-once at birth; see the CPU path for why
+    # compaction never touches it (species cannot migrate).
+    pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
+    pid_pool[:n_init] = 0
     slot_alive = np.zeros(_MAX_TRACKED_SLOTS, dtype=bool)
 
     n_track = min(1000, n_init)
@@ -1382,19 +1517,18 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             if batch_size > 0:
                 p_nbi, v_nbi = engine.inject_neutral_beam_cartesian(num_ions=batch_size, E_keV=cfg.nbi_energy_keV, psi_bounds=psi_bounds)
-                pos_tensor = torch.cat([pos_tensor, torch.tensor(p_nbi, device=device, dtype=torch.float32)], dim=0)
-                vel_tensor = torch.cat([vel_tensor, torch.tensor(v_nbi, device=device, dtype=torch.float32)], dim=0)
-                type_tensor = torch.cat([type_tensor, torch.full((batch_size,), 1, device=device, dtype=torch.int32)], dim=0)
-
+                _require_pid_capacity(next_pid, batch_size, pid_capacity, "GPU NBI injection")
                 new_pids = torch.arange(next_pid, next_pid + batch_size, device=device, dtype=torch.int64)
-                pid_tensor = torch.cat([pid_tensor, new_pids], dim=0)
+                base_row = pool.add(
+                    torch.tensor(p_nbi, device=device, dtype=torch.float32),
+                    torch.tensor(v_nbi, device=device, dtype=torch.float32),
+                    1, new_pids)
+                pos_tensor, vel_tensor, type_tensor, pid_tensor = pool.views()
                 total_injected += batch_size
 
-                base_row = pid_tensor.shape[0] - batch_size
-                pid_capacity, pid_row_t, pid_slot = _ensure_pid_capacity_gpu(
-                    pid_capacity, pid_row_t, pid_slot, next_pid + batch_size, device)
                 pid_row_t[new_pids] = torch.arange(base_row, base_row + batch_size,
                                                    device=device, dtype=torch.int64)
+                pid_pool[next_pid:next_pid + batch_size] = 0
 
                 n_new = min(batch_size, 1000 - tracked_nbis)
                 if n_new > 0:
@@ -1427,18 +1561,17 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             v_alpha[:, 1] = avR * np.sin(phi_pos) + avphi * np.cos(phi_pos)
             v_alpha[:, 2] = avZ
 
-            pos_tensor = torch.cat([pos_tensor, torch.tensor(p_alpha, device=device, dtype=torch.float32)], dim=0)
-            vel_tensor = torch.cat([vel_tensor, torch.tensor(v_alpha, device=device, dtype=torch.float32)], dim=0)
-            type_tensor = torch.cat([type_tensor, torch.full((alpha_batch,), 2, device=device, dtype=torch.int32)], dim=0)
-
+            _require_pid_capacity(next_pid, alpha_batch, pid_capacity, "GPU alpha injection")
             new_pids = torch.arange(next_pid, next_pid + alpha_batch, device=device, dtype=torch.int64)
-            pid_tensor = torch.cat([pid_tensor, new_pids], dim=0)
+            base_row = pool.add(
+                torch.tensor(p_alpha, device=device, dtype=torch.float32),
+                torch.tensor(v_alpha, device=device, dtype=torch.float32),
+                2, new_pids)
+            pos_tensor, vel_tensor, type_tensor, pid_tensor = pool.views()
 
-            base_row = pid_tensor.shape[0] - alpha_batch
-            pid_capacity, pid_row_t, pid_slot = _ensure_pid_capacity_gpu(
-                pid_capacity, pid_row_t, pid_slot, next_pid + alpha_batch, device)
             pid_row_t[new_pids] = torch.arange(base_row, base_row + alpha_batch,
                                                device=device, dtype=torch.int64)
+            pid_pool[next_pid:next_pid + alpha_batch] = 0
 
             n_new = min(alpha_batch, 1000 - tracked_alphas)
             if n_new > 0:
@@ -1520,7 +1653,18 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         # --- COLLISIONS + CONFINEMENT CHECK (GPU, eager; psi-surface, not circular) ---
         _t = prof.mark()
-        vel_tensor = apply_vectorized_collisions_torch(vel_tensor, type_tensor, cfg.nu_c, cfg.reactor_dt)
+        # MUST write back into the pool view rather than rebind. Unlike the numba
+        # twin, which mutates vel_arr in place and returns the same array,
+        # apply_vectorized_collisions_torch returns torch.where(...) -- a NEW
+        # tensor -- whenever any collision fires. Rebinding vel_tensor to it
+        # detaches the loop from pool.vel, so the pool keeps stale velocities and
+        # the next injection's pool.views() silently reverts every update made
+        # since. At nu_c*dt = 5e-6 with ~2,500 particles a collision fires only
+        # about every 80 steps, which is what made this look like late-onset
+        # chaotic drift rather than a lost write.
+        vel_updated = apply_vectorized_collisions_torch(vel_tensor, type_tensor, cfg.nu_c, cfg.reactor_dt)
+        if vel_updated is not vel_tensor:
+            vel_tensor.copy_(vel_updated)
         prof.add("apply_vectorized_collisions", _t)
 
         _t = prof.mark()
@@ -1562,13 +1706,15 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     slot_alive[t_slots] = False
 
             dead_pids_t = pid_tensor[~alive]
-            pos_tensor = pos_tensor[alive]
-            vel_tensor = vel_tensor[alive]
-            type_tensor = type_tensor[alive]
-            pid_tensor = pid_tensor[alive]
+            # In-place compaction into the same device buffers, replacing four
+            # boolean-mask reallocations per loss event.
+            alive_rows = torch.nonzero(alive, as_tuple=False).squeeze(1)
+            pool.compact(alive_rows)
+            pos_tensor, vel_tensor, type_tensor, pid_tensor = pool.views()
             # Renumber the device-side pid -> row map: dead pids to -1, then one
             # scatter giving every survivor its new row. Replaces the per-step
-            # torch.searchsorted the sampler used to run.
+            # torch.searchsorted the sampler used to run. pid_pool is untouched --
+            # rows move, pools do not.
             pid_row_t[dead_pids_t] = -1
             pid_row_t[pid_tensor] = torch.arange(pid_tensor.shape[0],
                                                  device=device, dtype=torch.int64)
