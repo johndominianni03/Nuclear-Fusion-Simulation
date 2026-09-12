@@ -1,6 +1,16 @@
 """Array-backed trajectory history storage, split out of main.py (step 14).
 
 True leaf module: imports nothing from this project.
+
+The module name undersells what is in here. _TrackStore is about plotted
+trajectories, but _pid_capacity_bound and _require_pid_capacity are about PIDS:
+they size pid_row / pid_slot / pid_pool and guard the shared pid counter at the
+injection sites, which has nothing to do with trajectories. They live here
+because the pid maps exist to serve the track store. Do not confuse
+_pid_capacity_bound (singular, here, sizes the pid maps) with
+particle_pool._pool_capacity_bounds (plural, there, sizes pool rows) -- the two
+have different consumers and were deliberately put in different modules so that
+every call site reads which one it means.
 """
 
 import numpy as np

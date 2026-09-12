@@ -1,61 +1,20 @@
 import numpy as np
-import time
-import numba
-import sys
 import torch
-from numba import njit, prange
 
 from physics_engine import (
-    gather_electric_field,
-    gather_electric_field_scalar,   # allocation-free scalar twin, used by the prange gather
     compute_electrostatic_energy,
-    compute_radiative_cooling_power,
     compute_dt_cross_section,
     compute_volumetric_fusion_power,
-    compute_radiation_losses,
-    compute_radiation_losses_grid,          # vectorized radiation-loss grid reduction
-    evaluate_q_factors,
     compute_cic_charge_density,
     HPCPhysicsAccelerator,
-    vectorized_boris_push_numba_fallback,
-    compute_cic_charge_density_torch,       # large-N (>=100K) GPU-resident kernels
-    vectorized_gather_and_B_torch,
-    check_confinement_torch,
-    apply_vectorized_collisions_torch,
-    compute_alpha_heating_power_torch,
-    _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
-    _vectorized_boris_push_metal_dynamic,   # dynamic-shape compile, handles that churn; None if the compile failed at import
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
-    interpolate_psi,                        # bilinear psi/B-grid lookup for the numba gather
     compute_poloidal_field_grids,           # psi-derived poloidal B (real grad-B / mirror force)
-    boris_push_substeps_torch,              # alpha sub-stepping (GPU)
-    vectorized_boris_push_numba_substeps    # alpha sub-stepping (CPU)
 )
 from config import SimulationConfiguration
 import initialization
 import diagnostics
-from profiling import (
-    StageProfiler,
-    _profile_header,
-    _log_device_memory,
-    _report_peak_rss,
-    _report_sor_histogram,
-)
-from kernels import (
-    vectorized_gather_and_B_into,
-    vectorized_gather_and_B,
-    apply_vectorized_collisions,
-)
-from particle_pool import (
-    _ParticlePool,
-    _pool_capacity_bounds,
-)
-from track_store import (
-    _MAX_TRACKED_SLOTS,
-    _pid_capacity_bound,
-    _require_pid_capacity,
-    _TrackStore,
-)
+from profiling import StageProfiler
+from kernels import vectorized_gather_and_B
 from reactor_cpu import _run_reactor_loop_cpu
 from reactor_gpu import _run_reactor_loop_gpu
 
@@ -91,8 +50,13 @@ GPU_PARTICLE_THRESHOLD = None
 # wall against ~32-36 s for the CPU loop. The CPU loop measured faster at every count
 # tested, up to 3,000,000.
 #
-# NOT a deprecation of the GPU path -- step 12 optimizes that loop and step 13 reassesses
-# this number. To force the GPU loop, set this to an int <= cfg.initial_thermal_count,
+# NOT a deprecation of the GPU path: it stays fully functional and forceable, it is
+# simply not being optimized further. (This line used to say "step 12 optimizes that
+# loop and step 13 reassesses this number". Both are retired: step 12 is a SKIP -- a
+# decision, not a deferral -- and step 13 is OPTIONAL and moot, since step 9 made the
+# CPU loop ~2.7x faster and moved the crossover further from the GPU, not closer. Only
+# a hardware change, a discrete NVIDIA card in particular, would justify revisiting.)
+# To force the GPU loop, set this to an int <= cfg.initial_thermal_count,
 # either by editing this line (what README.md documents) or at runtime without editing:
 #     import main; main.GPU_PARTICLE_THRESHOLD = 0; main.run_reactor_steady_state()
 # The dispatch reads this global when run_reactor_steady_state is called, so the runtime

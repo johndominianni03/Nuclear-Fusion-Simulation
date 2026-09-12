@@ -49,13 +49,19 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # steps for plotting.
     #
     # The push uses the DYNAMIC-shape compiled kernel where available, falling back to
-    # eager if that compile failed at import. STATIC compile is wrong here: this loop's
-    # masked subset shapes (mask_d / mask_a) change nearly every step as particles are
-    # lost or injected, and static re-specializes per exact shape, so it would recompile
-    # constantly -- it only pays off at fixed, reused shapes (see run_hpc_benchmark).
-    # Dynamic handles the churn without recompiling and is worth ~4x on the push alone
-    # (0.426 -> 0.098 ms at N=50,000). The loop as a whole is still slower than the CPU
-    # path at every size tested, which is why GPU_PARTICLE_THRESHOLD is None.
+    # eager if that compile failed at import. STATIC compile is wrong here: the pool
+    # shapes this loop pushes (bulk.n_live / alpha.n_live) change nearly every step as
+    # particles are injected or lost, and static re-specializes per exact shape, so it
+    # would recompile constantly -- it only pays off at fixed, reused shapes (see
+    # benchmarks.run_hpc_benchmark). Dynamic handles the churn without recompiling and
+    # is worth ~4x on the push alone (0.426 -> 0.098 ms at N=50,000). The loop as a
+    # whole is still slower than the CPU path at every size tested, which is why
+    # GPU_PARTICLE_THRESHOLD is None.
+    #
+    # (This comment said "mask_d / mask_a" until step 14 session H. Step 9 retired those
+    # masks entirely in favour of the split bulk/alpha pools; the shape-churn argument
+    # is unchanged, only the names it cites. run_hpc_benchmark moved to benchmarks.py
+    # in step 14 session B.)
     device = cfg.HPC_DEVICE
 
     pos_tensor = pos_tensor.to(device)

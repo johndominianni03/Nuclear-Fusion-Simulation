@@ -93,9 +93,11 @@ class _ParticlePool:
             raise RuntimeError(
                 f"_ParticlePool overflow: n_live={self.n_live} + {extra} exceeds "
                 f"capacity={self.capacity}. The capacity comes from "
-                f"_pid_capacity_bound, which is meant to be a hard ceiling on the "
-                f"injection schedule -- reaching it means that bound is wrong. "
-                f"Fix the bound; do not grow the pool here.")
+                f"particle_pool._pool_capacity_bounds, which is meant to be a hard "
+                f"ceiling on the injection schedule -- reaching it means that bound "
+                f"is wrong. Fix the bound; do not grow the pool here. (Not "
+                f"track_store._pid_capacity_bound: that sizes the pid maps, and has "
+                f"been a separate bound since step 9 split the pools.)")
 
     def add(self, pos_block, vel_block, type_value, pid_block):
         """Append a batch. Returns the first row written."""
