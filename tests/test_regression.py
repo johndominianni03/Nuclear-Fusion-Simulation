@@ -31,7 +31,7 @@ Exit codes: 0 pass, 1 a regression, 2 setup problem (no golden yet).
 Determinism notes -- read before regenerating the golden
 ------------------------------------------------------------------
 * Seeding numpy alone is NOT enough, and neither is adding a jitted
-  seeder on the main thread. apply_vectorized_collisions in main.py is
+  seeder on the main thread. apply_vectorized_collisions in kernels.py is
   @njit(parallel=True) and draws np.random inside the prange, where
   every worker thread carries its own RNG state. Those states are
   seeded by _seed_numba_threads, which runs one prange iteration per
