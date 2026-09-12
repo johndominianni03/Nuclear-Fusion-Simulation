@@ -81,6 +81,7 @@ from numba import njit, prange                          # noqa: E402
 import torch                                             # noqa: E402
 
 import main                                              # noqa: E402
+import reactor_cpu                                       # noqa: E402
 import initialization                                    # noqa: E402
 from config import SimulationConfiguration                # noqa: E402
 from mhd_equilibrium import MHDEquilibrium                # noqa: E402
@@ -229,7 +230,7 @@ def run_pipeline(quiet=True):
             dst_nR=cfg.nR, dst_nZ=cfg.nZ,
         )
 
-        loop_out = main._run_reactor_loop_cpu(
+        loop_out = reactor_cpu._run_reactor_loop_cpu(
             cfg, engine, pos_tensor, vel_tensor, type_tensor,
             rho_grid, phi_grid, E_R_grid, E_Z_grid,
             B_R_pol_grid, B_Z_pol_grid,
