@@ -506,10 +506,13 @@ def _forced(self, *a, **k):
 MHDEquilibrium.solve_grad_shafranov = _forced
 
 import main
-# Mirrors main.py's own __main__ block: the 17 plots come from all
-# four entry points, not from the reactor run alone.
+import benchmarks
+# The 17 plots come from all FOUR entry points, not from the reactor run
+# alone, so this drives all four. It no longer mirrors main.py's __main__,
+# which runs the reactor only as of step 14 session B; the benchmark sweep
+# moved to benchmarks.run_hpc_benchmark.
 cfg = config.SimulationConfiguration()
-main.run_hpc_benchmark(cfg)
+benchmarks.run_hpc_benchmark(cfg)
 # save_plots=True for the same reason main.py's __main__ passes it: the
 # manifest baseline needs the reactor PNGs whatever cfg.PROFILE is set to.
 main.run_reactor_steady_state(save_plots=True)

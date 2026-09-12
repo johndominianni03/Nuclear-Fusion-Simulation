@@ -201,67 +201,6 @@ def apply_vectorized_collisions(vel_arr, type_arr, nu_c, dt):
             vel_arr[i, 2] = speed * costheta
     return vel_arr
 
-# =======================================================
-# MULTI-CORE & GPU HPC BENCHMARK
-# =======================================================
-def run_hpc_benchmark(cfg):
-    print("==================================================")
-    print("   MULTI-CORE & GPU HPC BENCHMARK RUN    ")
-    print("==================================================")
-    
-    cpu_times = []
-    gpu_times = []
-    
-    q, m, dt = cfg.e_charge, cfg.m_deuterium, cfg.reactor_dt
-    hpc_engine = HPCPhysicsAccelerator(cfg.HPC_DEVICE)
-    
-    for num_particles in cfg.BENCHMARK_PARTICLE_COUNTS:
-        print(f"[{num_particles:,} Particles] Generating Tensors and Caches...")
-        pos_arr = np.random.rand(num_particles, 3).astype(np.float32)
-        vel_arr = np.random.rand(num_particles, 3).astype(np.float32)
-        B_arr = np.ones((num_particles, 3), dtype=np.float32) * cfg.B0
-        E_arr = np.random.rand(num_particles, 3).astype(np.float32)
-        
-        pos_cpu, vel_cpu = pos_arr.copy(), vel_arr.copy()
-        vectorized_boris_push_numba_fallback(pos_cpu[:10], vel_cpu[:10], q, m, B_arr[:10], E_arr[:10], dt)
-        
-        start_cpu = time.time()
-        for _ in range(cfg.BENCHMARK_STEPS):
-            vectorized_boris_push_numba_fallback(pos_cpu, vel_cpu, q, m, B_arr, E_arr, dt)
-        cpu_duration = time.time() - start_cpu
-        cpu_times.append(cpu_duration)
-        
-        if cfg.HPC_DEVICE.type != "cpu":
-            pos_tensor = torch.tensor(pos_arr, device=cfg.HPC_DEVICE)
-            vel_tensor = torch.tensor(vel_arr, device=cfg.HPC_DEVICE)
-            B_tensor = torch.tensor(B_arr, device=cfg.HPC_DEVICE)
-            E_tensor = torch.tensor(E_arr, device=cfg.HPC_DEVICE)
-            
-            # Warm up at the FULL particle count: the compiled push specializes per exact
-            # shape, so a 10-particle warmup would leave the real shape to compile inside
-            # the timed loop below and inflate gpu_duration.
-            hpc_engine.vectorized_boris_push_metal(pos_tensor, vel_tensor, q, m, B_tensor, E_tensor, dt)
-            if cfg.HPC_DEVICE.type == "cuda": torch.cuda.synchronize()
-            if cfg.HPC_DEVICE.type == "mps": torch.mps.synchronize()
-            
-            start_gpu = time.time()
-            for _ in range(cfg.BENCHMARK_STEPS):
-                pos_tensor, vel_tensor = hpc_engine.vectorized_boris_push_metal(pos_tensor, vel_tensor, q, m, B_tensor, E_tensor, dt)
-            
-            if cfg.HPC_DEVICE.type == "mps": torch.mps.synchronize() 
-            elif cfg.HPC_DEVICE.type == "cuda": torch.cuda.synchronize()
-                
-            gpu_duration = time.time() - start_gpu
-            gpu_times.append(gpu_duration)
-        else:
-            gpu_times.append(None)
-            
-        gpu_str = f"{gpu_duration:.4f}s" if gpu_times[-1] is not None else "N/A"
-        print(f"  -> CPU Parallel Time: {cpu_duration:.4f}s | Apple Metal Time: {gpu_str}")
-        
-    print("[SYSTEM] HPC Benchmark Complete! Handing off to diagnostics...")
-    diagnostics.plot_hpc_benchmark(cfg.BENCHMARK_PARTICLE_COUNTS, cpu_times, gpu_times)
-
 GPU_PARTICLE_THRESHOLD = None
 # The particle count at which the reactor run shifts from the Numba JIT CPU loop
 # (_run_reactor_loop_cpu) to the PyTorch GPU loop (_run_reactor_loop_gpu): Apple Metal
@@ -2246,10 +2185,14 @@ def run_nuclear_reaction_dynamics():
     diagnostics.plot_fusion_cross_section(E_kev_arr, sigma_arr)
 
 if __name__ == "__main__":
-    cfg = SimulationConfiguration()
-    run_hpc_benchmark(cfg)
-    # The full-artifact entry point: it exists to regenerate the plots, so it
-    # asks for them explicitly rather than inheriting the cfg.PROFILE default.
+    # The reactor run and nothing else. The benchmark sweep (now
+    # benchmarks.run_hpc_benchmark), run_plasma_oscillation_test and
+    # run_nuclear_reaction_dynamics used to run here too, which made bare
+    # `python3 main.py` unsafe as a reactor entry point; call them explicitly
+    # if you want them. tests/test_regression.py's compare-plots child script
+    # still drives all four, because the plot manifest covers all of them.
+    #
+    # save_plots=True: this is the full-artifact entry point, it exists to
+    # regenerate the plots, so it asks for them explicitly rather than
+    # inheriting the cfg.PROFILE default.
     run_reactor_steady_state(save_plots=True)
-    run_plasma_oscillation_test()
-    run_nuclear_reaction_dynamics()
