@@ -31,7 +31,7 @@ Exit codes: 0 pass, 1 a regression, 2 setup problem (no golden yet).
 Determinism notes -- read before regenerating the golden
 ------------------------------------------------------------------
 * Seeding numpy alone is NOT enough, and neither is adding a jitted
-  seeder on the main thread. apply_vectorized_collisions in main.py is
+  seeder on the main thread. apply_vectorized_collisions in kernels.py is
   @njit(parallel=True) and draws np.random inside the prange, where
   every worker thread carries its own RNG state. Those states are
   seeded by _seed_numba_threads, which runs one prange iteration per
@@ -81,6 +81,7 @@ from numba import njit, prange                          # noqa: E402
 import torch                                             # noqa: E402
 
 import main                                              # noqa: E402
+import reactor_cpu                                       # noqa: E402
 import initialization                                    # noqa: E402
 from config import SimulationConfiguration                # noqa: E402
 from mhd_equilibrium import MHDEquilibrium                # noqa: E402
@@ -229,7 +230,7 @@ def run_pipeline(quiet=True):
             dst_nR=cfg.nR, dst_nZ=cfg.nZ,
         )
 
-        loop_out = main._run_reactor_loop_cpu(
+        loop_out = reactor_cpu._run_reactor_loop_cpu(
             cfg, engine, pos_tensor, vel_tensor, type_tensor,
             rho_grid, phi_grid, E_R_grid, E_Z_grid,
             B_R_pol_grid, B_Z_pol_grid,
@@ -506,10 +507,13 @@ def _forced(self, *a, **k):
 MHDEquilibrium.solve_grad_shafranov = _forced
 
 import main
-# Mirrors main.py's own __main__ block: the 17 plots come from all
-# four entry points, not from the reactor run alone.
+import benchmarks
+# The 17 plots come from all FOUR entry points, not from the reactor run
+# alone, so this drives all four. It no longer mirrors main.py's __main__,
+# which runs the reactor only as of step 14 session B; the benchmark sweep
+# moved to benchmarks.run_hpc_benchmark.
 cfg = config.SimulationConfiguration()
-main.run_hpc_benchmark(cfg)
+benchmarks.run_hpc_benchmark(cfg)
 # save_plots=True for the same reason main.py's __main__ passes it: the
 # manifest baseline needs the reactor PNGs whatever cfg.PROFILE is set to.
 main.run_reactor_steady_state(save_plots=True)
