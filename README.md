@@ -1,4 +1,4 @@
-# Tokamak Fusion Simulation
+# Particle-In-Cell Tokamak Fusion Simulation
 
 A multi-species particle-in-cell simulation of deuterium–tritium fusion in a magnetically
 confined tokamak plasma. Models Grad–Shafranov equilibrium, Monte Carlo Coulomb collisions,
