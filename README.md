@@ -7,6 +7,8 @@ with 17 diagnostic outputs.
 
 Written in Python with Numba JIT and PyTorch backends.
 
+![3D view of the tokamak plasma](docs/images/tokamak_reactor_3d.png)
+
 ---
 
 ## How it works
@@ -32,6 +34,11 @@ Each timestep of the reactor run follows the same loop:
 **External heating.** Neutral beam injection adds high-energy ions in the core, raising the temperature toward fusion-relevant values.
 
 **Fusion and self-heating.** D–T cross-sections and reactivity give a volumetric fusion rate and power. Alphas are spawned at 3.5 MeV, tracked along their wide birth orbits, and deposit heat in the plasma. The run reports when alpha heating overtakes NBI, which marks the move toward a burning plasma.
+
+<p align="center">
+  <img src="docs/images/alpha_orbits.png" width="48%">
+  <img src="docs/images/fusion_cross_section.png" width="48%">
+</p>
 
 **Radiation and gain.** Bremsstrahlung and cyclotron losses are subtracted every step. The Lawson criterion and the Q-factor (scientific and engineering gain, including thermal-to-electric conversion losses) are computed independently of the electrostatic scaffolding.
 
