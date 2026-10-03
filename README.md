@@ -9,6 +9,97 @@ Written in Python with Numba JIT and PyTorch backends.
 
 ---
 
+## How it works
+
+Each timestep of the reactor run follows the same loop:
+
+1. **Field lookup.** Each particle's position is mapped onto the Grad–Shafranov equilibrium to get the local magnetic field.
+2. **Push.** The Boris integrator advances every particle's velocity and position under the Lorentz force.
+3. **Collisions.** Monte Carlo Coulomb collisions scatter particles in pitch angle, which degrades confinement.
+4. **Heating and sources.** Neutral beam injection adds fast ions. D–T fusion events spawn 3.5 MeV alpha particles.
+5. **Losses.** Bremsstrahlung and cyclotron radiation are subtracted. Particles that reach the wall or divertor are counted and removed.
+6. **Instabilities.** Sawtooth and tearing-mode perturbations and disruption-mitigation events are applied.
+7. **Diagnostics.** Fusion power, alpha heating, Lawson quantities and profiles are accumulated and then plotted at the end of the run.
+
+## Physics and features
+
+**Magnetic equilibrium.** `mhd_equilibrium.py` solves the Grad–Shafranov equation for a D-shaped tokamak cross-section. The result is cached to disk, so repeated runs skip the solve. Fields are interpolated to each particle's position.
+
+**Particle dynamics.** A 3D Boris pusher advances all particles. Its energy error stays bounded and oscillatory rather than drifting, so orbits remain stable over long runs. The bulk plasma is initialized from a Maxwell–Boltzmann distribution so the high-energy tail that dominates fusion reactivity is present from the start. Trapped particles trace banana orbits in the 1/R field.
+
+**Collisional transport.** Monte Carlo Coulomb collisions (pitch-angle scattering) knock particles off ideal orbits and drive transport toward the walls.
+
+**External heating.** Neutral beam injection adds high-energy ions in the core, raising the temperature toward fusion-relevant values.
+
+**Fusion and self-heating.** D–T cross-sections and reactivity give a volumetric fusion rate and power. Alphas are spawned at 3.5 MeV, tracked along their wide birth orbits, and deposit heat in the plasma. The run reports when alpha heating overtakes NBI, which marks the move toward a burning plasma.
+
+**Radiation and gain.** Bremsstrahlung and cyclotron losses are subtracted every step. The Lawson criterion and the Q-factor (scientific and engineering gain, including thermal-to-electric conversion losses) are computed independently of the electrostatic scaffolding.
+
+**MHD and disruptions.** The bulk plasma is also described as a compressible fluid (density and pressure profiles), bridged to the kinetic particles via the Vlasov description. Sawtooth and tearing-mode instabilities cause realistic energy bleed-out. Shattered pellet injection is modeled as a disruption-mitigation response that forces a controlled thermal quench.
+
+**Charge deposition and field solve.** Cloud-in-cell deposition and an SOR Poisson solve run every step as structural scaffolding for a PIC loop. As described in *Scope and limitations*, the resulting electrostatic field is not self-consistent at this grid resolution, and the confinement, transport, fusion-power and Lawson results do not depend on it.
+
+**Dual backends.** The reactor loop exists as a Numba JIT CPU implementation and a PyTorch GPU implementation (CUDA or Apple MPS), chosen at runtime (see *Choosing the CPU or GPU path*).
+
+## Graphical outputs
+
+A full run writes 14 reactor plots to the repo root. Three more diagnostics have their own entry points.
+
+### Reactor run (`python main.py`)
+
+**Geometry and structure**
+
+| Output | What it shows |
+|---|---|
+| `tokamak_reactor_2d.png` | Poloidal cross-section of the D-shaped plasma: flux surfaces and particle distribution. |
+| `tokamak_reactor_3d.png` | 3D view of the toroidal plasma and particle positions. |
+| `radial_profiles.png` | Radial profiles of density, temperature and pressure from the core to the edge. |
+| `phase_space_map.png` | Particle distribution in phase space (position versus velocity), showing the thermal bulk, the Maxwellian tail and injected beam ions. |
+
+**Fusion, heating and gain**
+
+| Output | What it shows |
+|---|---|
+| `fusion_power_density.png` | Volumetric D–T fusion power density. |
+| `alpha_heating_balance.png` | Alpha self-heating against external NBI heating (the ignition metric). |
+| `alpha_orbits.png` | Birth trajectories of fusion alphas, showing their wide-looping orbits. |
+| `lawson_q_factor.png` | Lawson criterion and Q-factor (scientific and engineering gain). |
+| `radiation_loss_profile.png` | Bremsstrahlung and cyclotron radiation losses. |
+| `plasma_stored_energy_time.png` | Plasma stored energy over time. |
+
+**Instabilities and disruptions**
+
+| Output | What it shows |
+|---|---|
+| `instability_growth.png` | Growth of the sawtooth and tearing-mode (magnetic island) perturbations. |
+| `disruption_mitigation.png` | Thermal quench and radiated-energy response during shattered pellet injection. |
+
+**Electrostatic scaffolding**
+
+| Output | What it shows |
+|---|---|
+| `charge_density_map.png` | Cloud-in-cell charge deposition on the grid. |
+| `potential_field_map.png` | Electrostatic potential from the SOR Poisson solve. |
+
+The two electrostatic plots show the PIC machinery working, but they are not a converged self-consistent field (see *Scope and limitations*).
+
+`alpha_orbits.png` and `disruption_mitigation.png` appear only when the run is long and large enough to produce those events, so they are absent at small test sizes. The regression manifest accounts for this.
+
+### Standalone diagnostics
+
+| Entry point | Output | What it shows |
+|---|---|---|
+| `benchmarks.run_hpc_benchmark()` | `benchmark_scaling.png` | Runtime versus particle count on your hardware, for both backends. |
+| `main.run_plasma_oscillation_test()` | `plasma_oscillation_frequency.png` | Measured plasma oscillation frequency against theory, a Debye-shielding check kept separate from the quasi-neutral reactor path. |
+| `main.run_nuclear_reaction_dynamics()` | `fusion_cross_section.png` | D–T fusion cross-section versus energy, showing the tunneling-enabled reaction rate. |
+
+### Reading the results
+
+The plots most directly tied to the physics this project claims are the radial profiles, orbit plots, fusion power density, alpha heating balance, radiation losses, stored energy and the Lawson/Q panel. Treat the charge density and potential maps as diagnostics of the scaffolding, per *Scope and limitations*.
+---
+
+---
+
 ## Performance
 
 Production case: 50,000 particles, 10,000 steps, CPU/Numba path.
@@ -155,124 +246,6 @@ the workload to the GPU, whereas a discrete card can. On Apple Silicon, memory b
 Plus `config.py`, `mhd_equilibrium.py` (Grad–Shafranov solve with disk cache),
 `initialization.py`, `diagnostics.py`, `visualizer.py`, `tests/test_regression.py`, and
 `tools/`.
-
----
-
-## Development timeline and physics
-
-### Phase I — Single particle kinematics and boundaries
-
-**1. Grad–Shafranov grid initialization and field interpolation.** The Grad–Shafranov equation
-maps the steady-state magnetic flux surfaces of the reactor. This establishes the foundational
-magnetic equilibrium, shaping the plasma into a realistic D-shaped torus rather than a simple,
-unphysical cylinder.
-
-**2. 3D guiding center / Boris particle pusher.** Standard integrators gradually add artificial
-energy to a simulation, causing virtual particles to speed up over time and ruin the data. The
-Boris algorithm is used because it is volume-preserving and time-reversible: its energy error
-stays bounded and oscillatory rather than accumulating, so orbits remain stable over millions
-of steps. (It is not symplectic in the canonical sense — shown by Qin et al., 2013 — but it has
-the conservation property that matters here.)
-
-**3. Numba JIT acceleration and NumPy vectorization.** Pure Python is far too slow for
-multi-particle physics. Numba compiles the hot loops through LLVM to native machine code at
-first call, unlocking multi-core data parallelism on the CPU.
-
-**4. Maxwellian thermal tails and divertor wall-loss metrics.** Plasmas do not sit at one
-uniform temperature. The core plasma is initialized from a Maxwell–Boltzmann distribution to
-capture high-energy tails — the rare, ultra-fast outliers most likely to overcome the Coulomb
-barrier and fuse.
-
-### Phase II — Collisionality and external heating
-
-**5. Monte Carlo Coulomb collisions (pitch-angle scattering).** Charged particles constantly
-deflect off one another's fields. Randomized scattering models realistic confinement
-degradation as particles are knocked off ideal orbits and toward the walls.
-
-**6. Magnetic trapping and banana orbit diagnostics.** A tokamak's toroidal field falls off as
-1/R, creating a magnetic mirror. Particles on the outboard side bounce back and forth in the
-tightening field, tracing the characteristic banana-shaped orbits. Modeling this matters for
-understanding which particles stay trapped rather than circulating freely.
-
-**7. External heating — neutral beam injection.** Magnetic fields cannot push more heat into a
-magnetic cage. NBI fires high-energy neutral atoms, which ignore the field, straight into the
-core; they ionize on arrival, become trapped, and collide with the bulk plasma, raising core
-temperature toward fusion-relevant levels.
-
-**8. Codebase refactoring and energy conservation audits.** A structural milestone: clean the
-architecture, remove redundant code, and verify that no energy is artificially created or
-destroyed during the heating phases.
-
-### Phase III — Charge deposition and field solve
-
-See **Scope and limitations** above: this phase implements the machinery of a PIC loop, but the
-electrostatic field it produces is not self-consistent at this grid resolution.
-
-**9. Charge density mapping (particle-to-grid weighting).** Computing pairwise forces between
-millions of particles is intractable. Cloud-in-cell deposition maps discrete particles onto a
-continuous spatial grid, locating where charge is pooling.
-
-**10. Poisson solver (electric field generation).** A successive over-relaxation solve in
-cylindrical coordinates translates the charge density grid into a macroscopic electric field.
-As documented above, the convergence criterion is inert at this scale — the solve exits after
-one sweep and the field is a running sum of un-converged sweeps.
-
-**11. Particle-in-cell integration.** Ties the loop together: particles move and deposit
-charge, the charge produces a field, the field pushes back. The structural feedback loop is
-present; the electrostatic component of it is not physically resolved here.
-
-**12. Debye shielding and plasma oscillations.** A separate standalone test demonstrating the
-plasma's tendency to rearrange charge to screen out rogue electric fields. Run independently of
-the reactor loop via `run_plasma_oscillation_test`, since the reactor path is quasi-neutral by
-construction and has no separate electron population to do the screening.
-
-### Phase IV — Magnetohydrodynamics and instabilities
-
-**13. Fluid approximations (density and pressure profiles).** Individual particle tracking
-captures micro-physics, but reactors are governed by macro-physics. The bulk plasma is also
-modeled as a continuous compressible fluid to analyze global pressure gradients.
-
-**14. Vlasov equation and kinetic–fluid bridging.** The translation layer between micro-scale
-particle tracking and macro-scale fluid dynamics, keeping both descriptions consistent as the
-simulation evolves.
-
-**15. Plasma instabilities (sawtooth / tearing modes).** Plasmas actively fight confinement.
-MHD instabilities such as magnetic islands act as potholes in the field, forcing the simulation
-to contend with realistic energy bleed-out and structural disruption.
-
-**16. Disruption mitigation diagnostics.** A plasma losing control can melt the reactor wall.
-This is the emergency brake: shattered pellet injection rapidly introduces heavy material to
-force a controlled thermal quench, radiating energy away before it lands on the wall.
-
-### Phase V — Nuclear reaction dynamics
-
-**17. D–T fusion cross-section.** Nuclei repel each other and classically shouldn't fuse. This
-computes the quantum tunneling probability for deuterium and tritium, letting sufficiently fast
-particles penetrate the Coulomb barrier.
-
-**18. Reactivity matrices and volumetric fusion rates.** Scales individual fusion probabilities
-to a macroscopic rate, giving megawatts of fusion power per cubic meter in real time.
-
-**19. Alpha particle generation and birth trajectories.** D–T fusion leaves a helium nucleus.
-Alphas are spawned dynamically at 3.5 MeV and their wide-looping birth orbits are tracked.
-
-**20. Alpha heating and ignition metrics.** The threshold where heat from newly born alphas
-overtakes external NBI heating — the transition to a self-sustaining burning plasma.
-
-### Phase VI — Reactor engineering and HPC
-
-**21. Bremsstrahlung and cyclotron radiation losses.** Plasmas radiate heavily in X-rays and
-microwaves. Continuously subtracting radiated energy prevents artificial overheating and
-enforces realistic thermodynamic limits.
-
-**22. Lawson criterion and Q-factor.** The scorecard: heat generated against energy lost,
-yielding both scientific and engineering gain, with realistic system inefficiencies such as
-thermal-to-electric conversion losses included.
-
-**23. Multi-core and GPU backends.** Two complete implementations of the reactor loop — Numba
-JIT across CPU cores, and PyTorch targeting CUDA or Apple MPS — selected at runtime. Which one
-wins depends on hardware: see **Choosing the CPU or GPU path** above for the measured numbers
-on this machine, where the CPU path is currently faster and is the default.
 
 ---
 
