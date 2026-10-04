@@ -36,8 +36,7 @@ Each timestep of the reactor run follows the same loop:
 **Fusion and self-heating.** D–T cross-sections and reactivity give a volumetric fusion rate and power. Alphas are spawned at 3.5 MeV, tracked along their wide birth orbits, and deposit heat in the plasma. The run reports when alpha heating overtakes NBI, which marks the move toward a burning plasma.
 
 <p align="center">
-  <img src="docs/images/alpha_orbits.png" width="48%">
-  <img src="docs/images/fusion_cross_section.png" width="48%">
+  <img src="docs/images/alpha_orbits.png" width="60%">
 </p>
 
 **Radiation and gain.** Bremsstrahlung and cyclotron losses are subtracted every step. The Lawson criterion and the Q-factor (scientific and engineering gain, including thermal-to-electric conversion losses) are computed independently of the electrostatic scaffolding.
@@ -73,6 +72,11 @@ A full run writes 14 reactor plots to the repo root. Three more diagnostics have
 | `lawson_q_factor.png` | Lawson criterion and Q-factor (scientific and engineering gain). |
 | `radiation_loss_profile.png` | Bremsstrahlung and cyclotron radiation losses. |
 | `plasma_stored_energy_time.png` | Plasma stored energy over time. |
+
+<p align="center">
+  <img src="docs/images/fusion_power_density.png" width="60%">
+</p>
+<p align="center"><em>D–T core fusion power density.</em></p>
 
 **Instabilities and disruptions**
 
@@ -218,7 +222,7 @@ The simulation dispatches between a Numba JIT loop and a PyTorch loop at runtime
 `GPU_PARTICLE_THRESHOLD` **defaults to `None`, which always selects the CPU path.** That is
 deliberate: on the development machine (Apple Silicon / MPS) the Numba loop measured faster at
 every particle count tested, up to 3,000,000 — 32–36 s against 69.6 s for the GPU loop at
-1M particles / 200 steps. The GPU path is fully functional and maintained, just not the default.
+1M particles / 200 steps. The GPU path is fully functional and maintained, just not the default. On the other hand, the GPU path running PyTorch runs faster on PCs with discrete GPUs, as the entire main loop can be allocated to the GPU, whereas on Apple Silicon, the GPU is integrated with the CPU as part of the System-on-a-Chip architecture; for the CPU loop on Numba, the simulation will run slower than on a Mac, as the SOC architecture on a Mac is superior for CPU runs.
 
 To force the GPU path, set the threshold to any integer at or below your particle count, either
 by editing `main.py` or at runtime:
