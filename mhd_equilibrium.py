@@ -20,7 +20,8 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 
 # Bumped whenever the stored format or the discretization changes, so stale
 # entries from an older solver can never be loaded as if they were current.
-_CACHE_FORMAT = "gs-v1"
+# gs-v2: discretization sign fix (1/R term in the stencil); gs-v1 psi is wrong.
+_CACHE_FORMAT = "gs-v2"
 
 _CACHE_OFF = {"", "0", "false", "no", "off"}
 GS_CACHE_DISABLED = (
@@ -76,6 +77,9 @@ if NUMBA_AVAILABLE:
     def _sor_sweep_numba(psi, RR, dR, dZ, omega):
         """One in-place SOR sweep; returns max |change| over the sweep.
 
+        Solves  Delta* psi = d2psi/dR2 - (1/R) dpsi/dR + d2psi/dZ2 = -R^2
+        (note the MINUS on the 1/R term).
+
         Deliberately serial and in row-major order: SOR reads the values
         its own sweep has already updated, so parallelising it (prange)
         would change the answer, not just its rounding.
@@ -95,8 +99,12 @@ if NUMBA_AVAILABLE:
 
                 source_term = -(R_val ** 2)
 
-                factor_R_minus = inv_dR2 - 1.0 / (2.0 * R_val * dR)
-                factor_R_plus = inv_dR2 + 1.0 / (2.0 * R_val * dR)
+                # Delta* psi = d2psi/dR2 - (1/R) dpsi/dR + d2psi/dZ2
+                # (MINUS on the 1/R term). Central differences give
+                #   psi[i, j+1] (R+dR): 1/dR^2 - 1/(2 R dR)
+                #   psi[i, j-1] (R-dR): 1/dR^2 + 1/(2 R dR)
+                factor_R_minus = inv_dR2 + 1.0 / (2.0 * R_val * dR)
+                factor_R_plus = inv_dR2 - 1.0 / (2.0 * R_val * dR)
 
                 psi_new = (
                     factor_R_plus * psi[i, j + 1]
@@ -279,7 +287,10 @@ class MHDEquilibrium:
 
     def _sor_solve_python(self, max_iters, omega, tolerance):
         """Pure-Python SOR sweep. The reference implementation: whatever else
-        is added, this is what 'bit-identical' is measured against."""
+        is added, this is what 'bit-identical' is measured against.
+
+        Solves  Delta* psi = d2psi/dR2 - (1/R) dpsi/dR + d2psi/dZ2 = -R^2
+        (note the MINUS on the 1/R term)."""
         psi = np.zeros((self.nz, self.nx))
 
         print("Solving Grad-Shafranov equilibrium via SOR iteration...")
@@ -294,9 +305,13 @@ class MHDEquilibrium:
                     # Toroidal current source (J_phi ~ R)
                     source_term = - (R_val ** 2)
 
-                    # 5-point finite difference operator
-                    factor_R_minus = 1.0 / (self.dR**2) - 1.0 / (2.0 * R_val * self.dR)
-                    factor_R_plus = 1.0 / (self.dR**2) + 1.0 / (2.0 * R_val * self.dR)
+                    # 5-point finite difference operator for
+                    #   Delta* psi = d2psi/dR2 - (1/R) dpsi/dR + d2psi/dZ2
+                    # (MINUS on the 1/R term). Central differences give
+                    #   psi[i, j+1] (R+dR): 1/dR^2 - 1/(2 R dR)
+                    #   psi[i, j-1] (R-dR): 1/dR^2 + 1/(2 R dR)
+                    factor_R_minus = 1.0 / (self.dR**2) + 1.0 / (2.0 * R_val * self.dR)
+                    factor_R_plus = 1.0 / (self.dR**2) - 1.0 / (2.0 * R_val * self.dR)
                     factor_Z = 1.0 / (self.dZ**2)
                     denom = 2.0 * (1.0 / (self.dR**2) + 1.0 / (self.dZ**2))
 
