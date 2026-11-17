@@ -162,8 +162,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     if not np.isfinite(p_max) or p_max <= p_min: p_max = p_min + 1e-9
 
     contour_rho = plt.contourf(R_mesh, Z_mesh, rho_clean, levels=np.linspace(p_min, p_max, 40), cmap='plasma', extend='both')
-    plt.colorbar(contour_rho, label="Charge Density $\\rho$ (C/m$^3$)")
-    plt.title("Poloidal Charge Density Distribution (CIC)")
+    plt.colorbar(contour_rho, label="Unweighted Charge Density $\\rho$ (C/m$^3$, one $e$ per macroparticle)")
+    plt.title("Poloidal Charge Density (CIC, Unweighted)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
     _draw_wall(plt.gca())
@@ -185,7 +185,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
     contour_phi = plt.contourf(R_mesh, Z_mesh, phi_clean, levels=np.linspace(p_min, p_max, 40), cmap='viridis', extend='both')
     plt.colorbar(contour_phi, label="Electrostatic Potential $\\phi$ (Volts)")
-    plt.title("Self-Consistent Potential Field (Poisson Solver)")
+    plt.title("Electrostatic Potential\n(Unconverged SOR Solve on Unweighted Deposition)")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
     _draw_wall(plt.gca())
@@ -259,7 +259,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     ax.set_ylim(*VIEW_YLIM)
     ax.set_aspect('equal')
 
-    ax.set_title("Steady-State Reactor with Self-Consistent PIC")
+    ax.set_title("Steady-State Reactor Particle Trajectories")
     ax.set_xlabel("Major Radius R (m)")
     ax.set_ylabel("Height Z (m)")
 
@@ -290,18 +290,18 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         
         color_dens = 'tab:blue'
         ax1.set_xlabel("Major Radius R (m)")
-        ax1.set_ylabel("Electron Density $n_e$ ($m^{-3}$)", color=color_dens)
+        ax1.set_ylabel("Macroparticle Density, Unweighted ($m^{-3}$)", color=color_dens)
         ax1.plot(_scrub_1d(R_centers), _scrub_1d(density_profile), color=color_dens, linewidth=2, label="Density Profile")
         ax1.tick_params(axis='y', labelcolor=color_dens)
         ax1.grid(True, alpha=0.3)
         
         ax2 = ax1.twinx()
         color_pres = 'tab:red'
-        ax2.set_ylabel("Fluid Pressure P (Pa)", color=color_pres)
+        ax2.set_ylabel("Pressure P, Unweighted Macroparticles (Pa)", color=color_pres)
         ax2.plot(_scrub_1d(R_centers), _scrub_1d(pressure_profile), color=color_pres, linewidth=2, linestyle='--', label="Pressure Profile")
         ax2.tick_params(axis='y', labelcolor=color_pres)
         
-        plt.title("Macroscopic Fluid Approximations (Density & Pressure)")
+        plt.title("Radial Fluid Moments (Unweighted Macroparticle Density & Pressure)")
         fig.tight_layout()
         plt.savefig("radial_profiles.png", dpi=300)
         _show()
@@ -315,7 +315,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         plt.scatter(_scrub_1d(R_phase), v_par_scrubbed, s=2, color='darkviolet', alpha=0.3)
         plt.title("Phase-Space Map (Banana Orbits vs. Passing Particles)")
         plt.xlabel("Major Radius R (m)")
-        plt.ylabel("Parallel (Toroidal) Velocity $v_\\parallel$ (m/s)")
+        plt.ylabel("Parallel Velocity $v_\\parallel$ Along the Local Field (m/s)")
         plt.axhline(0, color='black', linewidth=1, linestyle='--')
         
         # Framed to the actual curved confinement boundary, not the full rectangular solver grid.
@@ -341,7 +341,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
         contour_pf = plt.contourf(R_mesh, Z_mesh, P_mw_grid, levels=np.linspace(0, p_max, 40), cmap='inferno', extend='max')
         plt.colorbar(contour_pf, label="Volumetric Fusion Power ($MW/m^3$)")
-        plt.title("D-T Core Fusion Power Density")
+        plt.title("D-T Fusion Power Density\n(Density Normalised to a $10^{20}$ m$^{-3}$ Peak)")
         plt.xlabel("Major Radius R (m)")
         plt.ylabel("Height Z (m)")
         plt.xlim(*VIEW_XLIM)
