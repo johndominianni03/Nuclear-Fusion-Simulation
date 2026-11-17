@@ -465,7 +465,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         ax.set_ylabel("Triple Product ($keV \\cdot s \\cdot m^{-3}$)")
         ax.set_yscale('log')
         ax.grid(True, which="both", linestyle=':', alpha=0.6)
-        ax.legend(loc='lower right')
+        # 'best': the trace ends low-right in a production run and high-right in
+        # a short one, so no fixed corner stays clear of it.
+        ax.legend(loc='best')
 
         plt.tight_layout()
         plt.savefig("lawson_triple_product.png", dpi=300)

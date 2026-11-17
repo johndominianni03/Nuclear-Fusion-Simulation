@@ -1,9 +1,10 @@
 # Particle-In-Cell Tokamak Fusion Simulation
 
-A multi-species particle-in-cell simulation of deuterium–tritium fusion in a magnetically
-confined tokamak plasma. Models Grad–Shafranov equilibrium, Monte Carlo Coulomb collisions,
-neutral beam injection, alpha particle self-heating, radiation losses, and MHD instabilities,
-with 17 diagnostic outputs.
+A particle-in-cell style simulation of ions in a magnetically confined tokamak plasma. It
+solves a Grad–Shafranov equilibrium, pushes thermal deuterons, neutral-beam ions and 3.5 MeV
+alphas through the resulting field with a Boris integrator, removes particles that cross the
+last closed flux surface, and writes 11 diagnostic plots. Read *Scope and limitations* before
+drawing conclusions from the numbers: several parts are prescribed rather than computed.
 
 Written in Python with Numba JIT and PyTorch backends.
 
@@ -13,101 +14,98 @@ Written in Python with Numba JIT and PyTorch backends.
 
 ## How it works
 
-Each timestep of the reactor run follows the same loop:
+Each timestep of the reactor run does the following, in this order:
 
-1. **Field lookup.** Each particle's position is mapped onto the Grad–Shafranov equilibrium to get the local magnetic field.
-2. **Push.** The Boris integrator advances every particle's velocity and position under the Lorentz force.
-3. **Collisions.** Monte Carlo Coulomb collisions scatter particles in pitch angle, which degrades confinement.
-4. **Heating and sources.** Neutral beam injection adds fast ions. D–T fusion events spawn 3.5 MeV alpha particles.
-5. **Losses.** Bremsstrahlung and cyclotron radiation are subtracted. Particles that reach the wall or divertor are counted and removed.
-6. **Instabilities.** Sawtooth and tearing-mode perturbations and disruption-mitigation events are applied.
-7. **Diagnostics.** Fusion power, alpha heating, Lawson quantities and profiles are accumulated and then plotted at the end of the run.
+1. **Sources.** Neutral beam injection adds 50 keV ions on a decaying schedule. One 3.5 MeV alpha is injected every 4 steps on a fixed schedule.
+2. **Deposition and field solve.** Bulk ions are deposited on a 50×50 (R, Z) grid with cloud-in-cell weights, and one SOR pass of a Poisson solve updates the potential.
+3. **Field lookup.** Each particle gets the local electric field from that grid and a magnetic field made of the toroidal B0·R0/R field, the poloidal field derived from the Grad–Shafranov flux, and a prescribed tearing-mode perturbation.
+4. **Push.** The Boris integrator advances every particle's velocity and position under the Lorentz force. Alphas take 10 sub-steps per global step.
+5. **Collisions.** At a fixed rate, a bulk ion's velocity direction is re-drawn isotropically with its speed unchanged.
+6. **Losses.** Particles that cross the last closed flux surface are counted and removed.
+7. **Alpha slowing-down.** Alphas lose a fixed fraction of their energy per step, and that energy is added to the bulk ions.
+8. **Pellet trigger.** Once the prescribed tearing-mode amplitude passes a preset threshold, a scripted radiative drain starts scaling the bulk velocities down.
+9. **Diagnostics.** Confined count, stored energy, bulk temperature and the Lawson triple product are recorded each step. Profiles, the phase-space map and the fusion power map are computed once from the final state and plotted.
 
 ## Physics and features
 
-**Magnetic equilibrium.** `mhd_equilibrium.py` solves the Grad–Shafranov equation for a D-shaped tokamak cross-section. The result is cached to disk, so repeated runs skip the solve. Fields are interpolated to each particle's position.
+**Magnetic equilibrium.** `mhd_equilibrium.py` solves the Grad–Shafranov equation by SOR on a 60×60 rectangular (R, Z) box with a −R² source and ψ = 0 on the box edge. The result is cached to disk, so repeated runs skip the solve. The poloidal field is taken from the gradient of ψ and rescaled so the edge safety factor is 2; the toroidal field is the analytic B0·R0/R. Both are interpolated to each particle's position. The plasma boundary is the ψ = ψ_edge contour, and the same contour is used for the loss test, the plots and the plasma volume.
 
-**Particle dynamics.** A 3D Boris pusher advances all particles. Its energy error stays bounded and oscillatory rather than drifting, so orbits remain stable over long runs. The bulk plasma is initialized from a Maxwell–Boltzmann distribution so the high-energy tail that dominates fusion reactivity is present from the start. Trapped particles trace banana orbits in the 1/R field.
+**Particle dynamics.** A 3D Boris pusher advances all particles. The bulk plasma is initialized from a 1 keV Maxwellian inside the core flux surface. The poloidal field gives the field lines a magnetic mirror, and trapped particles trace banana orbits; the alpha orbit plot shows them.
 
-**Collisional transport.** Monte Carlo Coulomb collisions (pitch-angle scattering) knock particles off ideal orbits and drive transport toward the walls.
+**Collisions.** `apply_vectorized_collisions` gives each bulk ion a probability ν_c·dt per step (ν_c = 5000 s⁻¹) of having its velocity direction re-drawn uniformly on the sphere. Speed is preserved, so this is isotropic re-randomisation at a fixed rate, not an energy-dependent Coulomb operator. Alphas are not collided.
 
-**External heating.** Neutral beam injection adds high-energy ions in the core, raising the temperature toward fusion-relevant values.
+**Neutral beam.** Beam ions are born at 50 keV near R = 1.05 m, inside the core flux surface, with a mostly perpendicular pitch. The batch size decays as exp(−step / 2500). Beam ions live in the same pool as the thermal ions and never slow down, so the reported bulk temperature (2/3 of the mean kinetic energy of that pool) rises as they accumulate.
 
-**Fusion and self-heating.** D–T cross-sections and reactivity give a volumetric fusion rate and power. Alphas are spawned at 3.5 MeV, tracked along their wide birth orbits, and deposit heat in the plasma. The run reports when alpha heating overtakes NBI, which marks the move toward a burning plasma.
+**Alphas.** Alphas are not produced by fusion events. One is injected every 4 steps near R = 1.0 m, Z = 0 with an isotropic 3.5 MeV velocity. Each step an alpha gives up a fraction 2·ν_s·dt of its energy (down to a 15 keV floor), and the same energy is added to the bulk by scaling bulk speeds.
 
 <p align="center">
   <img src="docs/images/alpha_orbits.png" width="60%">
 </p>
 
-**Radiation and gain.** Bremsstrahlung and cyclotron losses are subtracted every step. The Lawson criterion and the Q-factor (scientific and engineering gain, including thermal-to-electric conversion losses) are computed independently of the electrostatic scaffolding.
+**Fusion power map.** At the end of the run, the deposited density is rescaled so its peak is 1e20 m⁻³, split 50/50 into deuterium and tritium, and given a temperature proportional to the local density with the measured bulk temperature at the peak. The Bosch–Hale D–T reactivity then gives a power density, which is integrated over the grid for the printed total. The bulk ions themselves all carry the deuteron mass; there is no tritium species in the push.
 
-**MHD and disruptions.** The bulk plasma is also described as a compressible fluid (density and pressure profiles), bridged to the kinetic particles via the Vlasov description. Sawtooth and tearing-mode instabilities cause realistic energy bleed-out. Shattered pellet injection is modeled as a disruption-mitigation response that forces a controlled thermal quench.
+**Lawson triple product.** Each step records n·T·τ with n = confined bulk macroparticles × 5e17 ÷ plasma volume, T = the bulk temperature, and τ = confined count ÷ particle loss rate, capped at 3 s. Until the first particle is lost there is no loss rate, and τ is a fixed 0.5 s placeholder; that part of the trace is not a measurement. The plot draws the 3e21 keV·s·m⁻³ reference line. Gain and ignition are not modelled.
 
-**Charge deposition and field solve.** Cloud-in-cell deposition and an SOR Poisson solve run every step as structural scaffolding for a PIC loop. As described in *Scope and limitations*, the resulting electrostatic field is not self-consistent at this grid resolution, and the confinement, transport, fusion-power and Lawson results do not depend on it.
+**Tearing mode and pellet injection.** The tearing mode is a prescribed perturbation: an m=2, n=1 field ripple whose amplitude follows b0·exp(γt) from config constants and is added to the magnetic field each particle sees. It does not respond to the plasma. Pellet injection is a scripted radiative drain: when that amplitude passes a preset threshold (about step 5,200 of 10,000), the bulk velocities are scaled down each step by an impurity-radiation formula evaluated at the measured bulk temperature, with a 10 eV floor.
+
+**Fluid moments.** Radial density and pressure profiles are computed once, from the final particle state, by binning surviving particles into cylindrical shells.
+
+**Charge deposition and field solve.** Cloud-in-cell deposition and an SOR Poisson solve run every step as structural scaffolding for a PIC loop. The resulting field is gathered and applied in the push, but it is not a self-consistent electrostatic field (see *Scope and limitations*). The deposited density is also what the fusion power map is built from.
 
 **Dual backends.** The reactor loop exists as a Numba JIT CPU implementation and a PyTorch GPU implementation (CUDA or Apple MPS), chosen at runtime (see *Choosing the CPU or GPU path*).
 
 ## Graphical outputs
 
-A full run writes 14 reactor plots to the repo root. Three more diagnostics have their own entry points.
+A reactor run writes 10 plots to the working directory. The benchmark writes one more.
 
 ### Reactor run (`python main.py`)
 
-**Geometry and structure**
+**Orbits and phase space**
 
 | Output | What it shows |
 |---|---|
-| `tokamak_reactor_2d.png` | Poloidal cross-section of the D-shaped plasma: flux surfaces and particle distribution. |
-| `tokamak_reactor_3d.png` | 3D view of the toroidal plasma and particle positions. |
-| `radial_profiles.png` | Radial profiles of density, temperature and pressure from the core to the edge. |
-| `phase_space_map.png` | Particle distribution in phase space (position versus velocity), showing the thermal bulk, the Maxwellian tail and injected beam ions. |
+| `tokamak_reactor_2d.png` | Sampled particle trajectories in the poloidal plane over the flux surfaces, with the last closed flux surface and wall strikes. |
+| `tokamak_reactor_3d.png` | The same trajectories in 3D, with a sample of alpha orbits. |
+| `alpha_orbits.png` | A sample of 3.5 MeV alpha orbits against thermal and beam-ion tracks. |
+| `phase_space_map.png` | Major radius against velocity parallel to the local magnetic field, for every surviving particle. |
 
-**Fusion, heating and gain**
+**Time traces**
 
 | Output | What it shows |
 |---|---|
-| `fusion_power_density.png` | Volumetric D–T fusion power density. |
-| `alpha_heating_balance.png` | Alpha self-heating against external NBI heating (the ignition metric). |
-| `alpha_orbits.png` | Birth trajectories of fusion alphas, showing their wide-looping orbits. |
-| `lawson_q_factor.png` | Lawson criterion and Q-factor (scientific and engineering gain). |
-| `radiation_loss_profile.png` | Bremsstrahlung and cyclotron radiation losses. |
-| `plasma_stored_energy_time.png` | Plasma stored energy over time. |
+| `plasma_stored_energy_time.png` | Total kinetic energy of the bulk ions over time. |
+| `lawson_triple_product.png` | The triple product described above, against the 3e21 keV·s·m⁻³ reference line. |
+
+**Normalised or unweighted maps**
+
+| Output | What it shows |
+|---|---|
+| `fusion_power_density.png` | D–T fusion power density, with the density normalised to a 1e20 m⁻³ peak. |
+| `radial_profiles.png` | Radial density and pressure moments of the final particle state, as unweighted macroparticle values. |
 
 <p align="center">
   <img src="docs/images/fusion_power_density.png" width="60%">
 </p>
-<p align="center"><em>D–T core fusion power density.</em></p>
-
-**Instabilities and disruptions**
-
-| Output | What it shows |
-|---|---|
-| `instability_growth.png` | Growth of the sawtooth and tearing-mode (magnetic island) perturbations. |
-| `disruption_mitigation.png` | Thermal quench and radiated-energy response during shattered pellet injection. |
+<p align="center"><em>D–T fusion power density, density normalised to a 1e20 m⁻³ peak.</em></p>
 
 **Electrostatic scaffolding**
 
 | Output | What it shows |
 |---|---|
-| `charge_density_map.png` | Cloud-in-cell charge deposition on the grid. |
-| `potential_field_map.png` | Electrostatic potential from the SOR Poisson solve. |
+| `charge_density_map.png` | Cloud-in-cell charge deposition on the grid, one elementary charge per macroparticle. |
+| `potential_field_map.png` | Potential from the unconverged SOR Poisson solve on that deposition. |
 
-The two electrostatic plots show the PIC machinery working, but they are not a converged self-consistent field (see *Scope and limitations*).
-
-`alpha_orbits.png` and `disruption_mitigation.png` appear only when the run is long and large enough to produce those events, so they are absent at small test sizes. The regression manifest accounts for this.
-
-### Standalone diagnostics
+### Standalone diagnostic
 
 | Entry point | Output | What it shows |
 |---|---|---|
-| `benchmarks.run_hpc_benchmark()` | `benchmark_scaling.png` | Runtime versus particle count on your hardware, for both backends. |
-| `main.run_plasma_oscillation_test()` | `plasma_oscillation_frequency.png` | Measured plasma oscillation frequency against theory, a Debye-shielding check kept separate from the quasi-neutral reactor path. |
-| `main.run_nuclear_reaction_dynamics()` | `fusion_cross_section.png` | D–T fusion cross-section versus energy, showing the tunneling-enabled reaction rate. |
+| `benchmarks.run_hpc_benchmark(cfg)` | `benchmark_scaling.png` | Runtime of the Boris push versus particle count on your hardware, for both backends. |
 
 ### Reading the results
 
-The plots most directly tied to the physics this project claims are the radial profiles, orbit plots, fusion power density, alpha heating balance, radiation losses, stored energy and the Lawson/Q panel. Treat the charge density and potential maps as diagnostics of the scaffolding, per *Scope and limitations*.
----
+- **Tied to the simulation:** the orbit plots (`tokamak_reactor_2d.png`, `tokamak_reactor_3d.png`, `alpha_orbits.png`), the phase-space map, the stored energy trace and the triple product are measured from the particles the loop pushes. The triple product's density carries the 5e17 macro-weight, and its early segment, before the first particle loss, uses a placeholder confinement time.
+- **Normalised or unweighted:** the fusion power density is normalised to a 1e20 m⁻³ peak density, and the radial profiles are unweighted macroparticle counts and moments. Read their shapes, not their absolute values.
+- **Scaffolding:** the charge density and potential maps show the deposition and solver running. They are not a converged electrostatic field.
 
 ---
 
@@ -135,19 +133,32 @@ split into eight modules across eight commits, each one proven bit-identical.
 
 ## Scope and limitations
 
-The reactor path models magnetic confinement with collisional transport. The electrostatic
-field is **not** self-consistent: the plasma is quasi-neutral by construction with no separate
-electron population, and the 50×50 grid under-resolves the Debye length by ~870×, so a
-resolved electrostatic solve isn't meaningful at this scale. Fusion power, radiation losses,
-and Lawson diagnostics are computed independently and are unaffected.
-
-The charge deposition, Poisson solve, and field gather are implemented and run every step, but
-should be read as structural scaffolding for a PIC loop rather than as a converged
-electrostatic solution. The solver's convergence test is absolute (`1e-5` V) against a solution
-of the same order, so it exits after a single sweep; the accumulated field is a running sum of
-un-converged sweeps. This is documented rather than hidden because the physics the project
-does claim to model — confinement, collisional transport, fusion power, alpha heating, the
-Lawson criterion — does not depend on it.
+- **No electrons, no self-consistent field.** There is no electron population and no
+  neutralising background, so the deposited charge is purely positive. The 50×50 grid
+  under-resolves the Debye length by about 870× (at 1e20 m⁻³ and 1 keV), so a resolved
+  electrostatic solve isn't meaningful at this scale.
+- **The Poisson solve does not converge.** Its stopping test is an absolute change of
+  `1e-5` V per sweep, which the first sweep never exceeds, so it exits after a single sweep
+  every step. The stored potential (about 3e-5 V at the end of a production run) is a running
+  sum of unconverged sweeps. The field is still applied in the push.
+- **Charge deposition is unweighted.** Each macroparticle deposits one elementary charge. The
+  5e17 macro-weight is applied only to the density in the Lawson triple product.
+- **Fusion power is normalised.** The power map rescales the deposited density to a 1e20 m⁻³
+  peak and assumes a temperature profile proportional to density, so its absolute value is
+  set by that normalisation.
+- **The alpha source is scheduled.** One alpha is injected every 4 steps regardless of the
+  fusion rate. Alphas are not spawned from fusion events.
+- **Collisions are a fixed-rate isotropic re-randomisation** of bulk-ion velocity direction,
+  not pitch-angle scattering from a Coulomb operator.
+- **The tearing mode and pellet injection are prescribed.** The perturbation amplitude is an
+  exponential set by config constants, and the radiative drain fires when that amplitude
+  passes a preset value.
+- **Gain and ignition are not modelled.** There is no Q-factor, no power balance, and no
+  bremsstrahlung or cyclotron loss. The only radiative loss is the scripted drain after the
+  pellet trigger. The 3e21 line on the triple-product plot is a reference value, and the
+  trace's confinement time is a particle-loss proxy with a placeholder before the first loss.
+- **One ion mass.** All bulk ions carry the deuteron mass; tritium appears only as half of
+  the density in the fusion power map.
 
 ---
 
@@ -181,7 +192,8 @@ pip install numba numpy pandas matplotlib scipy
 
 ## Running it
 
-The main reactor run, which writes the 14 reactor diagnostic plots:
+The main reactor run, which writes the 10 reactor plots into the working directory
+(set `FUSION_HEADLESS=1` to run without an interactive display):
 
 ```bash
 python main.py
@@ -193,12 +205,10 @@ Or, to call it directly and control plotting:
 python -c "import main; main.run_reactor_steady_state()"
 ```
 
-Three diagnostics live behind their own entry points and are not part of the reactor run:
+The benchmark lives behind its own entry point and is not part of the reactor run:
 
 ```bash
-python -c "import benchmarks; benchmarks.run_hpc_benchmark()"          # benchmark_scaling.png
-python -c "import main; main.run_plasma_oscillation_test()"            # plasma_oscillation_frequency.png
-python -c "import main; main.run_nuclear_reaction_dynamics()"          # fusion_cross_section.png
+python -c "import benchmarks, config; benchmarks.run_hpc_benchmark(config.SimulationConfiguration())"   # benchmark_scaling.png
 ```
 
 **Profiling.** Set `cfg.PROFILE = True` in `config.py` to print per-stage wall-clock tables:
@@ -212,12 +222,13 @@ table. Plot writing is gated behind it — a profiling run writes no PNGs unless
 python tests/test_regression.py compare           # strict, rtol 1e-6
 python tests/test_regression.py compare --loose   # rtol 1e-3
 python tests/test_regression.py compare-plots     # renders to a temp dir, diffs the manifest
+python tests/test_maxwellian.py                   # Maxwellian sampling check
 ```
 
 ### Choosing the CPU or GPU path
 
 The simulation dispatches between a Numba JIT loop and a PyTorch loop at runtime, based on
-`GPU_PARTICLE_THRESHOLD` in `main.py` and `initial_thermal_particle_count` in `config.py`.
+`GPU_PARTICLE_THRESHOLD` in `main.py` and `initial_thermal_count` in `config.py`.
 
 `GPU_PARTICLE_THRESHOLD` **defaults to `None`, which always selects the CPU path.** That is
 deliberate: on the development machine (Apple Silicon / MPS) the Numba loop measured faster at
@@ -244,10 +255,10 @@ the workload to the GPU, whereas a discrete card can. On Apple Silicon, memory b
 
 | module | lines | holds |
 |---|---|---|
-| `reactor_gpu.py` | 658 | the PyTorch reactor loop |
-| `reactor_cpu.py` | 649 | the Numba reactor loop, adaptive Boris push |
-| `main.py` | 401 | entry points, loop dispatch, result packaging |
-| `physics_engine.py` | 1518 | physics kernels, CPU and torch |
+| `reactor_gpu.py` | 611 | the PyTorch reactor loop |
+| `reactor_cpu.py` | 603 | the Numba reactor loop, adaptive Boris push |
+| `main.py` | 312 | entry points, loop dispatch, result packaging |
+| `physics_engine.py` | 1119 | physics kernels, CPU and torch |
 | `track_store.py` | 280 | trajectory sampling, pid→row maps |
 | `profiling.py` | 200 | per-stage wall-clock instrumentation |
 | `particle_pool.py` | 166 | capacity-backed particle pools, compaction |

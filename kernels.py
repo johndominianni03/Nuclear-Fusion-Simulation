@@ -115,9 +115,9 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
     """Allocating wrapper around vectorized_gather_and_B_into.
 
     Same signature and same (E_arr, B_arr) return as before the out-parameter
-    split, for the callers that run once per run rather than once per step --
-    package_reactor_results' phase-space projection and the plasma-oscillation
-    test -- where one pair of (N,3) arrays is not worth a reused buffer. The
+    split, for the caller that runs once per run rather than once per step --
+    package_reactor_results' phase-space projection -- where one pair of
+    (N,3) arrays is not worth a reused buffer. The
     reactor loop calls the _into form directly against buffers it owns.
     """
     N = pos_arr.shape[0]

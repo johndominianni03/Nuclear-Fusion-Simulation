@@ -69,7 +69,7 @@ class SimulationConfiguration:
         # =======================================================
         # Trigger threshold. Must sit above b_perturb_initial: at exactly 1e-4 the island
         # cleared it on step 1 and the run spent its whole life post-quench, flatlining
-        # the thermodynamics (brem scales as sqrt(T_e)). The island grows to ~1.42e-4 over
+        # the thermodynamics (the drain scales as sqrt(T_e)). The island grows to ~1.42e-4 over
         # 10,000 steps, so 1.2e-4 fires around the midpoint -- hot first, then quenched.
         self.MAX_ISLAND_WIDTH_THRESHOLD = 1.2e-4
         self.SPI_TRIGGERED = False              # Emergency-system flag
@@ -129,7 +129,7 @@ class SimulationConfiguration:
         # How many real ions each simulated macro-particle stands in for. Read in one
         # place only: the Lawson triple product's density,
         #   n_e = confined_macro_particles * MACRO_WEIGHT_REACTOR / PLASMA_VOLUME_M3
-        #       ~ 56,000 * 5e17 / 2.79  ~  1.0e22 m^-3.
+        #       ~ 56,000 * 5e17 / 3.52  ~  8e21 m^-3.
         # It does not weight the charge deposition or anything the particles feel.
         self.MACRO_WEIGHT_REACTOR = 5e17
 
