@@ -1,24 +1,14 @@
 import numpy as np
 import torch
-import platform
 
 class SimulationConfiguration:
     def __init__(self):
         # --- PHYSICS CONSTANTS ---
         self.e_charge = 1.602e-19       # Elementary charge (C)
         self.m_deuterium = 3.344e-27    # Deuterium mass (kg)
-        self.eps_0 = 8.854e-12          # Vacuum permittivity (F/m)
-
-        # Legacy aliases
-        self.q = self.e_charge 
-        self.m = self.m_deuterium 
-        self.t_start = 0.0
-        self.t_end = 4.0e-5
-        self.max_step = 1e-10
 
         # --- MAGNETIC FIELD ---
         self.B0 = 12.0                  # Toroidal field (T)
-        self.B_poloidal = 0.3           # Poloidal field (T)
         self.R0_major = 1.0             # Major radius (magnetic axis), shared by field/confinement/tearing mode
 
         # Target safety factor q = (a/R0) * (B_tor/B_pol), used to rescale the
@@ -88,23 +78,14 @@ class SimulationConfiguration:
         # additive: it reads clocks and accumulates floats, and touches no
         # array, no RNG and no control flow, so a profiled run and an
         # unprofiled one produce identical numbers.
-        self.PROFILE = True
+        self.PROFILE = False
 
         # Shattered Pellet Injection (SPI) constants
         self.IMPURITY_DENSITY_NZ = 5.0e19       # Injected Neon/Argon density (m^-3)
         self.RADIATIVE_COOLING_COEFF = 1.5e-32  # Simplified L_z(T_e) [W * m^3]
 
-        # Thermal Quench (TQ) timescales
-        self.TQ_DECAY_TIME = 2.0e-3             # TQ duration (2 ms)
-        self.POST_QUENCH_TEMP = 10.0            # Cold baseline temperature after TQ (eV)
-
-      # =======================================================
-        # NUCLEAR REACTION DYNAMICS (D-T FUSION)
-        # =======================================================
-        # Tunneling & cross-section constants
-        self.E_G_keV = 34.38          # Gamow energy for D-T (keV)
-        self.S_factor_base = 1000.0   # Astrophysical S-factor baseline (keV * barn)
-        self.E_resonance = 64.0       # D-T resonance peak (keV)
+        # Floor the radiative drain cools toward
+        self.POST_QUENCH_TEMP = 10.0            # Cold baseline temperature after the quench (eV)
 
         # =======================================================
         # REACTIVITY MATRICES & VOLUMETRIC FUSION RATES
@@ -138,9 +119,8 @@ class SimulationConfiguration:
         # into the background plasma (scaled for simulation)
         self.ALPHA_SLOWING_TIME = 0.5
 
-        # nu_s = energy drag, nu_pitch = directional scattering
+        # nu_s = energy drag
         self.NU_S = 1.0 / self.ALPHA_SLOWING_TIME
-        self.NU_PITCH = self.NU_S * 0.1  # Pitch scattering is much weaker for fast alphas
 
         # Below this energy (keV) an alpha counts as thermalized (Helium ash) and
         # stops heating
@@ -157,15 +137,6 @@ class SimulationConfiguration:
         # psi = psi_edge flux surface (physics_engine.compute_plasma_volume); the value
         # here is the circular-torus estimate 2*pi^2*R0*a^2 used only as a fallback.
         self.PLASMA_VOLUME_M3 = 2.0 * np.pi**2 * self.R0_major * (0.3 ** 2)
-
-        # ==========================================
-        # RADIATION LOSS MODELS
-        # ==========================================
-        # P_brem [W/m^3] = 4.8e-37 * Z_eff * n_e^2 * sqrt(T_e [keV])
-        self.bremsstrahlung_coeff = 4.8e-37
-
-        # P_cyc [W/m^3] = 6.21e-17 * n_e * T_e [keV] * B^2
-        self.cyclotron_coeff = 6.21e-17
 
         # ==========================================
         # LAWSON CRITERION

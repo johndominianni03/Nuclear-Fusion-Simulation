@@ -508,12 +508,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             print(f"  [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
 
         # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
-        # Post-trigger T_core used to come from trigger_thermal_quench()'s analytic
-        # exponential -- a curve drawn on top of the simulation. It ran on
-        # TQ_DECAY_TIME = 2 ms against a 10 us run, so it advanced 0.25% and read as a
-        # flatline, and it would have reported a quench even with the drain below off.
-        # T_core is now the real kinetic temperature in both regimes, so the disruption
-        # shows up because radiation genuinely removes the energy.
+        # T_core is the kinetic temperature of the bulk in both regimes, before and
+        # after the SPI trigger, so a quench shows up only because the drain below
+        # removes energy from the particles.
         T_core = T_core_kinetic
 
         if cfg.SPI_TRIGGERED:

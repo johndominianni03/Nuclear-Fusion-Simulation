@@ -1,6 +1,13 @@
-import numpy as np
 import os
-from physics_engine import ParticlePusher
+import sys
+import tempfile
+
+import numpy as np
+
+# Import physics_engine from the repo root, one level up from tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from physics_engine import ParticlePusher                # noqa: E402
 
 def test_maxwellian_sampling():
     print("Testing Maxwell-Boltzmann velocity sampling and diagnostic plotting...")
@@ -35,12 +42,14 @@ def test_maxwellian_sampling():
     assert abs(vz_std - v_th_expected) / v_th_expected < tolerance, "vz deviation out of range"
     print("Statistical verification passed!")
     
-    # 3. Diagnostic plot
-    plot_filename = "test_maxwell_boltzmann_diagnostic.png"
-    pusher.plot_velocity_diagnostic(velocities, T_keV=T_keV, filename=plot_filename)
-    
-    assert os.path.exists(plot_filename), "Diagnostic plot was not saved!"
-    print(f"Visual diagnostic plotting passed! Saved to {plot_filename}")
+    # 3. Diagnostic plot, written to a temp directory so the test leaves nothing
+    # behind in the repo.
+    with tempfile.TemporaryDirectory(prefix="fusion_maxwellian_") as out_dir:
+        plot_filename = os.path.join(out_dir, "test_maxwell_boltzmann_diagnostic.png")
+        pusher.plot_velocity_diagnostic(velocities, T_keV=T_keV, filename=plot_filename)
+
+        assert os.path.exists(plot_filename), "Diagnostic plot was not saved!"
+        print("Visual diagnostic plotting passed (temp file written and removed).")
     
     print("All tests passed successfully!")
 
