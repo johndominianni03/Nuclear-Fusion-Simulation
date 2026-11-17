@@ -19,11 +19,9 @@ test_plot_outputs_survive_full_run (slow -- it renders the plots).
 
 The plot test renders into a temp directory (never over the repo's
 own PNGs) and asks tools/plot_manifest.py the one question "was
-every expected plot produced". Two documented exceptions:
+every expected plot produced". One documented exception:
 benchmark_scaling.png plots measured wall-clock times, so its bytes
-are never stable and content changes are reported without failing;
-and disruption_mitigation.png needs the SPI disruption to fire
-(~5,200 steps), so at this test size it is excused as absent.
+are never stable and content changes are reported without failing.
 
 Exit codes: 0 pass, 1 a regression, 2 setup problem (no golden yet).
 
@@ -93,8 +91,7 @@ TEST_NUM_STEPS = 200
 NUMBA_THREADS = 1
 GS_BACKEND = "python"
 
-# Sizes for the slow plot test's other three entry points.
-TEST_OSC_STEPS = 200
+# Sizes for the slow plot test's other entry point, the benchmark sweep.
 TEST_BENCHMARK_COUNTS = [1000, 10000]
 TEST_BENCHMARK_STEPS = 20
 
@@ -104,11 +101,10 @@ TEST_BENCHMARK_STEPS = 20
 # plot identical". The .npz test is what pins the numbers.
 PLOT_PRESENCE_ONLY = True
 
-# disruption_mitigation.png only renders when the SPI disruption fires,
-# which needs the island to grow past MAX_ISLAND_WIDTH_THRESHOLD -- about
-# 5,200 steps at this seed, against the 200 this test runs. It is excused
-# rather than quietly dropped, so the tool still owns the list of 17.
-PLOT_ALLOW_MISSING = ["disruption_mitigation.png"]
+# Plots excused as absent at this test size. Empty: every one of the 11
+# expected plots renders at 200 steps. Kept so a size-dependent plot can
+# be excused by name rather than quietly dropped from the tool's list.
+PLOT_ALLOW_MISSING = []
 
 GOLDEN_DIR = os.path.join(HERE, "golden")
 GOLDEN_NPZ = os.path.join(GOLDEN_DIR, "reactor_regression.npz")
@@ -237,11 +233,9 @@ def run_pipeline(quiet=True):
 
         (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos,
          tracked_lastvel, tracked_lost, total_injected, total_lost,
-         inventory_history, energy_history_keV, instability_amp_history, time_history,
-         temp_history, rad_power_history, trigger_time, T_core,
-         alpha_heating_power_history_MW, external_heating_power_history_MW,
-         bremsstrahlung_power_history_MW, cyclotron_power_history_MW,
-         q_sci_history, q_eng_history, lawson_triple_product_history,
+         inventory_history, energy_history_keV,
+         temp_history, trigger_time, T_core,
+         lawson_triple_product_history,
          rho_grid_out, phi_grid_out) = loop_out
 
         packaged = main.package_reactor_results(
@@ -257,18 +251,7 @@ def run_pipeline(quiet=True):
         "inventory_history": _f(inventory_history),
         "energy_history_keV": _f(energy_history_keV),
         "temp_history": _f(temp_history),
-        "rad_power_history": _f(rad_power_history),
-        "instability_amp_history": _f(instability_amp_history),
-        "q_sci_history": _f(q_sci_history),
-        "q_eng_history": _f(q_eng_history),
         "lawson_triple_product_history": _f(lawson_triple_product_history),
-        "alpha_heating_power_history_MW": _f(alpha_heating_power_history_MW),
-        "bremsstrahlung_power_history_MW": _f(bremsstrahlung_power_history_MW),
-        "cyclotron_power_history_MW": _f(cyclotron_power_history_MW),
-        # Not in the brief's list, but it rides the same code path and
-        # diagnostics plots it beside the other three power channels.
-        "external_heating_power_history_MW": _f(external_heating_power_history_MW),
-        "time_history": _f(time_history),
 
         # --- scalars
         "total_injected": np.asarray(total_injected, dtype=np.int64),
@@ -490,10 +473,9 @@ def _patched_init(self, *a, **k):
     _orig_init(self, *a, **k)
     self.initial_thermal_count = {count}
     self.reactor_num_steps = {steps}
-    # The other three entry points get shrunk too -- this test asks
-    # whether every plot still renders, not whether the physics is
+    # The benchmark sweep gets shrunk too -- this test asks whether
+    # every plot still renders, not whether the physics is
     # production-sized. The .npz test is what guards the numbers.
-    self.osc_num_steps = {osc_steps}
     self.BENCHMARK_PARTICLE_COUNTS = {bench_counts}
     self.BENCHMARK_STEPS = {bench_steps}
 config.SimulationConfiguration.__init__ = _patched_init
@@ -507,17 +489,14 @@ MHDEquilibrium.solve_grad_shafranov = _forced
 
 import main
 import benchmarks
-# The 17 plots come from all FOUR entry points, not from the reactor run
-# alone, so this drives all four. It no longer mirrors main.py's __main__,
-# which runs the reactor only as of step 14 session B; the benchmark sweep
-# moved to benchmarks.run_hpc_benchmark.
+# The 11 plots come from two entry points: the reactor run (10) and the
+# benchmark sweep (benchmark_scaling.png), so this drives both. main.py's
+# __main__ runs the reactor only.
 cfg = config.SimulationConfiguration()
 benchmarks.run_hpc_benchmark(cfg)
 # save_plots=True for the same reason main.py's __main__ passes it: the
 # manifest baseline needs the reactor PNGs whatever cfg.PROFILE is set to.
 main.run_reactor_steady_state(save_plots=True)
-main.run_plasma_oscillation_test()
-main.run_nuclear_reaction_dynamics()
 """
 
 
@@ -536,7 +515,7 @@ def render_full_run(out_dir):
     script = CHILD_RENDER.format(
         repo=REPO, threads=NUMBA_THREADS, seed=SEED,
         count=TEST_THERMAL_COUNT, steps=TEST_NUM_STEPS, backend=GS_BACKEND,
-        osc_steps=TEST_OSC_STEPS, bench_counts=TEST_BENCHMARK_COUNTS,
+        bench_counts=TEST_BENCHMARK_COUNTS,
         bench_steps=TEST_BENCHMARK_STEPS,
     )
     env = dict(os.environ)
@@ -554,7 +533,7 @@ def render_full_run(out_dir):
 
 def plot_manifest(mode, out_dir, manifest_path):
     """Shell out to tools/plot_manifest.py -- the one authority on
-    whether all 17 plots survived a run."""
+    whether all 11 plots survived a run."""
     args = [sys.executable, PLOT_MANIFEST_TOOL, mode, "--dir", out_dir]
     args += ["--out" if mode == "record" else "--baseline", manifest_path]
     if mode == "compare":
@@ -591,7 +570,7 @@ def test_reactor_regression():
 
 def test_plot_outputs_survive_full_run():
     """Slow: the whole run_reactor_steady_state renders, and every one of
-    the 17 plots is still produced and unchanged."""
+    the 11 plots is still produced."""
     assert os.path.isfile(GOLDEN_MANIFEST), (
         f"no plot baseline at {GOLDEN_MANIFEST}; run "
         "'python tests/test_regression.py record-plots' first")
@@ -737,7 +716,7 @@ def build_parser():
     p.set_defaults(func=cmd_record_plots)
 
     p = sub.add_parser("compare-plots",
-                        help="render, and diff the 17 plots against the baseline")
+                        help="render, and diff the 11 plots against the baseline")
     p.set_defaults(func=cmd_compare_plots)
 
     return parser

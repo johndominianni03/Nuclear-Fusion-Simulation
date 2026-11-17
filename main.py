@@ -1,13 +1,7 @@
 import numpy as np
-import torch
 
 from physics_engine import (
-    compute_electrostatic_energy,
-    compute_dt_cross_section,
     compute_volumetric_fusion_power,
-    compute_cic_charge_density,
-    HPCPhysicsAccelerator,
-    check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
     compute_poloidal_field_grids,           # psi-derived poloidal B (real grad-B / mirror force)
 )
 from config import SimulationConfiguration
@@ -259,11 +253,9 @@ def run_reactor_steady_state(save_plots=None):
     (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
      tracked_lost,
      total_injected, total_lost,
-     inventory_history, energy_history_keV, instability_amp_history, time_history,
-     temp_history, rad_power_history, trigger_time, T_core,
-     alpha_heating_power_history_MW, external_heating_power_history_MW,
-     bremsstrahlung_power_history_MW, cyclotron_power_history_MW,
-     q_sci_history, q_eng_history, lawson_triple_product_history, rho_grid, phi_grid
+     inventory_history, energy_history_keV,
+     temp_history, trigger_time, T_core,
+     lawson_triple_product_history, rho_grid, phi_grid
      ) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
 
     _t = outer.mark()
@@ -302,98 +294,17 @@ def run_reactor_steady_state(save_plots=None):
             cfg, eq, rho_grid, phi_grid, energy_history_keV, 
             mock_active, total_injected, total_lost, inventory_history,
             R_centers, density_profile, pressure_profile,
-            R_phase, v_parallel_phase, instability_amp_history, P_fusion_grid,
-            alpha_particles=mock_alphas, 
-            alpha_power_history=alpha_heating_power_history_MW,
-            ext_power_history=external_heating_power_history_MW,
-            brem_power_history=bremsstrahlung_power_history_MW, 
-            cyc_power_history=cyclotron_power_history_MW,        
-            q_sci_history=q_sci_history, q_eng_history=q_eng_history, lawson_history=lawson_triple_product_history 
+            R_phase, v_parallel_phase, P_fusion_grid,
+            alpha_particles=mock_alphas,
+            lawson_history=lawson_triple_product_history
         )
 
-        if cfg.SPI_TRIGGERED:
-            diagnostics.plot_disruption_mitigation(time_history, temp_history, rad_power_history, trigger_time)
-
-
-def run_plasma_oscillation_test():
-    print("==================================================")
-    print("  HYBRID TENSOR OSCILLATIONS & SHIELDING ")
-    print("==================================================")
-    
-    cfg = SimulationConfiguration()
-    eq, engine, pos_tensor, vel_tensor, type_tensor, rho_grid = initialization.initialize_oscillation_test(cfg)
-
-    # A purely electrostatic unit test: it measures collective Langmuir ringing against
-    # the toroidal field only, so the gather gets zero B_pol grids rather than the
-    # Grad-Shafranov ones.
-    B_R_pol_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
-    B_Z_pol_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
-    hpc_engine = HPCPhysicsAccelerator(cfg.HPC_DEVICE)
-    
-    w_es_history, time_arr = [], []
-    pos_np = pos_tensor.cpu().numpy()
-    vel_np = vel_tensor.cpu().numpy()
-    type_np = type_tensor.cpu().numpy()
-    
-    print("[SYSTEM] Running Unit Test: Capturing collective electrostatic ringing...")
-    
-    for step in range(cfg.osc_num_steps):
-        mask_valid = type_np != -1
-        R_coords = np.sqrt(pos_np[mask_valid, 0]**2 + pos_np[mask_valid, 1]**2)
-        Z_coords = pos_np[mask_valid, 2]
-        charges = np.full(np.sum(mask_valid), -cfg.e_charge * cfg.macro_weight)
-        
-        rho_grid = compute_cic_charge_density(R_coords, Z_coords, charges, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, True)
-        phi_grid, E_R_grid, E_Z_grid = engine.solve_fields(rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max)
-        
-        w_es = compute_electrostatic_energy(E_R_grid, E_Z_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max)
-        w_es_history.append(w_es)
-        time_arr.append(step * cfg.osc_dt)
-        
-        E_np, B_np = vectorized_gather_and_B(
-            pos_np, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
-            cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
-            cfg.B0, cfg.R0_major, 0.0, 0.0, 1, 1, 0.0
-        )
-        
-        pos_tensor = torch.tensor(pos_np, device=cfg.HPC_DEVICE)
-        vel_tensor = torch.tensor(vel_np, device=cfg.HPC_DEVICE)
-        E_tensor = torch.tensor(E_np, device=cfg.HPC_DEVICE)
-        B_tensor = torch.tensor(B_np, device=cfg.HPC_DEVICE)
-        
-        p_e, v_e = hpc_engine.vectorized_boris_push_metal(pos_tensor, vel_tensor, -cfg.e_charge * cfg.macro_weight, cfg.m_electron * cfg.macro_weight, B_tensor, E_tensor, cfg.osc_dt)
-        
-        pos_np, vel_np = p_e.cpu().numpy(), v_e.cpu().numpy()
-        # Unified on the psi surface, same as the reactor loop
-        check_confinement_flux(
-            pos_np, type_np, eq.psi_grid, eq.psi_edge,
-            eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max,
-            eq.psi_nR, eq.psi_nZ
-        )
-        
-        if (step + 1) % 250 == 0:
-            print(f"  Step {step+1:04d}/{cfg.osc_num_steps} | W_ES: {w_es:.3e} Joules | E_Z Max: {np.max(np.abs(E_Z_grid)):.2e} V/m")
-
-    print("==================================================")
-    print("  TEST COMPLETE: GENERATING DIAGNOSTIC ARTIFACTS  ")
-    print("==================================================")
-    diagnostics.run_oscillation_diagnostics(cfg, time_arr, w_es_history)
-
-def run_nuclear_reaction_dynamics():
-    print("==================================================")
-    print("  EVALUATING D-T QUANTUM CROSS-SECTION   ")
-    print("==================================================")
-    E_kev_arr = np.linspace(1.0, 200.0, 500)
-    sigma_arr = np.array([compute_dt_cross_section(e) for e in E_kev_arr])
-    diagnostics.plot_fusion_cross_section(E_kev_arr, sigma_arr)
 
 if __name__ == "__main__":
-    # The reactor run and nothing else. The benchmark sweep (now
-    # benchmarks.run_hpc_benchmark), run_plasma_oscillation_test and
-    # run_nuclear_reaction_dynamics used to run here too, which made bare
-    # `python3 main.py` unsafe as a reactor entry point; call them explicitly
-    # if you want them. tests/test_regression.py's compare-plots child script
-    # still drives all four, because the plot manifest covers all of them.
+    # The reactor run and nothing else. The benchmark sweep lives in
+    # benchmarks.run_hpc_benchmark; call it explicitly if you want it.
+    # tests/test_regression.py's compare-plots child script drives both,
+    # because the plot manifest covers both.
     #
     # save_plots=True: this is the full-artifact entry point, it exists to
     # regenerate the plots, so it asks for them explicitly rather than

@@ -6,20 +6,13 @@ import torch
 # --- CONSTANTS ---
 e_charge = 1.602e-19       # Coulombs
 m_deuterium = 3.3435e-27   # kg
-m_electron = 9.109e-31     # kg
 eps_0 = 8.854e-12          # Vacuum permittivity (F/m)
 
 class ParticlePusher:
-    def __init__(self, equilibrium, species="deuterium"):
+    def __init__(self, equilibrium):
         self.eq = equilibrium
-        # Species is swappable so electron Langmuir waves can be simulated
-        self.species = species
-        if self.species == "electron":
-            self.m = m_electron
-            self.q = -e_charge
-        else:
-            self.m = m_deuterium
-            self.q = e_charge
+        self.m = m_deuterium
+        self.q = e_charge
 
     def initialize_velocities(self, num_particles, T_keV=1.0):
         T_Joules = T_keV * 1e3 * abs(self.q)
@@ -99,23 +92,6 @@ class ParticlePusher:
 
         return positions, velocities
 
-    def inject_langmuir_perturbation(self, num_particles, R_min, R_max, Z_min, Z_max, k_Z, perturbation_amplitude=1e4):
-        # Uniform positions plus a sinusoidal velocity kick to excite plasma oscillations
-        positions = np.zeros((num_particles, 3))
-        velocities = np.zeros((num_particles, 3))
-        
-        for i in range(num_particles):
-            R = np.random.uniform(R_min, R_max)
-            Z = np.random.uniform(Z_min, Z_max)
-            phi_ang = np.random.uniform(0, 2 * np.pi)
-            positions[i] = np.array([R * np.cos(phi_ang), R * np.sin(phi_ang), Z])
-            
-            # Velocity wave perturbation
-            v_z = perturbation_amplitude * np.sin(k_Z * Z)
-            velocities[i] = np.array([0.0, 0.0, v_z])
-            
-        return positions, velocities
-
     def compute_fluid_moments(self, active_particles, R_min, R_max, Z_min, Z_max, num_bins):
         # 0th (density) and 2nd (pressure) fluid moments, by binning particles radially.
         R_edges = np.linspace(R_min, R_max, num_bins + 1)
@@ -191,11 +167,11 @@ class ParticlePusher:
         return alpha_R, alpha_Z, alpha_vR, alpha_vphi, alpha_vZ
 
     def compute_alpha_heating_power(self, alpha_energies_kev, dt, cfg):
-        # Drains energy from fast alphas via Coulomb drag, updates their kinetic
-        # energies, and returns the deposited heating power in MW.
+        # Drains energy from fast alphas via Coulomb drag and returns
+        # (new alpha energies, total keV given up this step).
 
         if len(alpha_energies_kev) == 0:
-            return alpha_energies_kev, 0.0, 0.0
+            return alpha_energies_kev, 0.0
 
         # Precision: the per-step drain fraction 2*NU_S*dt = 4e-9 is ~30x below float32
         # epsilon, so the old `E - E*fraction` on float32 rounded back to E and the
@@ -214,23 +190,12 @@ class ParticlePusher:
         # 3. Drain it from the alphas
         new_alpha_energies = E - deposited_kev
 
-        # 4. Total transferred to the bulk this step
+        # 4. Total transferred to the bulk this step. Raw simulation-scale keV (no
+        # macro_weight), so the caller can conserve energy by depositing it into the
+        # thermal population.
         total_energy_deposited_kev = float(np.sum(deposited_kev))
 
-        # 5. Convert to reactor-scale MW (1 keV = 1.602e-16 J), scaled by a macro-particle
-        # weight representing the full plasma volume.
-        joules_per_kev = 1.602e-16
-        # Shared with the Lawson triple product so both describe the same plasma
-        macro_weight = cfg.MACRO_WEIGHT_REACTOR
-
-        total_joules = total_energy_deposited_kev * joules_per_kev * macro_weight
-
-        power_watts = total_joules / dt
-        power_mw = power_watts / 1e6
-
-        # Third return value is raw simulation-scale keV (no macro_weight), so the caller
-        # can conserve energy by depositing it into the thermal population.
-        return new_alpha_energies, power_mw, total_energy_deposited_kev
+        return new_alpha_energies, total_energy_deposited_kev
 
 # --- CLASSLESS NUMBA KERNELS ---
 
@@ -385,23 +350,6 @@ def gather_electric_field_scalar(px, py, pz, E_R_grid, E_Z_grid,
     return er * cos_phi, er * sin_phi, ez
 
 
-@njit(fastmath=True)
-def compute_electrostatic_energy(E_R, E_Z, R_min, R_max, Z_min, Z_max):
-    # Integrates 1/2 eps_0 E^2 over the grid volume to track wave energy
-    nR, nZ = E_R.shape
-    dR = (R_max - R_min) / (nR - 1)
-    dZ = (Z_max - Z_min) / (nZ - 1)
-    
-    w_es = 0.0
-    for i in range(nR):
-        R_i = R_min + i * dR
-        cell_volume = 2.0 * np.pi * R_i * dR * dZ if R_i > 0 else 1.0
-        for j in range(nZ):
-            e_mag_sq = E_R[i, j]**2 + E_Z[i, j]**2
-            w_es += 0.5 * 8.854e-12 * e_mag_sq * cell_volume
-            
-    return w_es
-
 # =======================================================
 # DISRUPTION MITIGATION FLUID FUNCTIONS
 # =======================================================
@@ -417,31 +365,6 @@ def compute_radiative_cooling_power(n_e, n_z, T_e, cooling_coeff):
     p_rad = n_e * n_z * cooling_coeff * np.sqrt(safe_Te)
 
     return p_rad
-
-# =======================================================
-# NUCLEAR REACTION DYNAMICS (QUANTUM TUNNELING)
-# =======================================================
-
-@njit(fastmath=True)
-def compute_dt_cross_section(E_keV):
-    # D-T fusion cross-section in barns, from the Gamow tunneling factor:
-    #   sigma(E) = (S(E) / E) * exp(-sqrt(E_G / E))
-
-    # Guard against division by zero for near-stationary particles
-    if E_keV <= 0.05:
-        return 0.0
-
-    E_G = 34.38  # Gamow energy for D-T (keV)
-
-    # Breit-Wigner resonance on the S-factor, modelling the spike at 64 keV
-    resonance_width = 150.0
-    S_E = 1000.0 + (80000.0) / ((E_keV - 64.0)**2 + resonance_width)
-
-    gamow_factor = np.exp(-np.sqrt(E_G / E_keV))
-
-    sigma_barns = (S_E / E_keV) * gamow_factor
-
-    return sigma_barns
 
 # =======================================================
 # REACTIVITY MATRICES & VOLUMETRIC FUSION RATES
@@ -496,73 +419,6 @@ def compute_volumetric_fusion_power(n_D_grid, n_T_grid, T_i_grid_keV, cfg):
             
     return P_fusion_grid
 
-@njit(fastmath=True)
-def compute_radiation_losses(n_e, T_e_keV, B_mag, Z_eff, V_cell, cyc_reabsorption=5.0e-4):
-
-    # Bremsstrahlung and cyclotron radiation power lost from one grid cell (Watts).
-    # n_e [m^-3], T_e_keV, B_mag [T], Z_eff, V_cell [m^3], and cyc_reabsorption =
-    # the net fraction of raw cyclotron emission that actually escapes.
-
-    P_brem_density = 0.0
-    P_cyc_density = 0.0
-
-    # Only cells with active plasma
-    if T_e_keV > 0.0 and n_e > 0.0:
-        # Bremsstrahlung (X-rays). Optically thin, so essentially all of it escapes --
-        # the dominant radiative channel in a D-T reactor.
-        P_brem_density = 4.8e-37 * Z_eff * (n_e**2) * np.sqrt(T_e_keV)
-
-        # Cyclotron (microwave). The coefficient is RAW emission; a reactor is optically
-        # thick at the fundamental and the wall reflects most of the rest, so net loss is
-        # a small fraction of brem (the old 0.05 factor put it ~2000x above).
-        # cyc_reabsorption is a lumped, tuned stand-in -- see cfg.CYCLOTRON_REABSORPTION.
-        if B_mag > 0.0:
-            P_cyc_density = 6.21e-17 * n_e * T_e_keV * (B_mag**2) * cyc_reabsorption
-
-    # Power density (W/m^3) * cell volume (m^3) -> Watts
-    P_brem_watts = P_brem_density * V_cell
-    P_cyc_watts = P_cyc_density * V_cell
-
-    return P_brem_watts, P_cyc_watts
-
-
-@njit(fastmath=True)
-def compute_radiation_losses_grid(n_e_grid_raw, T_core, R_min, dR, dZ, nR, nZ, B0, Z_eff, scale_factor, norm_n_e,
-                                  cyc_reabsorption=5.0e-4, R0=1.0):
-    # The whole (nR x nZ) radiation-loss reduction as one compiled Numba loop, instead
-    # of nR*nZ Python-level calls into compute_radiation_losses.
-    total_brem_watts = 0.0
-    total_cyc_watts = 0.0
-    for i in range(nR):
-        R_i = R_min + i * dR
-        V_cell = 2.0 * np.pi * R_i * dR * dZ if R_i > 0 else 1.0
-        # Toroidal field falls as R0/R about the major radius
-        B_mag_cell = B0 * (R0 / R_i) if R_i > 0 else B0
-        for j in range(nZ):
-            n_e_cell = n_e_grid_raw[i, j] * scale_factor
-            T_e_cell = T_core * (n_e_grid_raw[i, j] * norm_n_e)
-            p_b, p_c = compute_radiation_losses(n_e_cell, T_e_cell, B_mag_cell, Z_eff, V_cell, cyc_reabsorption)
-            total_brem_watts += p_b
-            total_cyc_watts += p_c
-    return total_brem_watts, total_cyc_watts
-
-@njit(fastmath=True)
-def evaluate_q_factors(P_fus_MW, P_ext_MW, eta_th, eta_heat):
-    # Scientific gain Q_sci (thermal out / thermal in) and engineering gain Q_eng
-    # (electrical out / electrical in).
-
-    Q_sci = P_fus_MW / P_ext_MW if P_ext_MW > 0.0 else 0.0
-
-    # Assumes the blanket captures 100% of fusion + external heat
-    P_elec_out = (P_fus_MW + P_ext_MW) * eta_th
-
-    # Grid power needed to run the heating systems
-    P_elec_in = P_ext_MW / eta_heat
-    
-    Q_eng = P_elec_out / P_elec_in if P_elec_in > 0.0 else 0.0
-    
-    return Q_sci, Q_eng, P_elec_out, P_elec_in
-
 
 # =====================================================================
 # HPC, MULTI-CORE PROCESSING & METAL GPU ACCELERATION
@@ -593,8 +449,8 @@ def _vectorized_boris_push_metal_impl(pos_tensor, vel_tensor, q, m, B_tensor, E_
 
 
 # Static-shape compile. Eager issues ~16-20 Metal dispatches at ~18 us each, a ~0.4 ms
-# floor at ANY particle count; fusing collapses that to one or two. The benchmark and
-# oscillation-test call sites use fixed shapes, so static compile applies and warms up
+# floor at ANY particle count; fusing collapses that to one or two. The benchmark
+# call site uses fixed shapes, so static compile applies and warms up
 # cheaply (~15ms per N). Measured warm at N=50,000: 0.426 ms eager -> 0.069 ms.
 # Falls back to eager on compile failure.
 try:
@@ -957,7 +813,7 @@ def apply_vectorized_collisions_torch(vel_tensor, type_tensor, nu_c, dt):
 def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
     # Eager only -- the torch.sum reduction hits the dynamic-shape Inductor bug.
     if alpha_energies_kev.numel() == 0:
-        return alpha_energies_kev, 0.0, 0.0
+        return alpha_energies_kev, 0.0
 
     # Same float32 cancellation as the numpy version, but MPS has no float64 so the
     # promote-to-double remedy isn't available. Compute the deposit directly instead:
@@ -974,13 +830,7 @@ def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
     # The reduction is over the precise per-particle drain, so no cancellation here
     total_energy_deposited_kev = float(torch.sum(deposited_kev).item())
 
-    joules_per_kev = 1.602e-16
-    macro_weight = cfg.MACRO_WEIGHT_REACTOR   # see config: shared with the Lawson math
-    total_joules = total_energy_deposited_kev * joules_per_kev * macro_weight
-    power_watts = total_joules / dt
-    power_mw = power_watts / 1e6
-
-    return new_alpha_energies, power_mw, total_energy_deposited_kev
+    return new_alpha_energies, total_energy_deposited_kev
 
 
 # =====================================================================

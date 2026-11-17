@@ -10,9 +10,8 @@ from scipy.interpolate import RegularGridInterpolator
 # =======================================================
 # The solved psi is a pure function of the grid geometry and the SOR controls --
 # there is no run-to-run variation -- but the pure-Python SOR loop costs several
-# seconds, and a single run solves twice (initialize_reactor and
-# initialize_oscillation_test both build an MHDEquilibrium). So the result is
-# memoized to disk, keyed by a hash of every parameter it depends on.
+# seconds. So the result is memoized to disk, keyed by a hash of every parameter
+# it depends on.
 #
 # Set FUSION_NO_GS_CACHE=1 to force a fresh solve; the cache file is then
 # rewritten from that solve's result.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record and compare a fingerprint manifest of the simulation's PNG output.
 
-The run writes 17 diagnostic plots into the working directory. This tool walks
+The run writes 11 diagnostic plots into the working directory. This tool walks
 that directory for them, records each one's SHA-256 and pixel dimensions to a
 JSON manifest, and can later diff a fresh run against a saved manifest to say
 which plots changed -- a cheap regression check for refactors that are meant to
@@ -14,11 +14,11 @@ Usage:
     # After a later run, diff against that baseline:
     python tools/plot_manifest.py compare --baseline plot_manifest.json
 
-Both modes warn loudly (and exit non-zero) if any of the 17 expected plots is
+Both modes warn loudly (and exit non-zero) if any of the 11 expected plots is
 missing from the working directory.
 
 Exit codes:
-    0  all 17 present; for compare, every plot byte-identical to the baseline
+    0  all 11 present; for compare, every plot byte-identical to the baseline
     1  a plot is missing, or (compare) a plot changed / is new
     2  usage error -- e.g. the baseline manifest does not exist
 
@@ -33,8 +33,10 @@ import json
 import os
 import sys
 
-# The 17 PNGs a full run is expected to produce: 16 from diagnostics.py plus
+# The 11 PNGs a full run is expected to produce: 10 from diagnostics.py plus
 # tokamak_reactor_3d.png, which diagnostics.py delegates to visualizer.py.
+# benchmark_scaling.png comes from benchmarks.run_hpc_benchmark; the other
+# ten from the reactor run.
 EXPECTED_PLOTS = (
     "benchmark_scaling.png",
     "charge_density_map.png",
@@ -43,16 +45,10 @@ EXPECTED_PLOTS = (
     "tokamak_reactor_2d.png",
     "radial_profiles.png",
     "phase_space_map.png",
-    "instability_growth.png",
     "fusion_power_density.png",
     "alpha_orbits.png",
     "tokamak_reactor_3d.png",
-    "alpha_heating_balance.png",
-    "radiation_loss_profile.png",
-    "lawson_q_factor.png",
-    "plasma_oscillation_frequency.png",
-    "disruption_mitigation.png",
-    "fusion_cross_section.png",
+    "lawson_triple_product.png",
 )
 
 DEFAULT_MANIFEST = "plot_manifest.json"
@@ -334,7 +330,7 @@ def cmd_compare(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Record or compare a SHA-256/dimension manifest of the "
-                    "simulation's 17 output plots.",
+                    "simulation's 11 output plots.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="exit codes: 0 = clean, 1 = missing/changed plots, 2 = usage error",
     )

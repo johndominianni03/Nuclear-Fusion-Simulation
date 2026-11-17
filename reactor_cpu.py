@@ -9,8 +9,6 @@ import torch
 
 from physics_engine import (
     compute_radiative_cooling_power,
-    compute_radiation_losses_grid,          # vectorized radiation-loss grid reduction
-    evaluate_q_factors,
     compute_cic_charge_density,
     vectorized_boris_push_numba_fallback,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
@@ -154,13 +152,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
-    inventory_history, energy_history_keV, instability_amp_history = [], [], []
-    time_history, temp_history, rad_power_history = [], [], []
+    inventory_history, energy_history_keV = [], []
+    temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
-
-    alpha_heating_power_history_MW, external_heating_power_history_MW = [], []
-    bremsstrahlung_power_history_MW, cyclotron_power_history_MW = [], []
-    q_sci_history, q_eng_history, lawson_triple_product_history = [], [], []
 
     print("[SYSTEM] Igniting time-domain reactor loop on CPU/Numba (fastest path at this particle count)...")
 
@@ -179,7 +173,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
     for step in range(cfg.reactor_num_steps):
         t = step * cfg.reactor_dt
-        time_history.append(t)
 
         # --- BATCH NBI INJECTION (tapering source) ---
         # A fixed batch forever meant inventory only climbed and no steady state was
@@ -455,17 +448,12 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             alpha_vels = a_vel.astype(np.float64)
             v_mags = np.linalg.norm(alpha_vels, axis=1)
             alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / 1.602e-16
-            new_energies_kev, alpha_power_mw, alpha_deposited_kev = engine.compute_alpha_heating_power(
+            new_energies_kev, alpha_deposited_kev = engine.compute_alpha_heating_power(
                 alpha_energies_kev, cfg.reactor_dt, cfg)
             new_v_mags = np.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
             scale_factors = new_v_mags / np.where(v_mags == 0, 1e-10, v_mags)
             alpha_vels *= scale_factors[:, np.newaxis]
             a_vel[:] = alpha_vels.astype(np.float32)
-        else:
-            alpha_power_mw = 0.0
-
-        alpha_heating_power_history_MW.append(alpha_power_mw)
-        external_heating_power_history_MW.append(cfg.EXTERNAL_HEATING_MW)
 
         # The bulk pool holds nothing but types 0 and 1, and the compaction above
         # removed every -1 this step, so its live count IS the confined count.
@@ -476,8 +464,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # Energy drained from the alphas used to vanish -- removed from the fast
         # population and given to nothing, so the thermal plasma never felt the heating.
         # Deposit it by scaling bulk speeds, using the simulation-scale keV (no
-        # macro_weight) so particles stay self-consistent; the MW figure above is
-        # separately scaled for reactor-equivalent output.
+        # macro_weight) so particles stay self-consistent.
         if alpha_deposited_kev > 0.0 and bulk.n_live > 0:
             bulk_vels = b_vel.astype(np.float64)
             bulk_energy_kev = float(np.sum(0.5 * cfg.m_deuterium * np.sum(bulk_vels**2, axis=1))) / 1.602e-16
@@ -494,12 +481,11 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         energy_history_keV.append(current_energy_keV)
 
         current_amp = cfg.b_perturb_initial * np.exp(cfg.gamma_growth * t)
-        instability_amp_history.append(current_amp)
 
         # --- T_core IS A TEMPERATURE, NOT A TOTAL ---
         # Assigning the plasma's TOTAL stored energy here made the "core temperature"
-        # read ~50,000 keV, and every consumer (brem's sqrt(T_e), the Lawson triple
-        # product, the quench baseline) was fed that. For a 3D Maxwellian
+        # read ~50,000 keV, and every consumer (the Lawson triple product, the
+        # quench baseline) was fed that. For a 3D Maxwellian
         # <E> = (3/2)kT, so kT = (2/3) * <E>.
         n_bulk = max(current_confined, 1)
         T_core_kinetic = (2.0 / 3.0) * (current_energy_keV / n_bulk)
@@ -555,9 +541,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 if loss_fraction > 0.0:
                     drain = np.sqrt(1.0 - loss_fraction)
                     b_vel[:] = (b_vel.astype(np.float64) * drain).astype(np.float32)
-        else:
-            # No impurities before SPI fires, so nothing radiates
-            P_rad = 0.0
 
         # energy_history_keV / T_core_kinetic above are recorded BEFORE the drain, which
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
@@ -565,41 +548,17 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("alpha heating + energy transfer", _t)
 
-        # One vectorized Numba call over the whole grid, replacing nR*nZ Python-level
-        # calls into compute_radiation_losses.
         _t = prof.mark()
-        n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
-        max_n_e = np.max(n_e_grid_raw)
-        scale_factor = 1.0e20 / (max_n_e + 1e-10)
-        norm_n_e = 1.0 / (max_n_e + 1e-10)
-        dR, dZ = (cfg.R_max - cfg.R_min) / (cfg.nR - 1), (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
-        total_brem_watts, total_cyc_watts = compute_radiation_losses_grid(
-            n_e_grid_raw, T_core, cfg.R_min, dR, dZ, cfg.nR, cfg.nZ, cfg.B0, cfg.Z_eff, scale_factor, norm_n_e,
-            cfg.CYCLOTRON_REABSORPTION, cfg.R0_major
-        )
-        bremsstrahlung_power_history_MW.append(total_brem_watts / 1e6)
-        cyclotron_power_history_MW.append(total_cyc_watts / 1e6)
-
-        total_fus_MW = alpha_power_mw * 5.0
-        q_sci, q_eng, p_elec_out, p_elec_in = evaluate_q_factors(total_fus_MW, cfg.EXTERNAL_HEATING_MW, cfg.eta_thermal, cfg.eta_heating)
-        q_sci_history.append(q_sci)
-        q_eng_history.append(q_eng)
-
         loss_rate = total_lost / t if t > 0 else 1e-5
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
-        # --- TRIPLE PRODUCT DENSITY MUST MATCH THE Q-FACTOR NORMALISATION ---
-        # n_e was hardcoded to 1e20 m^-3 here, which had nothing to do with the
-        # macro-particle weight that scales alpha heating into the reactor-scale MW
-        # feeding Q_sci on the panel directly above this one.
-        # Deriving n_e from the same MACRO_WEIGHT_REACTOR and the psi_edge volume makes
-        # the panels describe one plasma. Units are unchanged and already correct:
-        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
+        # The triple product's density is the confined macro-particle count scaled by
+        # MACRO_WEIGHT_REACTOR over the psi_edge volume. Units: m^-3 * keV * s,
+        # matching cfg.lawson_target and the axis label.
         n_e_reactor = (current_confined * cfg.MACRO_WEIGHT_REACTOR) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
-        rad_power_history.append(P_rad)
-        prof.add("radiation + Q-factor diagnostics", _t)
+        prof.add("Lawson diagnostics", _t)
 
         if (step + 1) % 500 == 0:
             max_rho, max_phi = np.max(rho_grid), np.max(np.abs(phi_grid))
@@ -642,8 +601,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     return (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
             tracked_lost,
             total_injected, total_lost,
-            inventory_history, energy_history_keV, instability_amp_history, time_history,
-            temp_history, rad_power_history, trigger_time, T_core,
-            alpha_heating_power_history_MW, external_heating_power_history_MW,
-            bremsstrahlung_power_history_MW, cyclotron_power_history_MW,
-            q_sci_history, q_eng_history, lawson_triple_product_history, rho_grid, phi_grid)
+            inventory_history, energy_history_keV,
+            temp_history, trigger_time, T_core,
+            lawson_triple_product_history, rho_grid, phi_grid)

@@ -1,123 +1,86 @@
 {
-  "expected_count": 17,
-  "generated": "2026-08-29T17:47:51Z",
-  "missing": [
-    "disruption_mitigation.png"
-  ],
+  "expected_count": 11,
+  "generated": "2026-11-17T05:56:54Z",
+  "missing": [],
   "plots": {
-    "alpha_heating_balance.png": {
-      "bytes": 141599,
-      "height": 1500,
-      "path": "alpha_heating_balance.png",
-      "sha256": "616690a4084718f8900d8ed362b45c96f5d32ba0af3bb282b593d25e50e0f9ef",
-      "width": 2400
-    },
     "alpha_orbits.png": {
-      "bytes": 889383,
+      "bytes": 905789,
       "height": 2400,
       "path": "alpha_orbits.png",
-      "sha256": "3fe4f57f55f6068e2bef563356b3e35bf6914299d7d4dc131c3111496dd814df",
+      "sha256": "5c55f903caf84b6885dd59473158a855d9bf4b08f5225363cce680fae4855c26",
       "width": 2400
     },
     "benchmark_scaling.png": {
-      "bytes": 221853,
+      "bytes": 245318,
       "height": 1800,
       "path": "benchmark_scaling.png",
-      "sha256": "98558f587b0a9455196708ba09004c3c36ec08c7f02d21b993eedd2a9a5205e7",
+      "sha256": "e32b71d3eea0eccfa5de8c055de1eb8cf37bd58e675921d35e0270e79d779a0e",
       "width": 2700
     },
     "charge_density_map.png": {
-      "bytes": 381718,
+      "bytes": 370899,
       "height": 1800,
       "path": "charge_density_map.png",
-      "sha256": "62b82d602505f79e3dbe9f304ff94d95a6191993e775bdf3d5d82c655f1c1d70",
+      "sha256": "0c99b3df472af64d05492e59a05e29c4522c7d7b85ec42129abedfe473930f16",
       "width": 2100
-    },
-    "fusion_cross_section.png": {
-      "bytes": 173883,
-      "height": 1500,
-      "path": "fusion_cross_section.png",
-      "sha256": "bd9263e7791e3eea13eacc65feb561bc94baade9812a54d219c42920c87d1cf4",
-      "width": 2400
     },
     "fusion_power_density.png": {
-      "bytes": 193630,
+      "bytes": 177496,
       "height": 1800,
       "path": "fusion_power_density.png",
-      "sha256": "452616816e88dadbd68b258b5b39998a7b5683edca9c44ce030100fafe326ab4",
+      "sha256": "16841beb4dab268117c5d13265d5dd579a8b7383f8c92bb7fbaef809d25fbbfc",
       "width": 2100
     },
-    "instability_growth.png": {
-      "bytes": 142398,
+    "lawson_triple_product.png": {
+      "bytes": 139833,
       "height": 1500,
-      "path": "instability_growth.png",
-      "sha256": "049ac5935a1c6d331f658b34b37670547940825d21dc51de02471fdc9ff68b22",
-      "width": 2400
-    },
-    "lawson_q_factor.png": {
-      "bytes": 252068,
-      "height": 2400,
-      "path": "lawson_q_factor.png",
-      "sha256": "dd97f89f8bf8ecd03036e1acca848707a4328ebf169612b94d35eb47acf666c4",
+      "path": "lawson_triple_product.png",
+      "sha256": "da7e55f9ff421f5c8dde1b995a21973948a1ead9f34e799781f4c55aedb0488b",
       "width": 2700
     },
     "phase_space_map.png": {
-      "bytes": 338167,
+      "bytes": 341623,
       "height": 1800,
       "path": "phase_space_map.png",
-      "sha256": "aad3fbace6c98a501deb25d46ece2a91074caea3492dcf7c7cf399f5a0d0c474",
+      "sha256": "35a365df3c681fe84c092a010baf4b7c6ba88332586672c072ceb905bd1495f9",
       "width": 2400
     },
-    "plasma_oscillation_frequency.png": {
-      "bytes": 202707,
-      "height": 2400,
-      "path": "plasma_oscillation_frequency.png",
-      "sha256": "a3e33bc3a093428e96ec1fec3423426d5f46d2a1af07b47f30ca37bfe2443bd3",
-      "width": 2700
-    },
     "plasma_stored_energy_time.png": {
-      "bytes": 98834,
+      "bytes": 98620,
       "height": 1200,
       "path": "plasma_stored_energy_time.png",
-      "sha256": "f39e8ca1ee994bd4f521caa4c19b72982461eab14f3aa80af44dd738b30a84ab",
+      "sha256": "27b23a964633fe9325078de9cdd696415c3f9687ced7d004ca1886925e669de7",
       "width": 2400
     },
     "potential_field_map.png": {
-      "bytes": 335574,
+      "bytes": 317085,
       "height": 1800,
       "path": "potential_field_map.png",
-      "sha256": "5e7d2c6cb1f604367db87afda684dc0339ba43ece08af817797a08de96b5fe55",
+      "sha256": "533cc7333494b994f2dcd17d277fa30118f69c9d849353dd89e63034eb5e041a",
       "width": 2100
     },
     "radial_profiles.png": {
-      "bytes": 197170,
+      "bytes": 186059,
       "height": 1500,
       "path": "radial_profiles.png",
-      "sha256": "2c4b10be49e9c23eea580d16670f6d82fb031a6c3a3b28055615fc68c867d8e0",
-      "width": 2400
-    },
-    "radiation_loss_profile.png": {
-      "bytes": 190233,
-      "height": 1800,
-      "path": "radiation_loss_profile.png",
-      "sha256": "b4bfc43ede787b372bf3f4e8c734b3119f7619df764217686d7af7eaf397dfc0",
+      "sha256": "44610c26ed4658ff77ae933f41674bd9fddee5d15b1ad3624e54f83a294f863d",
       "width": 2400
     },
     "tokamak_reactor_2d.png": {
-      "bytes": 970741,
+      "bytes": 946778,
       "height": 2400,
       "path": "tokamak_reactor_2d.png",
-      "sha256": "47ff518554e4646414ceadef251dcd8e92db144ed314799368de86b10c6d9005",
+      "sha256": "04102a98ed2851cbff5ad0c6340f4fef71622d8bc659fe3150cedc5b1db9bc46",
       "width": 2400
     },
     "tokamak_reactor_3d.png": {
-      "bytes": 870720,
+      "bytes": 958520,
       "height": 2400,
       "path": "tokamak_reactor_3d.png",
-      "sha256": "8838d8e5695e31f9f3f9df20deb6ef1dc24d249cefcba301a3de185c37925d93",
+      "sha256": "10ce138736c6feaad0894e7175ba123b993a2d5f73e936c665adbfe645e822c2",
       "width": 3000
     }
   },
-  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_6x0ci48l",
+  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_nq3540qv",
   "version": 1
 }

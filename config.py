@@ -7,7 +7,6 @@ class SimulationConfiguration:
         # --- PHYSICS CONSTANTS ---
         self.e_charge = 1.602e-19       # Elementary charge (C)
         self.m_deuterium = 3.344e-27    # Deuterium mass (kg)
-        self.m_electron = 9.109e-31     # Electron mass (kg)
         self.eps_0 = 8.854e-12          # Vacuum permittivity (F/m)
 
         # Legacy aliases
@@ -65,13 +64,6 @@ class SimulationConfiguration:
         # Alphas also need a finer history cadence than the 20-step thermal one, or the
         # plot stays aliased however finely the pusher integrates.
         self.ALPHA_HISTORY_EVERY = 2
-
-        # --- PLASMA OSCILLATION TEST SETTINGS ---
-        self.osc_num_steps = 1500
-        self.osc_dt = 2.0e-11           # 20 ps, to capture ultra-fast electron motion
-        self.num_electrons = 4000
-        self.macro_weight = 5e14        # Scales charge/mass up to realistic plasma densities
-        self.perturbation_amplitude = 2e5
 
         # --- Radial Fluid Bins ---
         self.num_radial_bins = 50
@@ -139,11 +131,8 @@ class SimulationConfiguration:
         self.CHARGE_ALPHA = 2.0 * 1.6022e-19     # +2e (C)
 
         # =====================================================================
-        # ALPHA HEATING & IGNITION METRICS (PHASE V FINALE)
+        # ALPHA SLOWING-DOWN
         # =====================================================================
-
-        # Baseline NBI/RF heating power (MW), compared against alpha heating for ignition
-        self.EXTERNAL_HEATING_MW = 40.0
 
         # Slowing-down time tau_s: how long a 3.5 MeV alpha takes to drag its energy
         # into the background plasma (scaled for simulation)
@@ -157,17 +146,11 @@ class SimulationConfiguration:
         # stops heating
         self.THERMALIZATION_ENERGY_KEV = 15.0
 
-        # How many real ions each simulated macro-particle stands in for.
-        #
-        # SINGLE SOURCE OF TRUTH -- this was previously a bare 5e17 literal inside
-        # compute_alpha_heating_power (and its torch twin), used only to scale alpha
-        # heating into reactor-scale MW. The Lawson triple product meanwhile hardcoded a
-        # completely unrelated n_e = 1e20 m^-3. The two Week 22 panels were therefore
-        # describing different plasmas: the Q panel's normalisation implies
+        # How many real ions each simulated macro-particle stands in for. Read in one
+        # place only: the Lawson triple product's density,
         #   n_e = confined_macro_particles * MACRO_WEIGHT_REACTOR / PLASMA_VOLUME_M3
-        #       ~ 56,000 * 5e17 / 2.79  ~  1.0e22 m^-3,
-        # i.e. ~100x the density the triple product was assuming, which is exactly the
-        # two-decade shortfall seen on the bottom graph. Both now derive from this value.
+        #       ~ 56,000 * 5e17 / 2.79  ~  1.0e22 m^-3.
+        # It does not weight the charge deposition or anything the particles feel.
         self.MACRO_WEIGHT_REACTOR = 5e17
 
         # Confined plasma volume (m^3). Filled in at runtime by revolving the actual
@@ -178,27 +161,15 @@ class SimulationConfiguration:
         # ==========================================
         # RADIATION LOSS MODELS
         # ==========================================
-        # Effective ion charge. Pure D-T is 1.0; 1.2-1.5 accounts for helium ash and
-        # wall impurities.
-        self.Z_eff = 1.2
-
         # P_brem [W/m^3] = 4.8e-37 * Z_eff * n_e^2 * sqrt(T_e [keV])
         self.bremsstrahlung_coeff = 4.8e-37
 
         # P_cyc [W/m^3] = 6.21e-17 * n_e * T_e [keV] * B^2
         self.cyclotron_coeff = 6.21e-17
 
-        # Net escaping fraction of the RAW cyclotron emission above. A reactor is
-        # optically thick at the fundamental and the wall reflects most of the rest, so
-        # net loss sits well below bremsstrahlung (the old 0.05 put it ~2000x above).
-        # Lumped, tuned stand-in for optical depth + wall reflectivity.
-        self.CYCLOTRON_REABSORPTION = 5.0e-4
-
         # ==========================================
-        # LAWSON CRITERION & Q-FACTORS
+        # LAWSON CRITERION
         # ==========================================
-        self.eta_thermal = 0.40   # Thermal-to-electrical conversion (steam turbine)
-        self.eta_heating = 0.50   # Wall-plug efficiency of NBI/RF heating
         self.lawson_target = 3.0e21  # D-T ignition triple product (keV * s * m^-3)
 
         # =====================================================================

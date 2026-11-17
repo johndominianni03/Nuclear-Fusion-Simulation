@@ -88,7 +88,7 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
-def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, instability_amp_history=None, P_fusion_grid=None, alpha_particles=None, alpha_power_history=None, ext_power_history=None, brem_power_history=None, cyc_power_history=None, q_sci_history=None, q_eng_history=None, lawson_history=None):
+def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None):
     
     rho_grid = _scrub_grid(rho_grid)
     phi_grid = _scrub_grid(phi_grid)
@@ -330,22 +330,6 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         _show()
         plt.close()
 
-    # --- MHD INSTABILITY EXPONENTIAL GROWTH ---
-    if instability_amp_history is not None and len(instability_amp_history) > 0:
-        plt.figure(figsize=(8, 5))
-        amp_history = _scrub_1d(instability_amp_history)
-        time_array = np.arange(len(amp_history)) * cfg.reactor_dt * 1e6 
-        plt.plot(time_array, amp_history, color='darkorange', linewidth=2.5)
-        
-        plt.title(f"Tearing Mode Instability Growth (m={cfg.m_mode}, n={cfg.n_mode})")
-        plt.xlabel("Simulation Time ($\\mu s$)")
-        plt.ylabel("Perturbation Amplitude $\\delta B$ (Tesla)")
-        plt.grid(True, linestyle='--', alpha=0.5)
-        plt.tight_layout()
-        plt.savefig("instability_growth.png", dpi=300)
-        _show()
-        plt.close()
-
     # --- VOLUMETRIC FUSION POWER HEATMAP (percentile clipped) ---
     if P_fusion_grid is not None:
         plt.figure(figsize=(7, 6))
@@ -465,190 +449,25 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         print(f"[WARNING] Skipping 3D visualization due to missing dependency or window issue: {e}")
 
     # =======================================================
-    # ALPHA HEATING & IGNITION BALANCE GRAPH
+    # LAWSON TRIPLE PRODUCT
     # =======================================================
-    if alpha_power_history is not None and ext_power_history is not None and len(alpha_power_history) > 0:
-        plt.figure(figsize=(8, 5))
-        
-        alpha_pwr_arr = _scrub_1d(alpha_power_history)
-        ext_pwr_arr = _scrub_1d(ext_power_history)
-        time_array = np.arange(len(alpha_pwr_arr)) * cfg.reactor_dt * 1e6
+    if lawson_history is not None and len(lawson_history) > 0:
+        fig, ax = plt.subplots(figsize=(9, 5))
 
-        plt.plot(time_array, ext_pwr_arr, color='dodgerblue', linewidth=2, linestyle='--', label='External Auxiliary Heating (40 MW)')
-        plt.plot(time_array, alpha_pwr_arr, color='magenta', linewidth=2.5, label='Internal Alpha Heating')
-        plt.fill_between(time_array, alpha_pwr_arr, ext_pwr_arr, where=(alpha_pwr_arr > ext_pwr_arr), interpolate=True, color='magenta', alpha=0.2, label='Ignition Achieved (Self-Heating)')
-
-        plt.title("Reactor Ignition Criteria (Alpha Heating Balance)")
-        plt.xlabel("Simulation Time ($\\mu s$)")
-        plt.ylabel("Heating Power (MW)")
-        plt.grid(True, linestyle=':', alpha=0.6)
-        plt.legend(loc='upper left')
-        
-        plt.tight_layout()
-        plt.savefig("alpha_heating_balance.png", dpi=300)
-        _show()
-        plt.close()
-        
-    # =======================================================
-    # RADIATION LOSS PROFILE
-    # =======================================================
-    if brem_power_history is not None and cyc_power_history is not None and alpha_power_history is not None and len(brem_power_history) > 0:
-        plt.figure(figsize=(8, 6))
-        
-        alpha_pwr_arr = _scrub_1d(alpha_power_history)
-        brem_pwr_arr = _scrub_1d(brem_power_history)
-        cyc_pwr_arr = _scrub_1d(cyc_power_history)
-        time_array = np.arange(len(brem_pwr_arr)) * cfg.reactor_dt * 1e6
-        
-        total_rad_loss = brem_pwr_arr + cyc_pwr_arr
-        
-        plt.plot(time_array, alpha_pwr_arr, color='magenta', linewidth=2.5, label='Alpha Heating Power (Input)')
-        plt.plot(time_array, total_rad_loss, color='black', linewidth=2.5, linestyle='-', label='Total Radiation Loss')
-        plt.plot(time_array, brem_pwr_arr, color='dodgerblue', linewidth=1.5, linestyle='--', label='Bremsstrahlung (X-Ray)')
-        plt.plot(time_array, cyc_pwr_arr, color='darkorange', linewidth=1.5, linestyle=':', label='Cyclotron (Microwave)')
-        
-        plt.fill_between(time_array, alpha_pwr_arr, total_rad_loss, where=(alpha_pwr_arr >= total_rad_loss), interpolate=True, color='lightgreen', alpha=0.3, label='Net Heating (Ignition Maintained)')
-        plt.fill_between(time_array, alpha_pwr_arr, total_rad_loss, where=(alpha_pwr_arr < total_rad_loss), interpolate=True, color='salmon', alpha=0.3, label='Net Cooling (Reactor Dying)')
-        
-        plt.title("Thermodynamic Balance (Alpha Heating vs Radiation Loss)")
-        plt.xlabel("Simulation Time ($\\mu s$)")
-        plt.ylabel("Power (MW)")
-        plt.grid(True, linestyle=':', alpha=0.6)
-        plt.legend(loc='upper left')
-        
-        plt.tight_layout()
-        plt.savefig("radiation_loss_profile.png", dpi=300)
-        _show()
-        plt.close()
-
-    # =======================================================
-    # Q-FACTORS & LAWSON CRITERION
-    # =======================================================
-    if q_sci_history is not None and q_eng_history is not None and lawson_history is not None and len(q_sci_history) > 0:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
-        
-        q_sci_history = _scrub_1d(q_sci_history)
-        q_eng_history = _scrub_1d(q_eng_history)
         lawson_arr = _scrub_1d(lawson_history)
-        time_array = np.arange(len(q_sci_history)) * cfg.reactor_dt * 1e6
-        
-        ax1.plot(time_array, q_sci_history, color='magenta', linewidth=2.5, label='Scientific Gain ($Q_{sci}$)')
-        ax1.plot(time_array, q_eng_history, color='dodgerblue', linewidth=2.5, linestyle='--', label='Engineering Gain ($Q_{eng}$)')
-        ax1.axhline(1.0, color='gold', linestyle='-', linewidth=2, label='Break-Even (Q=1)')
-        ax1.fill_between(time_array, q_sci_history, 1.0, where=(q_sci_history >= 1.0), interpolate=True, color='lightgreen', alpha=0.2)
-                         
-        ax1.set_title("Reactor Performance & Gain (Q-Factors)")
-        ax1.set_ylabel("Gain Factor (Q)")
-        ax1.grid(True, linestyle=':', alpha=0.6)
-        ax1.legend(loc='upper left')
-        
-        ax2.plot(time_array, lawson_arr, color='firebrick', linewidth=2.5, label='Simulated Triple Product ($n_e T_i \\tau_E$)')
-        ax2.axhline(cfg.lawson_target, color='mediumseagreen', linestyle='--', linewidth=2, label=f'Ignition Target ({cfg.lawson_target:.1e})')
-        ax2.fill_between(time_array, lawson_arr, cfg.lawson_target, where=(lawson_arr >= cfg.lawson_target), interpolate=True, color='mediumseagreen', alpha=0.2)
-        
-        ax2.set_title("Lawson Triple Product Evolution")
-        ax2.set_xlabel("Simulation Time ($\\mu s$)")
-        ax2.set_ylabel("Triple Product ($keV \\cdot s \\cdot m^{-3}$)")
-        ax2.set_yscale('log')
-        ax2.grid(True, which="both", linestyle=':', alpha=0.6)
-        ax2.legend(loc='lower right')
-        
+        time_array = np.arange(len(lawson_arr)) * cfg.reactor_dt * 1e6
+
+        ax.plot(time_array, lawson_arr, color='firebrick', linewidth=2.5, label='Simulated Triple Product ($n_e T_i \\tau_E$)')
+        ax.axhline(cfg.lawson_target, color='mediumseagreen', linestyle='--', linewidth=2, label=f'Ignition Target ({cfg.lawson_target:.1e})')
+
+        ax.set_title("Lawson Triple Product Evolution")
+        ax.set_xlabel("Simulation Time ($\\mu s$)")
+        ax.set_ylabel("Triple Product ($keV \\cdot s \\cdot m^{-3}$)")
+        ax.set_yscale('log')
+        ax.grid(True, which="both", linestyle=':', alpha=0.6)
+        ax.legend(loc='lower right')
+
         plt.tight_layout()
-        plt.savefig("lawson_q_factor.png", dpi=300)
+        plt.savefig("lawson_triple_product.png", dpi=300)
         _show()
         plt.close()
-
-def run_oscillation_diagnostics(cfg, time_arr, w_es_history):
-    time_arr = _scrub_1d(time_arr) * 1e9
-    w_es_history = _scrub_1d(w_es_history)
-    
-    N = len(w_es_history)
-    w_es_ac = w_es_history - np.mean(w_es_history) 
-    
-    fft_vals = np.fft.fft(w_es_ac)
-    fft_freqs = np.fft.fftfreq(N, d=cfg.osc_dt)
-    
-    pos_mask = fft_freqs > 0
-    freqs = fft_freqs[pos_mask]
-    power = np.abs(fft_vals[pos_mask])**2
-    
-    dominant_freq = freqs[np.argmax(power)]
-    plasma_freq = dominant_freq / 2.0  
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8))
-    
-    ax1.plot(time_arr, w_es_history, color='dodgerblue', linewidth=1.5)
-    ax1.set_title("Debye/Langmuir Validation: Electrostatic Energy ($W_{ES}$) Ringing")
-    ax1.set_xlabel("Time (ns)")
-    ax1.set_ylabel("Stored E-Field Energy (Joules)")
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.plot(freqs, power, color='crimson', linewidth=1.5)
-    ax2.set_xlim(0, dominant_freq * 3.0)
-    ax2.axvline(dominant_freq, color='gold', linestyle='--', label=f'Spectral Peak: {dominant_freq:.2e} Hz ($2f_{{pe}}$)')
-    ax2.set_title("Frequency Spectrum (FFT) of Field Energy")
-    ax2.set_xlabel("Frequency (Hz)")
-    ax2.set_ylabel("Power")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig("plasma_oscillation_frequency.png", dpi=300)
-    _show()
-    plt.close()
-
-def plot_disruption_mitigation(time_history, temp_history, rad_power_history, trigger_time=None):
-    time_history = _scrub_1d(time_history)
-    temp_history = _scrub_1d(temp_history)
-    rad_power_history = _scrub_1d(rad_power_history)
-    
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
-    time_ms = time_history * 1000
-    
-    ax1.plot(time_ms, temp_history, color='crimson', linewidth=2.5, label='Core Electron Temp ($T_e$)')
-    if trigger_time is not None:
-        ax1.axvline(x=trigger_time * 1000, color='black', linestyle='--', label='SPI Triggered')
-        
-    ax1.set_title("Active Disruption Mitigation (Shattered Pellet Injection)")
-    ax1.set_ylabel("Core Temperature (keV)")
-    ax1.grid(True, linestyle=':', alpha=0.6)
-    ax1.legend(loc='upper right')
-    
-    rad_power_mw = rad_power_history / 1e6
-    ax2.plot(time_ms, rad_power_mw, color='dodgerblue', linewidth=2.5, label='Radiated Power ($P_{rad}$)')
-    if trigger_time is not None:
-        ax2.axvline(x=trigger_time * 1000, color='black', linestyle='--')
-        
-    ax2.set_xlabel("Simulation Time (ms)")
-    ax2.set_ylabel("Radiative Cooling Loss (MW/$m^3$)")
-    ax2.grid(True, linestyle=':', alpha=0.6)
-    ax2.legend(loc='upper right')
-    
-    plt.tight_layout()
-    plt.savefig("disruption_mitigation.png", dpi=300)
-    _show()
-    plt.close()
-
-def plot_fusion_cross_section(E_kev_arr, sigma_arr):
-    plt.figure(figsize=(8, 5))
-    plt.semilogy(E_kev_arr, sigma_arr, color='darkviolet', linewidth=2.5, label='D-T Cross-Section $\\sigma$')
-    
-    peak_idx = np.argmax(sigma_arr)
-    peak_energy = E_kev_arr[peak_idx]
-    peak_sigma = sigma_arr[peak_idx]
-    
-    plt.axvline(x=peak_energy, color='gold', linestyle='--', label=f'Resonance Peak (~{peak_energy:.1f} keV)')
-    plt.plot(peak_energy, peak_sigma, 'ro')
-    
-    plt.title("D-T Fusion Cross-Section vs. Collision Energy")
-    plt.xlabel("Center-of-Mass Collision Energy (keV)")
-    plt.ylabel("Cross-Section $\\sigma$ (barns)")
-    plt.xlim(0, 200)
-    plt.ylim(1e-5, np.max(sigma_arr) * 5)
-    plt.grid(True, which="both", linestyle=':', alpha=0.6)
-    plt.legend(loc='lower right')
-    
-    plt.tight_layout()
-    plt.savefig("fusion_cross_section.png", dpi=300)
-    _show()
-    plt.close()

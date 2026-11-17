@@ -14,9 +14,6 @@ def _attach_flux_surfaces(eq, cfg=None, R0=1.0, a_minor=0.3):
     # (R0=1.0, a_minor=0.3) so the confined volume is comparably sized but follows the
     # real magnetic topology. Stashed on `eq` so downstream code reads them via eq.psi_*
     # without changing any caller's positionally-unpacked return signature.
-    #
-    # Shared by the reactor and the oscillation test: both now decide particle loss with
-    # check_confinement_flux against this one surface, so both need it attached.
     psi_axis, psi_edge, psi_core, psi_grid, psi_R_min, psi_R_max, psi_Z_min, psi_Z_max, psi_nR, psi_nZ = \
         compute_flux_thresholds(eq, R0=R0, a_minor=a_minor)
     eq.psi_axis, eq.psi_edge, eq.psi_core = psi_axis, psi_edge, psi_core
@@ -94,34 +91,3 @@ def initialize_reactor(cfg):
     E_Z_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
 
     return eq, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid
-
-
-def initialize_oscillation_test(cfg):
-    # Sets up the high-frequency electron plasma oscillation unit test with Tensors.
-    eq = MHDEquilibrium()
-    eq.solve_grad_shafranov()
-    
-    # Same psi surface the reactor uses, so check_confinement_flux has a boundary to test
-    # against here too (this test previously used the removed circular check_confinement).
-    _attach_flux_surfaces(eq)
-
-    engine = ParticlePusher(equilibrium=eq, species="electron")
-    engine.m *= cfg.macro_weight
-    engine.q *= cfg.macro_weight
-    
-    print(f"[SYSTEM] Injecting {cfg.num_electrons:,} electrons with a Langmuir velocity perturbation...")
-    k_Z = 2.0 * np.pi / (cfg.Z_max - cfg.Z_min)
-    
-    pos_arr, vel_arr = engine.inject_langmuir_perturbation(
-        cfg.num_electrons, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, k_Z, perturbation_amplitude=cfg.perturbation_amplitude
-    )
-    type_arr = np.zeros(cfg.num_electrons, dtype=np.int32)  # 0 = thermal electron
-
-    # Send to GPU
-    pos_tensor = torch.tensor(pos_arr, device=cfg.HPC_DEVICE, dtype=torch.float32)
-    vel_tensor = torch.tensor(vel_arr, device=cfg.HPC_DEVICE, dtype=torch.float32)
-    type_tensor = torch.tensor(type_arr, device=cfg.HPC_DEVICE, dtype=torch.int32)
-    
-    rho_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
-    
-    return eq, engine, pos_tensor, vel_tensor, type_tensor, rho_grid
