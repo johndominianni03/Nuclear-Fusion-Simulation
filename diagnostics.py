@@ -88,7 +88,7 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
-def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None):
+def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None):
     
     rho_grid = _scrub_grid(rho_grid)
     phi_grid = _scrub_grid(phi_grid)
@@ -266,7 +266,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     custom_lines = [
         Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions (Injected)'),
         Line2D([0], [0], color='dodgerblue', lw=2, label='1 keV Thermal Core Plasma'),
-        Line2D([0], [0], color='crimson', lw=2, label='Particles Lost to Divertor Wall'),
+        Line2D([0], [0], color='crimson', lw=2, label='Lost past last closed flux surface'),
         Line2D([0], [0], color='black', lw=1.4, linestyle='--',
                label='Last Closed Flux Surface ($\\psi_{edge}$)')
     ]
@@ -457,8 +457,17 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         lawson_arr = _scrub_1d(lawson_history)
         time_array = np.arange(len(lawson_arr)) * cfg.reactor_dt * 1e6
 
-        ax.plot(time_array, lawson_arr, color='firebrick', linewidth=2.5, label='Simulated Triple Product ($n_e T_i \\tau_E$)')
-        ax.axhline(cfg.lawson_target, color='mediumseagreen', linestyle='--', linewidth=2, label=f'Ignition Target ({cfg.lawson_target:.1e})')
+        # Before the first particle loss tau_E is a fixed placeholder, not a
+        # measurement, so that segment is not drawn.
+        if lawson_first_measured_step is not None:
+            k0 = int(lawson_first_measured_step)
+            ax.plot(time_array[k0:], lawson_arr[k0:], color='firebrick', linewidth=2.5,
+                    label='Simulated Triple Product ($n_e T_i \\tau_E$)')
+        else:
+            ax.text(0.5, 0.5, "No particle lost: confinement time not measured",
+                    transform=ax.transAxes, ha='center', va='center', color='dimgray')
+        ax.set_xlim(0.0, len(lawson_arr) * cfg.reactor_dt * 1e6)
+        ax.axhline(cfg.lawson_target, color='mediumseagreen', linestyle='--', linewidth=2, label=f'Reference value ({cfg.lawson_target:.1e})')
 
         ax.set_title("Lawson Triple Product Evolution")
         ax.set_xlabel("Simulation Time ($\\mu s$)")

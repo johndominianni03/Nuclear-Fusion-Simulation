@@ -44,7 +44,7 @@ Each timestep of the reactor run does the following, in this order:
 
 **Fusion power map.** At the end of the run, the deposited density is rescaled so its peak is 1e20 m⁻³, split 50/50 into deuterium and tritium, and given a temperature proportional to the local density with the measured bulk temperature at the peak. The Bosch–Hale D–T reactivity then gives a power density, which is integrated over the grid for the printed total. The bulk ions themselves all carry the deuteron mass; there is no tritium species in the push.
 
-**Lawson triple product.** Each step records n·T·τ with n = confined bulk macroparticles × 5e17 ÷ plasma volume, T = the bulk temperature, and τ = confined count ÷ particle loss rate, capped at 3 s. Until the first particle is lost there is no loss rate, and τ is a fixed 0.5 s placeholder; that part of the trace is not a measurement. The plot draws the 3e21 keV·s·m⁻³ reference line. Gain and ignition are not modelled.
+**Lawson triple product.** Each step records n·T·τ with n = confined bulk macroparticles × 5e17 ÷ plasma volume, T = the bulk temperature, and τ = confined count ÷ particle loss rate, capped at 3 s. Until the first particle is lost there is no loss rate and τ is a fixed placeholder, so the plot starts at the first loss. The plot draws a 3e21 keV·s·m⁻³ reference line. Gain and ignition are not modelled.
 
 **Tearing mode and pellet injection.** The tearing mode is a prescribed perturbation: an m=2, n=1 field ripple whose amplitude follows b0·exp(γt) from config constants and is added to the magnetic field each particle sees. It does not respond to the plasma. Pellet injection is a scripted radiative drain: when that amplitude passes a preset threshold (about step 5,200 of 10,000), the bulk velocities are scaled down each step by an impurity-radiation formula evaluated at the measured bulk temperature, with a 10 eV floor.
 
@@ -103,7 +103,7 @@ A reactor run writes 10 plots to the working directory. The benchmark writes one
 
 ### Reading the results
 
-- **Tied to the simulation:** the orbit plots (`tokamak_reactor_2d.png`, `tokamak_reactor_3d.png`, `alpha_orbits.png`), the phase-space map, the stored energy trace and the triple product are measured from the particles the loop pushes. The triple product's density carries the 5e17 macro-weight, and its early segment, before the first particle loss, uses a placeholder confinement time.
+- **Tied to the simulation:** the orbit plots (`tokamak_reactor_2d.png`, `tokamak_reactor_3d.png`, `alpha_orbits.png`), the phase-space map, the stored energy trace and the triple product are measured from the particles the loop pushes. The triple product's density carries the 5e17 macro-weight, and it is drawn only from the first particle loss on.
 - **Normalised or unweighted:** the fusion power density is normalised to a 1e20 m⁻³ peak density, and the radial profiles are unweighted macroparticle counts and moments. Read their shapes, not their absolute values.
 - **Scaffolding:** the charge density and potential maps show the deposition and solver running. They are not a converged electrostatic field.
 
@@ -126,7 +126,7 @@ contiguous per-species memory pools removed that pattern entirely; the two sub-t
 measured it now total 0.006 s of a 20.4 s stage.
 
 Every optimization was verified numerically inert against a byte-level regression harness:
-43 arrays, bit-identical, strict `rtol=1e-6`. The 2,437-line main module was subsequently
+34 arrays (43 entries including run metadata), bit-identical, strict `rtol=1e-6`. The 2,437-line main module was subsequently
 split into eight modules across eight commits, each one proven bit-identical.
 
 ---
@@ -156,7 +156,7 @@ split into eight modules across eight commits, each one proven bit-identical.
 - **Gain and ignition are not modelled.** There is no Q-factor, no power balance, and no
   bremsstrahlung or cyclotron loss. The only radiative loss is the scripted drain after the
   pellet trigger. The 3e21 line on the triple-product plot is a reference value, and the
-  trace's confinement time is a particle-loss proxy with a placeholder before the first loss.
+  trace's confinement time is a particle-loss proxy, drawn only from the first loss on.
 - **One ion mass.** All bulk ions carry the deuteron mass; tritium appears only as half of
   the density in the fusion power map.
 

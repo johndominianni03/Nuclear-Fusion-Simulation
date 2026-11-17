@@ -255,7 +255,7 @@ def run_reactor_steady_state(save_plots=None):
      total_injected, total_lost,
      inventory_history, energy_history_keV,
      temp_history, trigger_time, T_core,
-     lawson_triple_product_history, rho_grid, phi_grid
+     lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid
      ) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
 
     _t = outer.mark()
@@ -296,7 +296,8 @@ def run_reactor_steady_state(save_plots=None):
             R_centers, density_profile, pressure_profile,
             R_phase, v_parallel_phase, P_fusion_grid,
             alpha_particles=mock_alphas,
-            lawson_history=lawson_triple_product_history
+            lawson_history=lawson_triple_product_history,
+            lawson_first_measured_step=lawson_first_measured_step
         )
 
 

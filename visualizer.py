@@ -133,7 +133,7 @@ class PlasmaVisualizer:
             Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions'),
             Line2D([0], [0], color='dodgerblue', lw=2, label='1 keV Thermal Core Plasma'),
             Line2D([0], [0], color='magenta', lw=2, label='3.5 MeV Alphas (Banana Orbits)'),
-            Line2D([0], [0], color='crimson', lw=2, label='Lost to Divertor Wall'),
+            Line2D([0], [0], color='crimson', lw=2, label='Lost past last closed flux surface'),
             Line2D([0], [0], color='gray', lw=6, alpha=0.35,
                    label='Last Closed Flux Surface ($\\psi_{edge}$)' if wall_contour is not None
                          else 'Vacuum Vessel Wall')

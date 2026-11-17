@@ -141,6 +141,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     inventory_history, energy_history_keV = [], []
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
+    # First step whose tau_E is measured (t > 0 and at least one particle lost).
+    # Earlier entries use the fixed tau_E below, so the plot starts here. None if
+    # nothing was ever lost. Bookkeeping only: reads counters, writes nothing else.
+    lawson_first_measured_step = None
 
     # --- Profiling state (inert unless cfg.PROFILE) ---
     # MPS/CUDA queue work asynchronously, so every clock read on this path is
@@ -559,6 +563,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         _t = prof.mark()
         loss_rate = total_lost / t if t > 0 else 1e-5
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
+        if lawson_first_measured_step is None and t > 0 and total_lost > 0:
+            lawson_first_measured_step = step
         # The triple product's density is the confined macro-particle count scaled by
         # MACRO_WEIGHT_REACTOR over the psi_edge volume. Units: m^-3 * keV * s,
         # matching cfg.lawson_target and the axis label.
@@ -608,4 +614,4 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             total_injected, total_lost,
             inventory_history, energy_history_keV,
             temp_history, trigger_time, T_core,
-            lawson_triple_product_history, rho_grid, phi_grid)
+            lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid)

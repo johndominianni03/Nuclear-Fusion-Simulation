@@ -6,7 +6,6 @@ import torch
 # --- CONSTANTS ---
 e_charge = 1.602e-19       # Coulombs
 m_deuterium = 3.3435e-27   # kg
-eps_0 = 8.854e-12          # Vacuum permittivity (F/m)
 
 class ParticlePusher:
     def __init__(self, equilibrium):
@@ -964,7 +963,7 @@ def compute_plasma_volume(R_wall, Z_wall):
     # Volume enclosed by revolving the psi_edge contour about the Z axis (Pappus):
     #     V = 2*pi * R_centroid * A_cross_section
     # Using the real contour rather than 2*pi^2*R0*a^2 matters -- the flux surface is not
-    # the a = 0.3 circle, and the true volume is ~2.79 m^3 against that formula's 1.78.
+    # the a = 0.3 circle, and the true volume is ~3.519 m^3 against that formula's 1.78.
     R = np.asarray(R_wall, dtype=np.float64)
     Z = np.asarray(Z_wall, dtype=np.float64)
     if R[0] == R[-1] and Z[0] == Z[-1]:   # drop the duplicated closing vertex
