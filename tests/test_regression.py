@@ -140,8 +140,7 @@ METADATA_KEYS = frozenset({
 @njit(cache=True)
 def _seed_numba_main(seed):
     """Seeds the RNG state numba uses on the calling thread -- the one
-    the serial jitted kernels (apply_cartesian_collisions,
-    apply_guiding_center_collisions) draw from."""
+    any serial jitted kernel would draw from."""
     np.random.seed(seed)
 
 

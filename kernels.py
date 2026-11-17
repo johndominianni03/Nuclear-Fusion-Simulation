@@ -32,8 +32,8 @@ def vectorized_gather_and_B_into(pos_arr, E_out, B_out,
     # E_out/B_out must have at least pos_arr.shape[0] rows.
     #
     # r, phi and its cos/sin are computed ONCE per particle and shared between the
-    # E gather and the B construction. The previous version called
-    # gather_electric_field, which redid the sqrt and an arctan2 of its own and
+    # E gather and the B construction. The previous version called a per-particle
+    # array-returning gather, which redid the sqrt and an arctan2 of its own and
     # returned a freshly allocated 3-element float64 array per particle -- one
     # heap allocation per particle per step, and an array return that stopped the
     # prange body from vectorizing. gather_electric_field_scalar returns a tuple

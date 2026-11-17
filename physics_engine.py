@@ -38,22 +38,6 @@ class ParticlePusher:
         plt.savefig(filename, dpi=300)
         plt.close()
 
-    def map_charge_density(self, active_particles, R_min=0.5, R_max=1.5, Z_min=-0.5, Z_max=0.5, nR=50, nZ=50, apply_neutral_background=False):
-        valid_particles = [p for p in active_particles if p["type"] != -1]
-        
-        if len(valid_particles) == 0:
-            return np.zeros((nR, nZ))
-            
-        R_coords = np.array([p["pos"][0] for p in valid_particles], dtype=np.float64)
-        Z_coords = np.array([p["pos"][1] for p in valid_particles], dtype=np.float64)
-        charges = np.full(len(R_coords), self.q, dtype=np.float64)
-        
-        rho_grid = compute_cic_charge_density(
-            R_coords, Z_coords, charges, 
-            R_min, R_max, Z_min, Z_max, nR, nZ, apply_neutral_background
-        )
-        return rho_grid
-        
     def solve_fields(self, rho_grid, R_min, R_max, Z_min, Z_max, phi_init=None, return_iters=False):
         nR, nZ = rho_grid.shape
         dR = (R_max - R_min) / (nR - 1)
@@ -71,33 +55,6 @@ class ParticlePusher:
         if return_iters:
             return phi, E_R, E_Z, sor_iters
         return phi, E_R, E_Z
-
-    def inject_neutral_beam(self, num_ions, E_keV=50.0, R_target=1.05, Z_target=0.0):
-        E_Joules = E_keV * 1e3 * abs(self.q)
-        v_beam = np.sqrt(2.0 * E_Joules / self.m)
-        positions = np.zeros((num_ions, 3))
-        v_parallels = np.zeros(num_ions)
-        mus = np.zeros(num_ions)
-        
-        for i in range(num_ions):
-            R = np.random.normal(R_target, 0.05)
-            Z = np.random.normal(Z_target, 0.05)
-            phi = np.random.uniform(0, 2 * np.pi)
-            pos = np.array([R * np.cos(phi), R * np.sin(phi), Z])
-            positions[i] = pos
-            
-            pitch_angle = np.random.normal(0.1, 0.05)
-            v_para = v_beam * np.cos(pitch_angle)
-            v_perp = v_beam * np.abs(np.sin(pitch_angle))
-            v_parallels[i] = v_para
-            
-            B_vec = self.eq.get_B_field(pos)
-            B_mag = np.linalg.norm(B_vec)
-            if B_mag == 0: B_mag = 1e-5
-            mu = (self.m * v_perp**2) / (2.0 * B_mag)
-            mus[i] = mu
-            
-        return positions, v_parallels, mus
 
     def inject_neutral_beam_cartesian(self, num_ions, E_keV=50.0, R_target=1.05, Z_target=0.0, psi_bounds=None):
         E_Joules = E_keV * 1e3 * abs(self.q)
@@ -158,27 +115,6 @@ class ParticlePusher:
             velocities[i] = np.array([0.0, 0.0, v_z])
             
         return positions, velocities
-
-    # Both push wrappers return motion only -- (pos, v_parallel) and (pos, vel). They no
-    # longer report a confinement flag: the single authority on whether a particle is
-    # still inside the plasma is check_confinement_flux / check_confinement_torch, which
-    # test psi against psi_edge.
-    def guiding_center_push(self, pos, v_parallel, mu, dt, E_vec, t=0.0, b_perturb=0.0, m_mode=2, n_mode=1, gamma=0.0):
-        B_vec = self.eq.get_B_field(pos)
-        # Tearing mode perturbation, if active
-        if b_perturb > 0.0:
-            B_vec += _jit_apply_magnetic_perturbation(pos, t, b_perturb, m_mode, n_mode, gamma)
-            
-        grad_B = self.eq.get_grad_B(pos)
-        return _jit_guiding_center_push(pos, v_parallel, mu, B_vec, grad_B, E_vec, self.m, self.q, dt)
-
-    def lorentz_push(self, pos, vel, dt, E_vec, t=0.0, b_perturb=0.0, m_mode=2, n_mode=1, gamma=0.0):
-        B_vec = self.eq.get_B_field(pos)
-        # Tearing mode perturbation, if active
-        if b_perturb > 0.0:
-            B_vec += _jit_apply_magnetic_perturbation(pos, t, b_perturb, m_mode, n_mode, gamma)
-            
-        return _jit_lorentz_push(pos, vel, B_vec, E_vec, self.m, self.q, dt)
 
     def compute_fluid_moments(self, active_particles, R_min, R_max, Z_min, Z_max, num_bins):
         # 0th (density) and 2nd (pressure) fluid moments, by binning particles radially.
@@ -299,108 +235,6 @@ class ParticlePusher:
 # --- CLASSLESS NUMBA KERNELS ---
 
 @njit(fastmath=True)
-def _jit_lorentz_push(pos, vel, B_vec, E_vec, m, q, dt):
-    B_mag = np.linalg.norm(B_vec)
-    
-    if B_mag == 0:
-        vel_new = vel + (q / m) * E_vec * dt
-        pos_new = pos + vel_new * dt
-    else:
-        q_prime = q * dt / (2.0 * m)
-        t_vec = q_prime * B_vec
-        t_mag2 = t_vec[0]**2 + t_vec[1]**2 + t_vec[2]**2
-        s_vec = 2.0 * t_vec / (1.0 + t_mag2)
-        
-        v_minus = vel + q_prime * E_vec
-        v_prime = v_minus + np.cross(v_minus, t_vec)
-        v_plus = v_minus + np.cross(v_prime, s_vec)
-        
-        vel_new = v_plus + q_prime * E_vec
-        pos_new = pos + vel_new * dt
-
-    # No confinement test here. This kernel integrates motion and nothing else; whether a
-    # particle is still inside the plasma is decided exclusively by check_confinement_flux
-    # against the psi = psi_edge surface. The hard-coded box that used to live here
-    # (R < 0.7, R > 1.3, |Z| > 0.3) was a stale second boundary that disagreed with that
-    # surface -- the real one bulges to |Z| ~ 0.35 and R ~ 1.37 -- so it could only ever
-    # report a different answer than the loop it fed.
-    return pos_new, vel_new
-
-
-@njit(fastmath=True)
-def _jit_guiding_center_push(pos, v_parallel, mu, B_vec, grad_B, E_vec, m, q, dt):
-    B_mag = np.linalg.norm(B_vec)
-    if B_mag == 0:
-        return pos, v_parallel
-
-    b_unit = B_vec / B_mag
-    v_grad_B = (mu / (q * B_mag)) * np.cross(b_unit, grad_B)
-
-    R_vec = np.array([pos[0], pos[1], 0.0])
-    R_mag = np.linalg.norm(R_vec)
-    if R_mag > 0:
-        R_unit = R_vec / R_mag
-        v_curv = (m * v_parallel**2 / (q * B_mag * R_mag)) * np.cross(b_unit, R_unit)
-    else:
-        v_curv = np.zeros(3)
-
-    v_ExB = np.cross(E_vec, B_vec) / (B_mag**2)
-    v_drift = v_grad_B + v_curv + v_ExB
-    v_total = v_parallel * b_unit + v_drift
-
-    pos_new = pos + v_total * dt
-
-    # As in _jit_lorentz_push: motion only. Loss is check_confinement_flux's decision.
-    return pos_new, v_parallel
-
-
-@njit(fastmath=True)
-def apply_cartesian_collisions(vel, nu_c, dt):
-    if np.random.rand() < nu_c * dt:
-        speed = np.linalg.norm(vel)
-        costheta = 2.0 * np.random.rand() - 1.0
-        sintheta = np.sqrt(1.0 - costheta**2)
-        phi = 2.0 * np.pi * np.random.rand()
-        
-        vel_new = np.array([
-            speed * sintheta * np.cos(phi),
-            speed * sintheta * np.sin(phi),
-            speed * costheta
-        ], dtype=np.float64)
-        return vel_new
-    return vel
-
-
-@njit(fastmath=True)
-def apply_guiding_center_collisions(v_parallel, mu, B_mag, m, dt, nu_c):
-    if B_mag <= 0: return v_parallel, mu
-    v_perp = np.sqrt(2.0 * mu * B_mag / m)
-    v_mag = np.sqrt(v_parallel**2 + v_perp**2)
-    if v_mag == 0: return v_parallel, mu
-
-    pitch_angle = np.arccos(v_parallel / v_mag)
-    scattering_variance = nu_c * dt
-    delta_pitch = np.random.normal(0.0, np.sqrt(scattering_variance))
-    new_pitch = pitch_angle + delta_pitch
-
-    v_parallel_new = v_mag * np.cos(new_pitch)
-    v_perp_new = v_mag * np.abs(np.sin(new_pitch))
-    mu_new = (m * v_perp_new**2) / (2.0 * B_mag)
-
-    return v_parallel_new, mu_new
-
-
-@njit(fastmath=True)
-def classify_particle_orbit(v_parallel_history):
-    sign_changes = 0
-    for i in range(1, len(v_parallel_history)):
-        if v_parallel_history[i] * v_parallel_history[i-1] < 0.0:
-            sign_changes += 1
-            break
-    return 1 if sign_changes > 0 else 0
-
-
-@njit(fastmath=True)
 def compute_cic_charge_density(R_coords, Z_coords, charges, R_min, R_max, Z_min, Z_max, nR, nZ, apply_neutral_background=False):
     rho = np.zeros((nR, nZ), dtype=np.float64)
     dR = (R_max - R_min) / (nR - 1)
@@ -492,56 +326,16 @@ def compute_electric_field(phi, dR, dZ):
 
 
 @njit(fastmath=True)
-def gather_electric_field(pos, E_R_grid, E_Z_grid, R_min, R_max, Z_min, Z_max, nR, nZ):
-    r_p = np.sqrt(pos[0]**2 + pos[1]**2)
-    z_p = pos[2]
-    
-    if r_p < R_min or r_p > R_max or z_p < Z_min or z_p > Z_max:
-        return np.zeros(3, dtype=np.float64)
-        
-    dR = (R_max - R_min) / (nR - 1)
-    dZ = (Z_max - Z_min) / (nZ - 1)
-    
-    r_idx = (r_p - R_min) / dR
-    z_idx = (z_p - Z_min) / dZ
-    
-    i = int(np.floor(r_idx))
-    j = int(np.floor(z_idx))
-    
-    if i >= nR - 1 or j >= nZ - 1 or i < 0 or j < 0:
-         return np.zeros(3, dtype=np.float64)
-         
-    wR = r_idx - i
-    wZ = z_idx - j
-    
-    er = (E_R_grid[i, j] * (1-wR)*(1-wZ) + 
-          E_R_grid[i+1, j] * wR*(1-wZ) +
-          E_R_grid[i, j+1] * (1-wR)*wZ +
-          E_R_grid[i+1, j+1] * wR*wZ)
-          
-    ez = (E_Z_grid[i, j] * (1-wR)*(1-wZ) + 
-          E_Z_grid[i+1, j] * wR*(1-wZ) +
-          E_Z_grid[i, j+1] * (1-wR)*wZ +
-          E_Z_grid[i+1, j+1] * wR*wZ)
-          
-    phi_p = np.arctan2(pos[1], pos[0])
-    ex = er * np.cos(phi_p)
-    ey = er * np.sin(phi_p)
-    
-    return np.array([ex, ey, ez], dtype=np.float64)
-
-
-@njit(fastmath=True)
 def gather_electric_field_scalar(px, py, pz, E_R_grid, E_Z_grid,
                                  R_min, R_max, Z_min, Z_max, nR, nZ,
                                  cos_phi, sin_phi):
-    """Scalar, allocation-free twin of gather_electric_field.
+    """Scalar, allocation-free bilinear gather of the electric field.
 
-    Same bilinear gather and the same cylindrical -> Cartesian rotation, but
-    it returns a 3-tuple of floats instead of a freshly allocated 3-element
-    array. Called once per particle per step from the prange loop in
-    main.vectorized_gather_and_B, that allocation was the dominant cost of
-    the stage -- and an array return keeps numba from vectorizing the loop.
+    Bilinear gather plus the cylindrical -> Cartesian rotation, returned as a
+    3-tuple of floats rather than a freshly allocated 3-element array. Called
+    once per particle per step from the prange loop in
+    kernels.vectorized_gather_and_B_into, where an array return was the
+    dominant cost of the stage and kept numba from vectorizing the loop.
 
     cos_phi / sin_phi are passed in rather than derived from an arctan2 here:
     the caller already needs phi to build the toroidal and poloidal B, so the
@@ -549,9 +343,6 @@ def gather_electric_field_scalar(px, py, pz, E_R_grid, E_Z_grid,
 
     Arithmetic is float32 throughout, matching the caller's E_arr/B_arr, so
     storing a result costs no per-element downcast.
-
-    gather_electric_field is deliberately left in place unchanged: main.py
-    imports it directly, and it remains the reference for this one.
     """
     r_p = np.float32(np.sqrt(px * px + py * py))
     z_p = np.float32(pz)
@@ -611,37 +402,6 @@ def compute_electrostatic_energy(E_R, E_Z, R_min, R_max, Z_min, Z_max):
             
     return w_es
 
-@njit(fastmath=True)
-def _jit_apply_magnetic_perturbation(pos, t, b_amp, m, n, gamma):
-    # Localized delta_B from an exponentially growing m/n tearing mode (island).
-
-    # To cylindrical coordinates
-    R = np.sqrt(pos[0]**2 + pos[1]**2)
-    Z = pos[2]
-    phi = np.arctan2(pos[1], pos[0])
-
-    # Minor radius and poloidal angle about the magnetic axis (R_0 = 1.0)
-    R_0 = 1.0
-    r = np.sqrt((R - R_0)**2 + Z**2)
-
-    if r == 0:
-        theta = 0.0
-    else:
-        theta = np.arctan2(Z, R - R_0)
-
-    # Instability growth: amplitude = b_amp * e^(gamma * t)
-    amplitude = b_amp * np.exp(gamma * t)
-
-    # Helical island perturbation (divergence-free approximation)
-    dB_R = amplitude * np.sin(m * theta - n * phi)
-    dB_Z = amplitude * np.cos(m * theta - n * phi)
-
-    # dB_R back to Cartesian for the pusher
-    dB_x = dB_R * np.cos(phi)
-    dB_y = dB_R * np.sin(phi)
-    
-    return np.array([dB_x, dB_y, dB_Z], dtype=np.float64)
-
 # =======================================================
 # DISRUPTION MITIGATION FLUID FUNCTIONS
 # =======================================================
@@ -657,16 +417,6 @@ def compute_radiative_cooling_power(n_e, n_z, T_e, cooling_coeff):
     p_rad = n_e * n_z * cooling_coeff * np.sqrt(safe_Te)
 
     return p_rad
-
-def trigger_thermal_quench(current_temp_profile, time_since_trigger, tq_timescale, post_quench_temp):
-    # Rapid Thermal Quench: exponentially decays the core temperature over a few ms.
-
-    decay_factor = np.exp(-time_since_trigger / tq_timescale)
-
-    # Decays toward the cold baseline, not absolute zero
-    new_temp_profile = (current_temp_profile - post_quench_temp) * decay_factor + post_quench_temp
-    
-    return np.maximum(new_temp_profile, post_quench_temp)
 
 # =======================================================
 # NUCLEAR REACTION DYNAMICS (QUANTUM TUNNELING)
@@ -1249,7 +999,7 @@ def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
 
 @njit(fastmath=True)
 def interpolate_psi(r_p, z_p, psi_grid, R_min, R_max, Z_min, Z_max, nR, nZ):
-    # Bilinear lookup on the (R, Z)-ordered psi grid, as in gather_electric_field.
+    # Bilinear lookup on the (R, Z)-ordered psi grid, as in gather_electric_field_scalar.
     if r_p < R_min or r_p > R_max or z_p < Z_min or z_p > Z_max:
         return 0.0
 
