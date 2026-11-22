@@ -1,86 +1,86 @@
 {
   "expected_count": 11,
-  "generated": "2026-11-17T05:56:54Z",
+  "generated": "2026-11-22T03:34:48Z",
   "missing": [],
   "plots": {
     "alpha_orbits.png": {
-      "bytes": 905789,
+      "bytes": 900012,
       "height": 2400,
       "path": "alpha_orbits.png",
-      "sha256": "5c55f903caf84b6885dd59473158a855d9bf4b08f5225363cce680fae4855c26",
+      "sha256": "5630d5949bbc7cc61cd7a4e03a76b12703e8f976d06484296e87557222b9e916",
       "width": 2400
     },
     "benchmark_scaling.png": {
-      "bytes": 245318,
+      "bytes": 227230,
       "height": 1800,
       "path": "benchmark_scaling.png",
-      "sha256": "e32b71d3eea0eccfa5de8c055de1eb8cf37bd58e675921d35e0270e79d779a0e",
+      "sha256": "9cbefdff7d427ecd231ea3f1e44231fc89024dbb02109b8fafda6dec371cf9ee",
       "width": 2700
     },
-    "charge_density_map.png": {
-      "bytes": 370899,
-      "height": 1800,
-      "path": "charge_density_map.png",
-      "sha256": "0c99b3df472af64d05492e59a05e29c4522c7d7b85ec42129abedfe473930f16",
-      "width": 2100
-    },
     "fusion_power_density.png": {
-      "bytes": 177496,
+      "bytes": 275906,
       "height": 1800,
       "path": "fusion_power_density.png",
-      "sha256": "16841beb4dab268117c5d13265d5dd579a8b7383f8c92bb7fbaef809d25fbbfc",
+      "sha256": "64ae4f0c06464947f388bb36a7ea3ee759bc466da6c83497c10c74d97672ff69",
+      "width": 2100
+    },
+    "ion_density_map.png": {
+      "bytes": 339205,
+      "height": 1800,
+      "path": "ion_density_map.png",
+      "sha256": "4c11e7e0d14d68a3b3ced74e8faeb7aae50ba0dc0e2cf0edc4066037f4cbec26",
       "width": 2100
     },
     "lawson_triple_product.png": {
-      "bytes": 139833,
+      "bytes": 116373,
       "height": 1500,
       "path": "lawson_triple_product.png",
-      "sha256": "da7e55f9ff421f5c8dde1b995a21973948a1ead9f34e799781f4c55aedb0488b",
+      "sha256": "d416b25f966f9c7f87ed068e40722c537594b6ab736e73de9b6bb1b0dcd46a3e",
       "width": 2700
     },
     "phase_space_map.png": {
-      "bytes": 341623,
+      "bytes": 458305,
       "height": 1800,
       "path": "phase_space_map.png",
-      "sha256": "35a365df3c681fe84c092a010baf4b7c6ba88332586672c072ceb905bd1495f9",
-      "width": 2400
+      "sha256": "bac4ebe8760d223da3cc7bdc98e32f28aa74fdae6dee2a7fbde4ceb8450893b0",
+      "width": 3900
     },
     "plasma_stored_energy_time.png": {
-      "bytes": 98620,
+      "bytes": 107288,
       "height": 1200,
       "path": "plasma_stored_energy_time.png",
-      "sha256": "27b23a964633fe9325078de9cdd696415c3f9687ced7d004ca1886925e669de7",
+      "sha256": "619232d6456881cd945ba04cc308b06f66fed626383c2161e8d4eb63d0e56b2a",
       "width": 2400
     },
     "potential_field_map.png": {
-      "bytes": 317085,
+      "bytes": 258272,
       "height": 1800,
       "path": "potential_field_map.png",
-      "sha256": "533cc7333494b994f2dcd17d277fa30118f69c9d849353dd89e63034eb5e041a",
+      "sha256": "f371a7b46c58f2ce8a2f9470d67154d99ff2e60b10acc7cef49d10019fa3412d",
       "width": 2100
     },
     "radial_profiles.png": {
-      "bytes": 186059,
-      "height": 1500,
+      "bytes": 339979,
+      "height": 3000,
       "path": "radial_profiles.png",
-      "sha256": "44610c26ed4658ff77ae933f41674bd9fddee5d15b1ad3624e54f83a294f863d",
+      "sha256": "d7833de80b7d8f5974d78e97ca74e9a49240ecebb6d9a04783d06a5103740a47",
       "width": 2400
     },
     "tokamak_reactor_2d.png": {
-      "bytes": 946778,
+      "bytes": 925274,
       "height": 2400,
       "path": "tokamak_reactor_2d.png",
-      "sha256": "04102a98ed2851cbff5ad0c6340f4fef71622d8bc659fe3150cedc5b1db9bc46",
+      "sha256": "003527ed9e48b7801ab05152b55e3d3808f536f980ee70eac67768720c6db6e3",
       "width": 2400
     },
     "tokamak_reactor_3d.png": {
-      "bytes": 958520,
+      "bytes": 939297,
       "height": 2400,
       "path": "tokamak_reactor_3d.png",
-      "sha256": "10ce138736c6feaad0894e7175ba123b993a2d5f73e936c665adbfe645e822c2",
+      "sha256": "222a6991debdad61cca44b6cbc104f0f944a133472d5772f30b68bd224491596",
       "width": 3000
     }
   },
-  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_nq3540qv",
+  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_7r81ivfd",
   "version": 1
 }

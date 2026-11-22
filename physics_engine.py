@@ -1129,20 +1129,30 @@ def update_force_balance_field(cfg, eq, pos, vel, types):
                                        cfg.nR, cfg.nZ, species=0)
 
 
+def _deposit_weighted(cfg, pos, types, per_particle):
+    pos = np.asarray(pos)
+    types = np.asarray(types)
+    live = types >= 0
+    R = np.ascontiguousarray(np.hypot(pos[live, 0], pos[live, 1]), dtype=np.float64)
+    Z = np.ascontiguousarray(pos[live, 2], dtype=np.float64)
+    q = np.ascontiguousarray(per_particle(types[live]) * cfg.MACRO_WEIGHT, dtype=np.float64)
+    return compute_cic_charge_density(R, Z, q, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
+                                      cfg.nR, cfg.nZ, False)
+
+
 def deposit_ion_charge_density(cfg, pos, types):
     """Weighted CIC ion charge density (C/m^3) of every live particle.
 
     Each macroparticle carries MACRO_WEIGHT ions of its species' charge: e for
     thermal and beam deuterons, CHARGE_ALPHA for alphas.
     """
-    pos = np.asarray(pos)
-    types = np.asarray(types)
-    live = types >= 0
-    R = np.ascontiguousarray(np.hypot(pos[live, 0], pos[live, 1]), dtype=np.float64)
-    Z = np.ascontiguousarray(pos[live, 2], dtype=np.float64)
-    q = np.where(types[live] == 2, cfg.CHARGE_ALPHA, cfg.e_charge) * cfg.MACRO_WEIGHT
-    return compute_cic_charge_density(R, Z, np.ascontiguousarray(q, dtype=np.float64),
-                                      cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, False)
+    return _deposit_weighted(cfg, pos, types,
+                             lambda t: np.where(t == 2, cfg.CHARGE_ALPHA, cfg.e_charge))
+
+
+def deposit_ion_number_density(cfg, pos, types):
+    """Weighted CIC ion number density (m^-3) of every live particle, all species."""
+    return _deposit_weighted(cfg, pos, types, lambda t: np.ones(t.shape[0]))
 
 
 def resample_grid_to(src_grid, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ,

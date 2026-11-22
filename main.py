@@ -6,6 +6,7 @@ from physics_engine import (
     compute_thermal_fusion_power,           # thermal D-T power from those profiles
     map_flux_profile_to_grid,
     species_masses,
+    deposit_ion_number_density,             # end-of-run weighted ion density map
 )
 from config import SimulationConfiguration
 import initialization
@@ -136,7 +137,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     print("[SYSTEM] Projecting velocities onto local field lines for phase-space map...")
     _t = prof.mark()
     alive_mask = type_np != -1
-    R_phase, v_parallel_phase = [], []
+    R_phase, v_parallel_phase, species_phase = [], [], []
     if np.any(alive_mask):
         pos_alive = np.ascontiguousarray(pos_np[alive_mask], dtype=np.float32)
         vel_alive = np.ascontiguousarray(vel_np[alive_mask], dtype=np.float32)
@@ -156,6 +157,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
         keep = (R_all > 0) & (B_mag > 0.0)
         R_phase = R_all[keep].tolist()
         v_parallel_phase = v_par_all[keep].tolist()
+        species_phase = type_np[alive_mask][keep].tolist()
 
     prof.add("pkg: v_parallel phase-space projection", _t)
 
@@ -169,6 +171,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     P_fusion_grid = map_flux_profile_to_grid(
         P_fusion_profile, flux_profiles["psiN_centers"], eq,
         cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ)
+    n_ion_grid = deposit_ion_number_density(cfg, pos_np, type_np)
     prof.add("pkg: flux profiles + thermal fusion power", _t)
 
     print("==================================================")
@@ -185,6 +188,8 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
         "pressure_profile": pressure_profile,
         "R_phase": R_phase,
         "v_parallel_phase": v_parallel_phase,
+        "species_phase": species_phase,
+        "n_ion_grid": n_ion_grid,
         "P_fusion_grid": P_fusion_grid,
         "P_fusion_profile": P_fusion_profile,
         "total_fusion_power_watts": total_fusion_power_watts,
@@ -291,7 +296,11 @@ def run_reactor_steady_state(save_plots=None):
             R_phase, v_parallel_phase, P_fusion_grid,
             alpha_particles=mock_alphas,
             lawson_history=lawson_triple_product_history,
-            lawson_first_measured_step=lawson_first_measured_step
+            lawson_first_measured_step=lawson_first_measured_step,
+            n_ion_grid=packaged["n_ion_grid"],
+            flux_profiles=packaged["flux_profiles"],
+            total_fusion_power_watts=packaged["total_fusion_power_watts"],
+            species_phase=packaged["species_phase"],
         )
 
 

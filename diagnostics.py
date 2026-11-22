@@ -88,10 +88,12 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
-def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None):
+def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
+                                 n_ion_grid=None, flux_profiles=None, total_fusion_power_watts=None, species_phase=None):
     
     rho_grid = _scrub_grid(rho_grid)
     phi_grid = _scrub_grid(phi_grid)
+    n_ion_grid = _scrub_grid(n_ion_grid)
     P_fusion_grid = _scrub_grid(P_fusion_grid)
     energy_history_keV = _scrub_1d(energy_history_keV)
     inventory_history = _scrub_1d(inventory_history)
@@ -108,8 +110,12 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     print(f"Total Particles Sourced       : {total_injected}")
     print(f"Total Particles Lost (Sink)   : {total_lost}")
     print(f"Estimated Confinement Time (τ): {tau_p:.2e} seconds")
-    print(f"Peak Charge Density           : {np.max(rho_grid):.3e} C/m^3")
-    print(f"Peak Electrostatic Potential  : {np.max(phi_grid):.3e} V")
+    print(f"Peak Ion Charge Density       : {np.max(rho_grid):.3e} C/m^3")
+    if n_ion_grid is not None:
+        print(f"Peak Ion Density              : {np.max(n_ion_grid):.3e} m^-3")
+    print(f"Force-Balance Potential Range : {np.min(phi_grid):.3e} to {np.max(phi_grid):.3e} V")
+    if total_fusion_power_watts is not None:
+        print(f"Thermal D-T Fusion Power      : {total_fusion_power_watts:.3e} W")
     print("==================================================")
 
     R_axis = np.linspace(cfg.R_min, cfg.R_max, cfg.nR)
@@ -154,38 +160,43 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
         axis.plot(WALL_R, WALL_Z, color='black', linewidth=1.2, alpha=0.85, zorder=7,
                   linestyle='--', label=label)
 
-    # --- 2D CHARGE DENSITY MAP (percentile clipped) ---
-    plt.figure(figsize=(7, 6))
-    rho_clean = np.where(_confinement_mask, np.nan, rho_grid.T)
-    p_min, p_max = np.nanpercentile(rho_clean, 2), np.nanpercentile(rho_clean, 98)
-    if not np.isfinite(p_min): p_min = 0.0
-    if not np.isfinite(p_max) or p_max <= p_min: p_max = p_min + 1e-9
+    # --- 2D ION DENSITY MAP ---
+    # Weighted cloud-in-cell deposition of every live ion (thermal, beam, alpha), each
+    # macroparticle standing for cfg.MACRO_WEIGHT ions, computed once from the final state.
+    if n_ion_grid is not None:
+        plt.figure(figsize=(7, 6))
+        n_clean = np.where(_confinement_mask, np.nan, n_ion_grid.T)
+        n_max = np.nanmax(n_clean)
+        if not np.isfinite(n_max) or n_max <= 0: n_max = 1.0
+        contour_n = plt.contourf(R_mesh, Z_mesh, n_clean, levels=np.linspace(0.0, n_max, 40), cmap='plasma')
+        plt.colorbar(contour_n, label="Ion density $n_i$ (m$^{-3}$)")
+        plt.title("Ion Density, End of Run\n(weighted CIC, all ion species)")
+        plt.xlabel("Major Radius R (m)")
+        plt.ylabel("Height Z (m)")
+        _draw_wall(plt.gca())
+        plt.xlim(*VIEW_XLIM)
+        plt.ylim(*VIEW_YLIM)
+        plt.gca().set_aspect('equal')
+        plt.grid(True, linestyle=':', alpha=0.5)
+        plt.tight_layout()
+        plt.savefig("ion_density_map.png", dpi=300)
+        _show()
+        plt.close()
 
-    contour_rho = plt.contourf(R_mesh, Z_mesh, rho_clean, levels=np.linspace(p_min, p_max, 40), cmap='plasma', extend='both')
-    plt.colorbar(contour_rho, label="Unweighted Charge Density $\\rho$ (C/m$^3$, one $e$ per macroparticle)")
-    plt.title("Poloidal Charge Density (CIC, Unweighted)")
-    plt.xlabel("Major Radius R (m)")
-    plt.ylabel("Height Z (m)")
-    _draw_wall(plt.gca())
-    plt.xlim(*VIEW_XLIM)
-    plt.ylim(*VIEW_YLIM)
-    plt.gca().set_aspect('equal')
-    plt.grid(True, linestyle=':', alpha=0.5)
-    plt.tight_layout()
-    plt.savefig("charge_density_map.png", dpi=300)
-    _show()
-    plt.close()
-
-    # --- ELECTROSTATIC POTENTIAL MAP (percentile clipped) ---
+    # --- ELECTROSTATIC POTENTIAL MAP ---
+    # Phi from thermal-ion radial force balance, E_r = grad(p_i) / (e n_i), quasi-neutral,
+    # no rotation; Phi = 0 at the outer edge of the ion profile. This is the field the
+    # loop applied over its last FIELD_UPDATE_EVERY steps.
     plt.figure(figsize=(7, 6))
     phi_clean = np.where(_confinement_mask, np.nan, phi_grid.T)
-    p_min, p_max = np.nanpercentile(phi_clean, 2), np.nanpercentile(phi_clean, 98)
+    p_min, p_max = np.nanmin(phi_clean), np.nanmax(phi_clean)
     if not np.isfinite(p_min): p_min = 0.0
     if not np.isfinite(p_max) or p_max <= p_min: p_max = p_min + 1e-9
 
-    contour_phi = plt.contourf(R_mesh, Z_mesh, phi_clean, levels=np.linspace(p_min, p_max, 40), cmap='viridis', extend='both')
-    plt.colorbar(contour_phi, label="Electrostatic Potential $\\phi$ (Volts)")
-    plt.title("Electrostatic Potential\n(Unconverged SOR Solve on Unweighted Deposition)")
+    contour_phi = plt.contourf(R_mesh, Z_mesh, phi_clean, levels=np.linspace(p_min, p_max, 40), cmap='viridis')
+    plt.colorbar(contour_phi, label="Electrostatic Potential $\\Phi$ (V)")
+    plt.title("Quasi-Neutral Potential from Ion Pressure Balance\n"
+              "$E_r = \\nabla p_i / (e\\,n_i)$, no rotation")
     plt.xlabel("Major Radius R (m)")
     plt.ylabel("Height Z (m)")
     _draw_wall(plt.gca())
@@ -199,11 +210,20 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.close()
 
     # --- STORED ENERGY WAVEFORM ---
+    # energy_history_keV sums the kinetic energy of the bulk-pool macroparticles
+    # (thermal + beam; alphas are not included); times MACRO_WEIGHT it is the
+    # stored ion kinetic energy of the plasma they represent.
     plt.figure(figsize=(8, 4))
-    plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6, energy_history_keV, color='firebrick', linewidth=1.5)
-    plt.title("Stored Plasma Energy vs. Time (Full Lorentz Push)")
+    _w = getattr(cfg, "MACRO_WEIGHT", None)
+    if _w:
+        plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6,
+                 energy_history_keV * _w * 1.0e3 * cfg.e_charge / 1.0e3, color='firebrick', linewidth=1.5)
+        plt.ylabel("Stored Ion Kinetic Energy (kJ)")
+    else:
+        plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6, energy_history_keV, color='firebrick', linewidth=1.5)
+        plt.ylabel("Macroparticle Kinetic Energy (keV)")
+    plt.title("Stored Kinetic Energy of Thermal + Beam Ions vs. Time")
     plt.xlabel("Time ($\\mu s$)")
-    plt.ylabel("Stored Energy (keV)")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig("plasma_stored_energy_time.png", dpi=300)
@@ -284,66 +304,99 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     # are the clearest banana orbits in the simulation but were previously drawn only on
     # the 2D alpha plot, never in the 3D torus view.
 
-    # --- 1D RADIAL FLUID PROFILES ---
-    if R_centers is not None and density_profile is not None and pressure_profile is not None:
-        fig, ax1 = plt.subplots(figsize=(8, 5))
-        
-        color_dens = 'tab:blue'
-        ax1.set_xlabel("Major Radius R (m)")
-        ax1.set_ylabel("Macroparticle Density, Unweighted ($m^{-3}$)", color=color_dens)
-        ax1.plot(_scrub_1d(R_centers), _scrub_1d(density_profile), color=color_dens, linewidth=2, label="Density Profile")
-        ax1.tick_params(axis='y', labelcolor=color_dens)
-        ax1.grid(True, alpha=0.3)
-        
-        ax2 = ax1.twinx()
-        color_pres = 'tab:red'
-        ax2.set_ylabel("Pressure P, Unweighted Macroparticles (Pa)", color=color_pres)
-        ax2.plot(_scrub_1d(R_centers), _scrub_1d(pressure_profile), color=color_pres, linewidth=2, linestyle='--', label="Pressure Profile")
-        ax2.tick_params(axis='y', labelcolor=color_pres)
-        
-        plt.title("Radial Fluid Moments (Unweighted Macroparticle Density & Pressure)")
+    # --- FLUX-SURFACE PROFILES ---
+    # n, T, p per species on psi_N shells (compute_flux_profiles), weighted, against
+    # rho = sqrt(psi_N). Log axes: the alpha temperature is ~1000x the thermal one.
+    if flux_profiles is not None:
+        rho_c = flux_profiles["rho_centers"]
+        species = ((0, "Thermal D", "tab:blue"), (1, "Beam D (50 keV NBI)", "tab:orange"),
+                   (2, "Alpha (3.5 MeV birth)", "tab:pink"))
+        fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
+        for s_idx, s_label, s_color in species:
+            n_s = flux_profiles["n"][s_idx]
+            T_s = flux_profiles["T_keV"][s_idx]
+            p_s = flux_profiles["p"][s_idx]
+            has = n_s > 0
+            if not np.any(has):
+                continue
+            axes[0].plot(rho_c[has], n_s[has], marker='o', ms=3, color=s_color, label=s_label)
+            okT = np.isfinite(T_s) & (T_s > 0)
+            axes[1].plot(rho_c[okT], T_s[okT], marker='o', ms=3, color=s_color, label=s_label)
+            okp = p_s > 0
+            axes[2].plot(rho_c[okp], p_s[okp], marker='o', ms=3, color=s_color, label=s_label)
+        axes[0].set_ylabel("Density $n$ (m$^{-3}$)")
+        axes[1].set_ylabel("Temperature $T$ (keV)")
+        axes[2].set_ylabel("Pressure $p = nT$ (Pa)")
+        for a in axes:
+            a.set_yscale('log')
+            a.grid(True, which='both', alpha=0.3)
+        axes[0].legend(loc='best')
+        axes[2].set_xlabel("$\\rho = \\sqrt{\\psi_N}$  (0 = magnetic axis, 1 = last closed flux surface)")
+        axes[2].set_xlim(0.0, 1.0)
+        beta_txt = ""
+        if "beta_avg" in flux_profiles:
+            mu0 = 4.0e-7 * np.pi
+            V = flux_profiles["shell_volume"]
+            beta_th = 2.0 * mu0 * float(np.sum(flux_profiles["p"][0] * V) / np.sum(V)) / cfg.B0**2
+            beta_txt = (f"\n$\\langle\\beta\\rangle$ = {flux_profiles['beta_avg']:.2e} all species, "
+                        f"{beta_th:.2e} thermal  ($B_0$ = {cfg.B0:g} T)")
+        axes[0].set_title("Flux-Surface Profiles at End of Run (weighted)" + beta_txt)
         fig.tight_layout()
         plt.savefig("radial_profiles.png", dpi=300)
         _show()
         plt.close()
 
     # --- PHASE-SPACE DISTRIBUTION ---
+    # Deuterons and alphas on separate panels, each scaled to its own largest |v_par|:
+    # alpha speeds (~1.3e7 m/s) are ~40x the thermal ones, so one shared axis either
+    # crushes the deuterons onto v_par = 0 or clips the fastest alphas.
     if R_phase is not None and v_parallel_phase is not None and len(R_phase) > 0:
-        plt.figure(figsize=(8, 6))
-        v_par_scrubbed = _scrub_1d(v_parallel_phase)
-        
-        plt.scatter(_scrub_1d(R_phase), v_par_scrubbed, s=2, color='darkviolet', alpha=0.3)
-        plt.title("Phase-Space Map (Banana Orbits vs. Passing Particles)")
-        plt.xlabel("Major Radius R (m)")
-        plt.ylabel("Parallel Velocity $v_\\parallel$ Along the Local Field (m/s)")
-        plt.axhline(0, color='black', linewidth=1, linestyle='--')
-        
-        # Framed to the actual curved confinement boundary, not the full rectangular solver grid.
-        plt.xlim(*VIEW_XLIM)
-        if len(v_par_scrubbed) > 0:
-            v_max = np.percentile(np.abs(v_par_scrubbed), 98)
-            plt.ylim(-v_max * 1.2 if v_max > 0 else -1000, v_max * 1.2 if v_max > 0 else 1000)
-            
-        plt.grid(True, linestyle=':', alpha=0.6)
-        plt.tight_layout()
+        R_ph = _scrub_1d(R_phase)
+        v_ph = _scrub_1d(v_parallel_phase)
+        sp = np.asarray(species_phase, dtype=int) if species_phase is not None and len(species_phase) == len(R_ph) \
+            else np.zeros(len(R_ph), dtype=int)
+        groups = [("Thermal and beam deuterons", ((0, 'darkviolet', 'Thermal D'), (1, 'darkorange', 'Beam D'))),
+                  ("Alphas", ((2, '#FF66CC', 'Alpha'),))]
+        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+        for ax_ph, (g_title, members) in zip(axes, groups):
+            g_mask = np.isin(sp, [m[0] for m in members])
+            for code, color, label in members:
+                m = sp == code
+                if np.any(m):
+                    ax_ph.scatter(R_ph[m], v_ph[m], s=2, color=color, alpha=0.3, label=f"{label} ({int(m.sum()):,})")
+            ax_ph.axhline(0, color='black', linewidth=1, linestyle='--')
+            ax_ph.set_xlim(*VIEW_XLIM)
+            v_max = float(np.max(np.abs(v_ph[g_mask]))) if np.any(g_mask) else 0.0
+            if v_max > 0:
+                ax_ph.set_ylim(-1.05 * v_max, 1.05 * v_max)
+                ax_ph.legend(loc='upper right', markerscale=4)
+            ax_ph.set_title(g_title)
+            ax_ph.set_xlabel("Major Radius R (m)")
+            ax_ph.set_ylabel("$v_\\parallel$ Along the Local Field (m/s)")
+            ax_ph.grid(True, linestyle=':', alpha=0.6)
+        fig.suptitle("Phase-Space Map (Trapped vs. Passing)")
+        fig.tight_layout()
         plt.savefig("phase_space_map.png", dpi=300)
         _show()
         plt.close()
 
-    # --- VOLUMETRIC FUSION POWER HEATMAP (percentile clipped) ---
+    # --- THERMAL D-T FUSION POWER DENSITY ---
+    # P(psi_N) = (n_th/2)^2 <sigma v>(T_th) E_fus from the weighted thermal-ion profiles,
+    # mapped through psi_N. 50/50 D-T is assumed (no tritium species); beam ions and
+    # alphas are excluded.
     if P_fusion_grid is not None:
         plt.figure(figsize=(7, 6))
-        P_mw_grid = np.where(_confinement_mask, np.nan, P_fusion_grid.T / 1e6)
-
-        # Clip the top 1% of outliers to keep the gradient readable
-        p_max = np.nanpercentile(P_mw_grid, 99)
+        P_clean = np.where(_confinement_mask, np.nan, P_fusion_grid.T)
+        p_max = np.nanmax(P_clean)
         if not np.isfinite(p_max) or p_max <= 0: p_max = 1e-9
-
-        contour_pf = plt.contourf(R_mesh, Z_mesh, P_mw_grid, levels=np.linspace(0, p_max, 40), cmap='inferno', extend='max')
-        plt.colorbar(contour_pf, label="Volumetric Fusion Power ($MW/m^3$)")
-        plt.title("D-T Fusion Power Density\n(Density Normalised to a $10^{20}$ m$^{-3}$ Peak)")
+        contour_pf = plt.contourf(R_mesh, Z_mesh, P_clean, levels=np.linspace(0, p_max, 40), cmap='inferno')
+        plt.colorbar(contour_pf, label="Fusion Power Density (W/m$^3$)")
+        total_txt = f", total {total_fusion_power_watts:.3g} W" if total_fusion_power_watts is not None else ""
+        plt.title("Thermal D-T Fusion Power Density" + total_txt +
+                  "\n(50/50 D-T assumed; beam ions and alphas excluded)")
         plt.xlabel("Major Radius R (m)")
         plt.ylabel("Height Z (m)")
+        _draw_wall(plt.gca())
         plt.xlim(*VIEW_XLIM)
         plt.ylim(*VIEW_YLIM)
         plt.gca().set_aspect('equal')

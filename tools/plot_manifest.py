@@ -39,7 +39,7 @@ import sys
 # ten from the reactor run.
 EXPECTED_PLOTS = (
     "benchmark_scaling.png",
-    "charge_density_map.png",
+    "ion_density_map.png",
     "potential_field_map.png",
     "plasma_stored_energy_time.png",
     "tokamak_reactor_2d.png",
