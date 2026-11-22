@@ -18,7 +18,8 @@ from physics_engine import (
     compute_alpha_heating_power_torch,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     _vectorized_boris_push_metal_dynamic,   # dynamic-shape compile, handles that churn; None if the compile failed at import
-    boris_push_substeps_regather_torch      # alpha sub-stepping (GPU), field re-gathered per sub-step
+    boris_push_substeps_regather_torch,     # alpha sub-stepping (GPU), field re-gathered per sub-step
+    relative_weight_lut,                    # per-species weight / thermal-D weight
 )
 from profiling import (
     StageProfiler,
@@ -149,6 +150,11 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     tracked_nbis = 0
     tracked_alphas = 0
     max_tracked_pid = n_track - 1
+
+    # Per-species weight relative to thermal D, indexed by type code, on the
+    # device. Twin of the CPU loop's rel_w: energies and counts below read in
+    # thermal-D macroparticle units. Equal weights make every entry 1.0.
+    rel_w_t = torch.tensor(relative_weight_lut(cfg), device=device, dtype=torch.float32)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
@@ -450,8 +456,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * v_mags**2) / 1.602e-16
             # Second return value is the raw simulation-scale keV drained, needed by the
             # energy transfer below.
+            # Weighted: sum(w_a dE) / w_thermal, the real energy given up.
             new_energies_kev, alpha_deposited_kev = compute_alpha_heating_power_torch(
-                alpha_energies_kev, cfg.reactor_dt, cfg)
+                alpha_energies_kev, cfg.reactor_dt, cfg, rel_weights=rel_w_t[a_type.long()])
             new_v_mags = torch.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
             safe_v_mags = torch.where(v_mags == 0, torch.full_like(v_mags, 1e-10), v_mags)
             scale_factors = new_v_mags / safe_v_mags
@@ -466,16 +473,20 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- ALPHA -> BULK ENERGY TRANSFER (energy conservation) ---
         # Energy drained from the alphas used to vanish -- removed from the fast
         # population and given to nothing, so the thermal plasma never felt the heating.
-        # Deposit it by scaling bulk speeds, using the simulation-scale keV (no
-        # macro_weight) so particles stay self-consistent.
+        # Deposit it by scaling every bulk speed by one factor. Both sides are
+        # weighted (twin of the CPU loop), so real energy is conserved even when
+        # the species weights differ.
+        r_b = rel_w_t[b_type.long()]
         if alpha_deposited_kev > 0.0 and bulk.n_live > 0:
-            bulk_energy_kev = float((0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1)).sum().item()) / 1.602e-16
+            bulk_energy_kev = float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item()) / 1.602e-16
             if bulk_energy_kev > 0.0:
                 boost = float(np.sqrt(1.0 + alpha_deposited_kev / bulk_energy_kev))
                 b_vel.copy_(b_vel * boost)
 
+        # Weighted macroparticle count of the bulk (thermal-D units).
+        r_sum = float(r_b.sum().item()) if bulk.n_live > 0 else 0.0
         if bulk.n_live > 0:
-            current_energy_joules = float((0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1)).sum().item())
+            current_energy_joules = float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
         else:
             current_energy_joules = 0.0
 
@@ -488,8 +499,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # Assigning the plasma's TOTAL stored energy here made the "core temperature"
         # read ~50,000 keV, and every consumer (the Lawson triple product, the
         # quench baseline) was fed that. For a 3D Maxwellian
-        # <E> = (3/2)kT, so kT = (2/3) * <E>.
-        n_bulk = max(current_confined, 1)
+        # <E> = (3/2)kT, so kT = (2/3) * <E>, with <E> per real ion (weighted).
+        n_bulk = max(r_sum, 1.0)
         T_core_kinetic = (2.0 / 3.0) * (current_energy_keV / n_bulk)
 
         if current_amp > cfg.MAX_ISLAND_WIDTH_THRESHOLD and not cfg.SPI_TRIGGERED:
@@ -554,10 +565,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined macro-particle count times
-        # MACRO_WEIGHT over the psi_edge volume. Units: m^-3 * keV * s, matching
-        # cfg.lawson_target and the axis label.
-        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the confined real ion count (weighted
+        # macroparticle count times WEIGHT[0]) over the psi_edge volume. Units:
+        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
+        n_e_reactor = (r_sum * cfg.WEIGHT[0]) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)

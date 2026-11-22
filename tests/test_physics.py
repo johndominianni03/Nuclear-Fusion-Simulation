@@ -265,12 +265,12 @@ def test_weighted_cic_deposits_total_charge():
     pos = _positions_in_psiN(eq, 20000, rng, 0.0, 1.0)
     types = rng.choice([0, 1, 2, -1], size=len(pos), p=[0.8, 0.1, 0.05, 0.05])
     w = 7.04e15
-    saved = cfg.MACRO_WEIGHT
-    cfg.MACRO_WEIGHT = w
+    saved = cfg.WEIGHT
+    cfg.WEIGHT = {s: w for s in saved}
     try:
         rho = deposit_ion_charge_density(cfg, pos, types)
     finally:
-        cfg.MACRO_WEIGHT = saved
+        cfg.WEIGHT = saved
     dR = (cfg.R_max - cfg.R_min) / (cfg.nR - 1)
     dZ = (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
     R_nodes = cfg.R_min + np.arange(cfg.nR) * dR
@@ -361,7 +361,7 @@ def test_force_balance_field_zero_outside_lcfs_and_inward():
 
 def test_initial_loading_profiles_and_weight():
     """initialize_reactor loads n = n0 (1 - psi_N), T = T0 (1 - psi_N) with
-    <n> = N_AVG_TARGET, and MACRO_WEIGHT = N_AVG_TARGET * V / N."""
+    <n> = N_AVG_TARGET, and WEIGHT[0] = N_AVG_TARGET * V / N."""
     from config import SimulationConfiguration
     import initialization
     from physics_engine import compute_flux_profiles
@@ -372,9 +372,9 @@ def test_initial_loading_profiles_and_weight():
         eq, engine, p, v, t, *_ = initialization.initialize_reactor(cfg)
         np.random.set_state(state)
     N = cfg.initial_thermal_count
-    assert cfg.MACRO_WEIGHT == cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / N
+    assert cfg.WEIGHT[0] == cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / N
     pos, vel, typ = p.cpu().numpy(), v.cpu().numpy(), t.cpu().numpy()
-    prof = compute_flux_profiles(pos, vel, typ, eq, _species_masses(cfg), weight=cfg.MACRO_WEIGHT)
+    prof = compute_flux_profiles(pos, vel, typ, eq, _species_masses(cfg), weight=cfg.WEIGHT[0])
     V = prof["shell_volume"]
     n_avg = np.sum(prof["n"][0] * V) / V.sum()
     assert abs(n_avg / cfg.N_AVG_TARGET - 1.0) < 1e-3, f"<n> = {n_avg:.4e}"
@@ -439,6 +439,86 @@ def test_thermal_fusion_power_uniform_profile():
     _, total = compute_thermal_fusion_power(prof, cfg)
     expect = n**2 / 4 * 1.136e-22 * cfg.E_FUSION_JOULES * eq.plasma_volume_m3
     assert abs(total / expect - 1.0) < 0.01, f"{total:.4e} W vs {expect:.4e} W"
+
+
+# =======================================================
+# TIER 2 PHASE 1 -- per-species weights
+# =======================================================
+def test_flux_profile_density_with_unequal_species_weights():
+    """With a different weight per species, sum_k n_k V_k must equal
+    N_species * w_species for every species (particles inside psi_N <= 1),
+    and the weighted CIC deposit must carry sum_s N_s w_s q_s."""
+    from physics_engine import (compute_flux_profiles, compute_psi_normalised,
+                                deposit_ion_charge_density)
+    cfg, eq, *_ = _production_fields()
+    rng = np.random.default_rng(31)
+    pos = _positions_in_psiN(eq, 30000, rng, 0.0, 1.0)
+    vel = rng.normal(0.0, 3e5, pos.shape)
+    types = rng.choice([0, 1, 2, -1], size=len(pos), p=[0.6, 0.25, 0.1, 0.05])
+    inside = compute_psi_normalised(np.hypot(pos[:, 0], pos[:, 1]), pos[:, 2], eq) <= 1.0
+    w = (7.04e15, 2.1e12, 3.3e3)
+    prof = compute_flux_profiles(pos, vel, types, eq, _species_masses(cfg), weight=w)
+    for s in range(3):
+        expect = w[s] * np.sum(inside & (types == s))
+        got = float(np.sum(prof["n"][s] * prof["shell_volume"]))
+        assert abs(got - expect) <= 1e-12 * expect, f"species {s}: {got} vs {expect}"
+
+    saved = cfg.WEIGHT
+    cfg.WEIGHT = {s: w[s] for s in range(3)}
+    try:
+        rho = deposit_ion_charge_density(cfg, pos, types)
+    finally:
+        cfg.WEIGHT = saved
+    dR = (cfg.R_max - cfg.R_min) / (cfg.nR - 1)
+    dZ = (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
+    R_nodes = cfg.R_min + np.arange(cfg.nR) * dR
+    total = float(np.sum(rho * 2.0 * np.pi * R_nodes[:, None] * dR * dZ))
+    expect = (cfg.e_charge * (w[0] * np.sum(types == 0) + w[1] * np.sum(types == 1))
+              + cfg.CHARGE_ALPHA * w[2] * np.sum(types == 2))
+    assert abs(total / expect - 1.0) < 1e-10, f"{total:.12e} vs {expect:.12e}"
+
+
+def _alpha_to_bulk_transfer(cfg, engine, a_vel, a_w, groups, dt):
+    """Run the reactor loops' alpha -> bulk transfer (physics_engine helpers, in
+    the loop's order) on float64 copies. groups: [(vel, w, mass)] bulk pools.
+    Weights are absolute; the loop's relative weights are w / w_ref."""
+    from physics_engine import drain_alpha_energy, weighted_kinetic_energy_kev, bulk_boost_factor
+    w_ref = 7.04e15
+    a = a_vel.astype(np.float64)
+    dep = drain_alpha_energy(engine, cfg, a, a_w / w_ref, dt)
+    out = [g[0].astype(np.float64) for g in groups]
+    E_bulk = sum(weighted_kinetic_energy_kev(v, w / w_ref, m) for v, (_, w, m) in zip(out, groups))
+    boost = bulk_boost_factor(dep, E_bulk)
+    return a, [v * boost for v in out], dep * w_ref
+
+
+def _real_energy(vel, w, m):
+    return float(np.sum(w * 0.5 * m * np.sum(vel.astype(np.float64) ** 2, axis=1)))
+
+
+def test_alpha_to_bulk_transfer_conserves_weighted_energy():
+    """Real energy given up by the alphas, sum(w_a dE_a), equals the real energy
+    received by the bulk, sum(w_b dE_b), to 1e-12 relative, with alpha, thermal
+    and beam weights that all differ (and differ per alpha)."""
+    cfg, eq, engine, *_ = _production_fields()
+    rng = np.random.default_rng(41)
+    _, a_vel = _isotropic_alphas(cfg, 500, rng)
+    a_vel = a_vel * rng.uniform(0.3, 1.0, (500, 1))         # spread of energies
+    # Per-alpha weights, large enough that the deposit is a resolvable fraction of
+    # the bulk energy (at production alpha weights it is ~1e-12 of it, below the
+    # float64 resolution of the bulk total, and the comparison would test rounding).
+    a_w = rng.uniform(0.5e14, 2.0e14, 500)
+    n_b = 4000
+    b_vel = rng.normal(0.0, 3e5, (n_b, 3))
+    b_type = rng.choice([0, 1], size=n_b, p=[0.8, 0.2])
+    b_w = np.where(b_type == 0, 7.04e15, 2.1e12)
+    dt = 1e-2                                                  # a drain well above rounding
+    a1, (b1,), _ = _alpha_to_bulk_transfer(cfg, engine, a_vel, a_w,
+                                           [(b_vel, b_w, cfg.m_deuterium)], dt)
+    given = _real_energy(a_vel, a_w, cfg.MASS_ALPHA) - _real_energy(a1, a_w, cfg.MASS_ALPHA)
+    received = _real_energy(b1, b_w, cfg.m_deuterium) - _real_energy(b_vel, b_w, cfg.m_deuterium)
+    assert given > 0.0
+    assert abs(received / given - 1.0) < 1e-12, f"given {given:.15e} J, received {received:.15e} J"
 
 
 # =======================================================

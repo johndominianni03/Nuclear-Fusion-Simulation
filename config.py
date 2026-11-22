@@ -126,14 +126,16 @@ class SimulationConfiguration:
         # stops heating
         self.THERMALIZATION_ENERGY_KEV = 15.0
 
-        # Volume-averaged ion density the macroparticles represent (m^-3). After the
-        # plasma volume is known, initialization sets
-        #     MACRO_WEIGHT = N_AVG_TARGET * PLASMA_VOLUME_M3 / initial_thermal_count
-        # (~7e15 real ions per macroparticle at production size). Thermal, beam and
-        # alpha macroparticles all carry it: the deposited density, the flux-surface
-        # profiles and the Lawson density are physical, in m^-3.
+        # Volume-averaged ion density the thermal macroparticles represent (m^-3).
+        # After the plasma volume is known, initialization sets the per-species
+        # weights (real ions per macroparticle), keyed by type code:
+        #     WEIGHT[0] (thermal D) = N_AVG_TARGET * PLASMA_VOLUME_M3 / initial_thermal_count
+        # (~7e15 at production size). Every quantity that turns macroparticles into
+        # physics -- the deposited density, the flux-surface profiles, stored energy,
+        # the Lawson density, beta, the alpha -> bulk energy transfer -- multiplies
+        # each macroparticle by its own species' weight.
         self.N_AVG_TARGET = 1.0e20
-        self.MACRO_WEIGHT = None                # set by initialization.initialize_reactor
+        self.WEIGHT = None                      # {type code: weight}, set by initialize_reactor
 
         # The radial electric field is taken from thermal-ion force balance (quasi-
         # neutral, no rotation) and rebuilt from the current particles at step 0 and

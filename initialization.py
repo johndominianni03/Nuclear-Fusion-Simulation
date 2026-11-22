@@ -45,10 +45,13 @@ def initialize_reactor(cfg):
     psi_Z_min, psi_Z_max = eq.psi_Z_min, eq.psi_Z_max
     print(f"[SYSTEM] Confined plasma volume from psi_edge surface: {eq.plasma_volume_m3:.3f} m^3")
 
-    # Real ions per macroparticle, so that the thermal population represents a
-    # volume-averaged density of N_AVG_TARGET. Every species carries this weight.
-    cfg.MACRO_WEIGHT = cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / cfg.initial_thermal_count
-    print(f"[SYSTEM] Macroparticle weight: {cfg.MACRO_WEIGHT:.3e} ions per macroparticle "
+    # Real ions per macroparticle, per species (keyed by type code), so that the
+    # thermal population represents a volume-averaged density of N_AVG_TARGET.
+    w_thermal = cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / cfg.initial_thermal_count
+    cfg.WEIGHT = {0: w_thermal,     # thermal D
+                  1: w_thermal,     # beam D
+                  2: w_thermal}     # alpha
+    print(f"[SYSTEM] Thermal macroparticle weight: {w_thermal:.3e} ions per macroparticle "
           f"(<n> = {cfg.N_AVG_TARGET:.2e} m^-3 over {cfg.PLASMA_VOLUME_M3:.3f} m^3)")
 
     print(f"[SYSTEM] Initializing thermal background ({cfg.initial_thermal_count:,} particles, "

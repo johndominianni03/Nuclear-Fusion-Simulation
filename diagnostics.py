@@ -162,7 +162,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
 
     # --- 2D ION DENSITY MAP ---
     # Weighted cloud-in-cell deposition of every live ion (thermal, beam, alpha), each
-    # macroparticle standing for cfg.MACRO_WEIGHT ions, computed once from the final state.
+    # macroparticle standing for cfg.WEIGHT[its type] ions, computed once from the final state.
     if n_ion_grid is not None:
         plt.figure(figsize=(7, 6))
         n_clean = np.where(_confinement_mask, np.nan, n_ion_grid.T)
@@ -210,11 +210,12 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.close()
 
     # --- STORED ENERGY WAVEFORM ---
-    # energy_history_keV sums the kinetic energy of the bulk-pool macroparticles
-    # (thermal + beam; alphas are not included); times MACRO_WEIGHT it is the
-    # stored ion kinetic energy of the plasma they represent.
+    # energy_history_keV is sum_i (w_i / w_thermal) E_i over the bulk-pool
+    # macroparticles (thermal + beam; alphas are not included): real energy in
+    # units of one thermal-D macroparticle. Times WEIGHT[0] it is the stored ion
+    # kinetic energy of the plasma they represent.
     plt.figure(figsize=(8, 4))
-    _w = getattr(cfg, "MACRO_WEIGHT", None)
+    _w = (getattr(cfg, "WEIGHT", None) or {}).get(0)
     if _w:
         plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6,
                  energy_history_keV * _w * 1.0e3 * cfg.e_charge / 1.0e3, color='firebrick', linewidth=1.5)

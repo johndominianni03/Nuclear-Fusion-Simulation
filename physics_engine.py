@@ -104,9 +104,11 @@ class ParticlePusher:
         
         return alpha_R, alpha_Z, alpha_vR, alpha_vphi, alpha_vZ
 
-    def compute_alpha_heating_power(self, alpha_energies_kev, dt, cfg):
+    def compute_alpha_heating_power(self, alpha_energies_kev, dt, cfg, rel_weights=None):
         # Drains energy from fast alphas via Coulomb drag and returns
-        # (new alpha energies, total keV given up this step).
+        # (new alpha energies, total keV given up this step). The total is
+        # sum(rel_w * dE) when rel_weights (per-alpha weight / thermal-D weight)
+        # is given, i.e. real energy expressed in thermal-D macroparticle units.
 
         if len(alpha_energies_kev) == 0:
             return alpha_energies_kev, 0.0
@@ -128,10 +130,13 @@ class ParticlePusher:
         # 3. Drain it from the alphas
         new_alpha_energies = E - deposited_kev
 
-        # 4. Total transferred to the bulk this step. Raw simulation-scale keV (no
-        # macro_weight), so the caller can conserve energy by depositing it into the
-        # thermal population.
-        total_energy_deposited_kev = float(np.sum(deposited_kev))
+        # 4. Total transferred to the bulk this step, weighted: sum(rel_w * dE) is the
+        # real energy given up, in units of one thermal-D macroparticle's weight, so the
+        # caller conserves real energy by depositing it with the bulk weights.
+        if rel_weights is None:
+            total_energy_deposited_kev = float(np.sum(deposited_kev))
+        else:
+            total_energy_deposited_kev = float(np.sum(rel_weights * deposited_kev))
 
         return new_alpha_energies, total_energy_deposited_kev
 
@@ -621,7 +626,7 @@ def apply_vectorized_collisions_torch(vel_tensor, type_tensor, nu_c, dt):
     return torch.where(collide_mask.unsqueeze(1), new_vel, vel_tensor)
 
 
-def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
+def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg, rel_weights=None):
     # Eager only -- the torch.sum reduction hits the dynamic-shape Inductor bug.
     if alpha_energies_kev.numel() == 0:
         return alpha_energies_kev, 0.0
@@ -638,8 +643,12 @@ def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg):
 
     new_alpha_energies = E - deposited_kev
 
-    # The reduction is over the precise per-particle drain, so no cancellation here
-    total_energy_deposited_kev = float(torch.sum(deposited_kev).item())
+    # The reduction is over the precise per-particle drain, so no cancellation here.
+    # Weighted exactly as the numpy twin: sum(rel_w * dE).
+    if rel_weights is None:
+        total_energy_deposited_kev = float(torch.sum(deposited_kev).item())
+    else:
+        total_energy_deposited_kev = float(torch.sum(rel_weights * deposited_kev).item())
 
     return new_alpha_energies, total_energy_deposited_kev
 
@@ -850,8 +859,9 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
 
     pos, vel : (N, 3) Cartesian positions [m] and velocities [m/s]
     types    : (N,) species, 0 thermal, 1 beam, 2 alpha (-1 lost; ignored)
-    masses   : (m_thermal, m_beam, m_alpha) in kg
-    weight   : real ions per macroparticle
+    masses   : per-species masses in kg, indexed by type code (species_masses)
+    weight   : real ions per macroparticle, either one number for every species
+               or a per-species sequence indexed by type code (weight_lut)
     B0       : field for beta [T]; beta is omitted when None
 
     Velocities are moments in the local cylindrical basis (R, phi, Z): the mean
@@ -860,7 +870,7 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
     rotation to zero and count it as temperature.
 
     Per species s and shell k:
-        n  = weight * count / V_k                       [m^-3]
+        n  = weight_s * count / V_k                     [m^-3]
         u  = <v_cyl>                                    [m/s]
         T  = m_s <|v_cyl - u|^2> / 3                    [J]   (also T_keV)
         p  = n T                                        [Pa]
@@ -886,7 +896,8 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
                       -vel[:, 0] * sphi + vel[:, 1] * cphi,
                       vel[:, 2]], axis=1)
 
-    n_species = 3
+    n_species = len(masses)
+    w_s = np.broadcast_to(np.asarray(weight, dtype=np.float64), (n_species,))
     count = np.zeros((n_species, n_bins), dtype=np.int64)
     n = np.zeros((n_species, n_bins))
     u = np.zeros((n_species, n_bins, 3))
@@ -899,7 +910,7 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
         vs = v_cyl[sel]
         c = np.bincount(k, minlength=n_bins)
         count[s] = c
-        n[s] = weight * c / safe_V
+        n[s] = w_s[s] * c / safe_V
         safe_c = np.where(c > 0, c, 1)
         for d in range(3):
             u[s, :, d] = np.bincount(k, weights=vs[:, d], minlength=n_bins) / safe_c
@@ -920,7 +931,7 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
         "T": T,
         "T_keV": T / (e_charge * 1.0e3),
         "p": p,
-        "weight": float(weight),
+        "weight": tuple(float(x) for x in w_s),
     }
     if B0 is not None:
         mu0 = 4.0e-7 * np.pi
@@ -1067,14 +1078,58 @@ def compute_thermal_fusion_power(prof, cfg):
 
 
 def species_masses(cfg):
-    """(thermal, beam, alpha) masses in the order compute_flux_profiles expects."""
+    """Per-species masses indexed by type code: (thermal D, beam D, alpha)."""
     return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA)
+
+
+def weight_lut(cfg):
+    """cfg.WEIGHT (real ions per macroparticle, keyed by type code) as a float64
+    array indexed by type code, for vectorised per-particle lookup. Index it with
+    live types only (>= 0)."""
+    return np.array([cfg.WEIGHT[s] for s in range(len(species_masses(cfg)))], dtype=np.float64)
+
+
+def relative_weight_lut(cfg):
+    """weight_lut / the thermal-D weight. The reactor loops weight energies and
+    counts with these ratios, so a weighted sum reads in units of one thermal-D
+    macroparticle; with equal weights every ratio is exactly 1.0 and the weighted
+    sums are bit-identical to the unweighted ones."""
+    lut = weight_lut(cfg)
+    return lut / lut[0]
+
+
+def weighted_kinetic_energy_kev(vels64, rel_w, mass):
+    """sum_i rel_w_i * (1/2) m |v_i|^2, in keV: the real kinetic energy of a set of
+    macroparticles in thermal-D macroparticle units."""
+    return float(np.sum(rel_w * (0.5 * mass * np.sum(vels64**2, axis=1)))) / 1.602e-16
+
+
+def drain_alpha_energy(engine, cfg, alpha_vels, rel_w, dt):
+    """Slow the alphas by the fixed drag (compute_alpha_heating_power) and return
+    the real energy given up, sum(rel_w * dE) in keV (thermal-D macroparticle units).
+    alpha_vels is float64 and is rescaled in place (speed only)."""
+    v_mags = np.linalg.norm(alpha_vels, axis=1)
+    alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / 1.602e-16
+    new_energies_kev, deposited_kev = engine.compute_alpha_heating_power(
+        alpha_energies_kev, dt, cfg, rel_weights=rel_w)
+    new_v_mags = np.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
+    scale_factors = new_v_mags / np.where(v_mags == 0, 1e-10, v_mags)
+    alpha_vels *= scale_factors[:, np.newaxis]
+    return deposited_kev
+
+
+def bulk_boost_factor(deposited_kev, bulk_energy_kev):
+    """Common speed factor that adds deposited_kev to a population holding
+    bulk_energy_kev (both weighted, same units): energy goes as v^2, so every
+    velocity scales by sqrt(1 + dE/E) and the real energy received,
+    (boost^2 - 1) * E, equals the real energy given up whatever the weights."""
+    return np.sqrt(1.0 + deposited_kev / bulk_energy_kev)
 
 
 def update_force_balance_field(cfg, eq, pos, vel, types):
     """The reactor loops' field update: thermal-ion profiles of the given
     particles -> (phi_grid, E_R_grid, E_Z_grid, potential_dict). Host arrays."""
-    prof = compute_flux_profiles(pos, vel, types, eq, species_masses(cfg), weight=cfg.MACRO_WEIGHT)
+    prof = compute_flux_profiles(pos, vel, types, eq, species_masses(cfg), weight=weight_lut(cfg))
     return compute_force_balance_field(prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
                                        cfg.nR, cfg.nZ, species=0)
 
@@ -1085,7 +1140,8 @@ def _deposit_weighted(cfg, pos, types, per_particle):
     live = types >= 0
     R = np.ascontiguousarray(np.hypot(pos[live, 0], pos[live, 1]), dtype=np.float64)
     Z = np.ascontiguousarray(pos[live, 2], dtype=np.float64)
-    q = np.ascontiguousarray(per_particle(types[live]) * cfg.MACRO_WEIGHT, dtype=np.float64)
+    q = np.ascontiguousarray(per_particle(types[live]) * weight_lut(cfg)[types[live]],
+                             dtype=np.float64)
     return compute_cic_charge_density(R, Z, q, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
                                       cfg.nR, cfg.nZ, False)
 
@@ -1093,8 +1149,8 @@ def _deposit_weighted(cfg, pos, types, per_particle):
 def deposit_ion_charge_density(cfg, pos, types):
     """Weighted CIC ion charge density (C/m^3) of every live particle.
 
-    Each macroparticle carries MACRO_WEIGHT ions of its species' charge: e for
-    thermal and beam deuterons, CHARGE_ALPHA for alphas.
+    Each macroparticle carries cfg.WEIGHT[type] ions of its species' charge: e
+    for thermal and beam deuterons, CHARGE_ALPHA for alphas.
     """
     return _deposit_weighted(cfg, pos, types,
                              lambda t: np.where(t == 2, cfg.CHARGE_ALPHA, cfg.e_charge))

@@ -14,6 +14,10 @@ from physics_engine import (
     vectorized_boris_push_numba_fallback,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
+    relative_weight_lut,                    # per-species weight / thermal-D weight
+    drain_alpha_energy,
+    weighted_kinetic_energy_kev,
+    bulk_boost_factor,
 )
 from profiling import (
     StageProfiler,
@@ -161,6 +165,11 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # inside the sub-step kernel.
     E_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
     B_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
+
+    # Per-species weight relative to thermal D, indexed by type code. Energies and
+    # counts below are weighted with it, so they read in thermal-D macroparticle
+    # units (times cfg.WEIGHT[0] = physical). Equal weights make every entry 1.0.
+    rel_w = relative_weight_lut(cfg)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
@@ -431,16 +440,12 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # Reads the alpha pool, writes the bulk pool below. ORDER IS PRESERVED
         # EXACTLY: alpha energies are updated here, the deposit happens after
         # that and before the bulk energy is recorded.
+        # alpha_deposited_kev is the weighted (real) energy given up, sum(w_a dE) / w_thermal.
         alpha_deposited_kev = 0.0
         if alpha.n_live > 0:
             alpha_vels = a_vel.astype(np.float64)
-            v_mags = np.linalg.norm(alpha_vels, axis=1)
-            alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / 1.602e-16
-            new_energies_kev, alpha_deposited_kev = engine.compute_alpha_heating_power(
-                alpha_energies_kev, cfg.reactor_dt, cfg)
-            new_v_mags = np.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
-            scale_factors = new_v_mags / np.where(v_mags == 0, 1e-10, v_mags)
-            alpha_vels *= scale_factors[:, np.newaxis]
+            alpha_deposited_kev = drain_alpha_energy(engine, cfg, alpha_vels, rel_w[a_type],
+                                                     cfg.reactor_dt)
             a_vel[:] = alpha_vels.astype(np.float32)
 
         # The bulk pool holds nothing but types 0 and 1, and the compaction above
@@ -451,17 +456,22 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- ALPHA -> BULK ENERGY TRANSFER (energy conservation) ---
         # Energy drained from the alphas used to vanish -- removed from the fast
         # population and given to nothing, so the thermal plasma never felt the heating.
-        # Deposit it by scaling bulk speeds, using the simulation-scale keV (no
-        # macro_weight) so particles stay self-consistent.
+        # Deposit it by scaling every bulk speed by one factor. Both sides are
+        # weighted -- given up sum(w_a dE_a), received sum(w_b dE_b) -- so real
+        # energy is conserved even when the species weights differ.
+        r_b = rel_w[b_type]
         if alpha_deposited_kev > 0.0 and bulk.n_live > 0:
             bulk_vels = b_vel.astype(np.float64)
-            bulk_energy_kev = float(np.sum(0.5 * cfg.m_deuterium * np.sum(bulk_vels**2, axis=1))) / 1.602e-16
+            bulk_energy_kev = weighted_kinetic_energy_kev(bulk_vels, r_b, cfg.m_deuterium)
             if bulk_energy_kev > 0.0:
-                boost = np.sqrt(1.0 + alpha_deposited_kev / bulk_energy_kev)
+                boost = bulk_boost_factor(alpha_deposited_kev, bulk_energy_kev)
                 b_vel[:] = (bulk_vels * boost).astype(np.float32)
 
+        # Weighted macroparticle count of the bulk (thermal-D units): the confined
+        # real ion count is r_sum * WEIGHT[0].
+        r_sum = float(np.sum(r_b))
         if bulk.n_live > 0:
-            current_energy_joules = np.sum(0.5 * cfg.m_deuterium * (np.linalg.norm(b_vel.astype(np.float64), axis=1)**2))
+            current_energy_joules = np.sum(r_b * (0.5 * cfg.m_deuterium * (np.linalg.norm(b_vel.astype(np.float64), axis=1)**2)))
         else:
             current_energy_joules = 0.0
 
@@ -474,8 +484,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # Assigning the plasma's TOTAL stored energy here made the "core temperature"
         # read ~50,000 keV, and every consumer (the Lawson triple product, the
         # quench baseline) was fed that. For a 3D Maxwellian
-        # <E> = (3/2)kT, so kT = (2/3) * <E>.
-        n_bulk = max(current_confined, 1)
+        # <E> = (3/2)kT, so kT = (2/3) * <E>, with <E> per real ion (weighted).
+        n_bulk = max(r_sum, 1.0)
         T_core_kinetic = (2.0 / 3.0) * (current_energy_keV / n_bulk)
 
         if current_amp > cfg.MAX_ISLAND_WIDTH_THRESHOLD and not cfg.SPI_TRIGGERED:
@@ -538,10 +548,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined macro-particle count times
-        # MACRO_WEIGHT over the psi_edge volume. Units: m^-3 * keV * s, matching
-        # cfg.lawson_target and the axis label.
-        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the confined real ion count (weighted
+        # macroparticle count times WEIGHT[0]) over the psi_edge volume. Units:
+        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
+        n_e_reactor = (r_sum * cfg.WEIGHT[0]) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)

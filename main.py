@@ -6,6 +6,7 @@ from physics_engine import (
     compute_thermal_fusion_power,           # thermal D-T power from those profiles
     map_flux_profile_to_grid,
     species_masses,
+    weight_lut,
     deposit_ion_number_density,             # end-of-run weighted ion density map
 )
 from config import SimulationConfiguration
@@ -151,7 +152,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     # Weighted thermal-ion n(psi_N), T(psi_N); n_D = n_T = n_thermal / 2 is an
     # assumption (there is no tritium species). Beam ions and alphas are excluded.
     flux_profiles = compute_flux_profiles(pos_np, vel_np, type_np, eq, species_masses(cfg),
-                                          weight=cfg.MACRO_WEIGHT, B0=cfg.B0)
+                                          weight=weight_lut(cfg), B0=cfg.B0)
     P_fusion_profile, total_fusion_power_watts = compute_thermal_fusion_power(flux_profiles, cfg)
     P_fusion_grid = map_flux_profile_to_grid(
         P_fusion_profile, flux_profiles["psiN_centers"], eq,
