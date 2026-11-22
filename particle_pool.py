@@ -34,12 +34,20 @@ def _compact_pool_numba(pos, vel, typ, pid, idx, m):
         pid[k] = pid[src]
 
 
+@njit(cache=True)
+def _compact_1d_numba(arr, idx, m):
+    """In-place forward compaction of one per-particle column (see
+    _compact_pool_numba for why ascending idx makes this safe; sequential)."""
+    for k in range(m):
+        arr[k] = arr[idx[k]]
+
+
 class _ParticlePool:
     """Capacity-backed particle storage: pos/vel/type/pid allocated once, with an
     n_live write pointer.
 
     Both loops used to grow by full reallocation -- np.vstack/np.append on the
-    CPU path, torch.cat on the GPU path -- once every cfg.inject_every_n_steps.
+    CPU path, torch.cat on the GPU path -- at every injection event.
     At 1,000,000 particles that copied ~36 MB per event (12 MB pos + 12 MB vel +
     4 MB type + 8 MB pid), about 5,000 times over a production run, and churned
     the MPS allocator badly on the GPU side.
@@ -54,12 +62,24 @@ class _ParticlePool:
 
     device=None keeps the arrays in numpy (CPU loop); pass a torch device and the
     same structure holds device tensors instead.
+
+    with_weight=True adds a per-particle weight column (real particles per
+    macroparticle, float64 on the host, float32 on a device) for a species whose
+    macroparticles do not share one weight -- the alphas, each of which keeps the
+    weight it was born with. add() then needs the weights, and compact() carries
+    them with the other columns.
     """
 
-    def __init__(self, capacity, device=None):
+    def __init__(self, capacity, device=None, with_weight=False):
         self.capacity = int(capacity)
         self.device = device
         self.n_live = 0
+        self.weight = None
+        if with_weight:
+            if device is None:
+                self.weight = np.empty(self.capacity, dtype=np.float64)
+            else:
+                self.weight = torch.empty(self.capacity, dtype=torch.float32, device=device)
         if device is None:
             self.pos = np.empty((self.capacity, 3), dtype=np.float32)
             self.vel = np.empty((self.capacity, 3), dtype=np.float32)
@@ -83,6 +103,10 @@ class _ParticlePool:
         n = self.n_live
         return self.pos[:n], self.vel[:n], self.type[:n], self.pid[:n]
 
+    def weight_view(self):
+        """The live prefix of the per-particle weight column (with_weight pools)."""
+        return self.weight[:self.n_live]
+
     def _require(self, extra):
         # RuntimeError, not assert: `python -O` strips assert statements, and
         # AssertionError is what an assert raises, so either form would make this
@@ -99,17 +123,22 @@ class _ParticlePool:
                 f"track_store._pid_capacity_bound: that sizes the pid maps, and has "
                 f"been a separate bound since step 9 split the pools.)")
 
-    def add(self, pos_block, vel_block, type_value, pid_block):
+    def add(self, pos_block, vel_block, type_value, pid_block, weight_block=None):
         """Append a batch. Returns the first row written."""
         batch = len(pid_block)
         if batch == 0:
             return self.n_live
+        if (self.weight is None) != (weight_block is None):
+            raise RuntimeError("_ParticlePool.add: weights must be given exactly when the "
+                               "pool has a weight column")
         self._require(batch)
         start, end = self.n_live, self.n_live + batch
         self.pos[start:end] = pos_block
         self.vel[start:end] = vel_block
         self.type[start:end] = type_value
         self.pid[start:end] = pid_block
+        if self.weight is not None:
+            self.weight[start:end] = weight_block
         self.n_live = end
         return start
 
@@ -119,6 +148,8 @@ class _ParticlePool:
         if self.device is None:
             _compact_pool_numba(self.pos, self.vel, self.type, self.pid,
                                 alive_idx, m)
+            if self.weight is not None:
+                _compact_1d_numba(self.weight, alive_idx, m)
         else:
             # index_select allocates one temporary per array. Left as is on
             # purpose: wall-loss compaction measures 0.0% of loop wall, so the
@@ -127,6 +158,8 @@ class _ParticlePool:
             self.vel[:m] = self.vel.index_select(0, alive_idx)
             self.type[:m] = self.type.index_select(0, alive_idx)
             self.pid[:m] = self.pid.index_select(0, alive_idx)
+            if self.weight is not None:
+                self.weight[:m] = self.weight.index_select(0, alive_idx)
         self.n_live = m
         return m
 
@@ -146,9 +179,10 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
       bulk  -- n_bulk_init thermal deuterons, plus the NBI source: one batch per
                step of int(rate) plus at most one more from the stochastic
                remainder, rate = cfg.NBI_MACRO_PER_STEP (constant).
-      alpha -- one particle per alpha event, because alpha_batch is the literal
-               1 at both injection sites. If that ever becomes a variable, this
-               bound has to follow it.
+      alpha -- the fusion-driven alpha source: one batch per step of int(rate)
+               plus at most one more from the stochastic remainder,
+               rate = cfg.ALPHA_MACRO_PER_STEP (constant; the weight carries
+               the fusion rate).
       trit  -- n_trit_init thermal tritons; nothing is ever injected into it.
 
     Neither can be exceeded by a run the single-pool version survived: species
@@ -158,10 +192,38 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
     injected.
     """
     steps = int(cfg.reactor_num_steps)
-    nbi_events = steps
-    alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
     nbi_max = int(cfg.NBI_MACRO_PER_STEP) + 1
-    bulk_cap = int(n_bulk_init + nbi_events * nbi_max) + 1024
-    alpha_cap = int(alpha_events) + 1024
+    alpha_max = int(cfg.ALPHA_MACRO_PER_STEP) + 1
+    bulk_cap = int(n_bulk_init + steps * nbi_max) + 1024
+    alpha_cap = int(steps * alpha_max) + 1024
     trit_cap = int(n_trit_init) + 1024
     return bulk_cap, alpha_cap, trit_cap
+
+
+def _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
+             alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
+             alpha_rate_updates, weight_np):
+    """The loops' last return value: source bookkeeping and per-row weights.
+
+      nbi_per_step        beam macroparticles injected each step
+      nbi_energy_J        weighted kinetic energy those carried in [J]
+      alpha_per_step      macro-alphas born each step
+      alpha_rate_per_step total thermal D-T rate in force at each step [1/s]
+      alpha_birth_weight  sum of the birth weights of every macro-alpha (real alphas)
+      alpha_birth_shells  psi_N shell index of each birth
+      alpha_birth_update  index into alpha_rate_updates of the rates each birth used
+      alpha_rate_updates  (n_updates, n_shells) rate_k at each field update [1/s]
+      weight_np           real ions per row of the returned pos/vel/type arrays
+    Shared by both reactor loops.
+    """
+    return {
+        "nbi_per_step": np.asarray(nbi_per_step, dtype=np.int64),
+        "nbi_energy_J": float(nbi_energy_J),
+        "alpha_per_step": np.asarray(alpha_per_step, dtype=np.int64),
+        "alpha_rate_per_step": np.asarray(alpha_rate_per_step, dtype=np.float64),
+        "alpha_birth_weight": float(alpha_birth_weight),
+        "alpha_birth_shells": np.asarray(alpha_birth_shells, dtype=np.int64),
+        "alpha_birth_update": np.asarray(alpha_birth_update, dtype=np.int64),
+        "alpha_rate_updates": np.asarray(alpha_rate_updates, dtype=np.float64),
+        "weight_np": np.asarray(weight_np, dtype=np.float64),
+    }

@@ -45,7 +45,6 @@ class SimulationConfiguration:
         # with those same profiles and the same weight; tritium has its own pool.
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
-        self.inject_every_n_steps = 2   # alpha schedule only (one alpha every 2x this)
 
         # Neutral beam source, calibrated by injected power. P_NBI_MW is an INPUT, not
         # a result: 33 MW is ITER's design neutral-beam heating power. The beam is
@@ -56,6 +55,15 @@ class SimulationConfiguration:
         # the weighted injected power is P_NBI while the beam keeps good statistics.
         self.P_NBI_MW = 33.0
         self.NBI_MACRO_PER_STEP = 2.0
+
+        # Fusion-driven alpha source. Alphas are born from the computed thermal D-T
+        # reaction rate, per flux shell rate_k = n_D n_T <sigma v>(T_i) V_k, recomputed
+        # at every field update. ALPHA_MACRO_PER_STEP macro-alphas are born per step
+        # (fractional rates realised stochastically), each of weight
+        #     w_alpha = (sum_k rate_k) * dt / ALPHA_MACRO_PER_STEP,
+        # which it keeps for life (the alpha pool stores one weight per alpha).
+        self.ALPHA_MACRO_PER_STEP = 1.0
+        self.ALPHA_BIRTH_WEIGHT = None          # latest w_alpha, set by the loop
 
         # 3.5 MeV alphas cover ~1.3e-2 m per global step against a ~2.2e-2 m Larmor
         # radius -- under two samples per gyro-arc, hence jagged orbits. Sub-step only

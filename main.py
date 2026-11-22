@@ -65,7 +65,7 @@ GPU_PARTICLE_THRESHOLD = None
 def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
                             pos_np, vel_np, type_np,
                             history_tracks, tracked_type, tracked_lastpos,
-                            tracked_lastvel, tracked_lost, prof=None):
+                            tracked_lastvel, tracked_lost, prof=None, *, weight_np):
     """Turns the reactor loop's raw output into the arrays diagnostics plots.
 
     Lifted verbatim out of run_reactor_steady_state so a regression test can
@@ -76,6 +76,11 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     `eq` supplies psi for the flux-surface profiles and the fusion power map.
 
     Returns a dict of exactly the products the caller forwards onward.
+
+    `weight_np` (required, keyword) is the loop's per-row real-ion weight
+    (run_log["weight_np"]): alphas each carry their birth weight, so the
+    flux-surface profiles, beta and the density map need it -- cfg.WEIGHT[2] is
+    only the latest birth weight and would mis-weight every older alpha.
 
     `prof` is an optional StageProfiler. When None (the default, and what
     tests/test_regression.py passes) every hook below is a no-op.
@@ -152,12 +157,13 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     # Weighted thermal-D and thermal-T n(psi_N), T(psi_N); P = n_D n_T <sigma v>(T_i) E
     # at the density-weighted thermal-ion temperature. Beam ions and alphas are excluded.
     flux_profiles = compute_flux_profiles(pos_np, vel_np, type_np, eq, species_masses(cfg),
-                                          weight=weight_lut(cfg), B0=cfg.B0)
+                                          weight=weight_lut(cfg), B0=cfg.B0,
+                                          particle_weight=weight_np)
     P_fusion_profile, total_fusion_power_watts = compute_thermal_fusion_power(flux_profiles, cfg)
     P_fusion_grid = map_flux_profile_to_grid(
         P_fusion_profile, flux_profiles["psiN_centers"], eq,
         cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ)
-    n_ion_grid = deposit_ion_number_density(cfg, pos_np, type_np)
+    n_ion_grid = deposit_ion_number_density(cfg, pos_np, type_np, weights=weight_np)
     prof.add("pkg: flux profiles + thermal fusion power", _t)
 
     print("==================================================")
@@ -237,14 +243,14 @@ def run_reactor_steady_state(save_plots=None):
      inventory_history, stored_energy_J,
      temp_history, trigger_time, T_core,
      lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
-     source_log) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
+     run_log) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
 
     _t = outer.mark()
     packaged = package_reactor_results(
         cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
         pos_np, vel_np, type_np,
         history_tracks, tracked_type, tracked_lastpos,
-        tracked_lastvel, tracked_lost, prof=outer,
+        tracked_lastvel, tracked_lost, prof=outer, weight_np=run_log["weight_np"],
     )
     outer.add("package_reactor_results (total)", _t)
 

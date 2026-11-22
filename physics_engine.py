@@ -856,7 +856,8 @@ def compute_flux_shell_volumes(eq, n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_
 
 
 def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
-                          n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_MESH, B0=None):
+                          n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_MESH, B0=None,
+                          particle_weight=None):
     """Per-species moments on psi_N shells.
 
     pos, vel : (N, 3) Cartesian positions [m] and velocities [m/s]
@@ -865,6 +866,10 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
     weight   : real ions per macroparticle, either one number for every species
                or a per-species sequence indexed by type code (weight_lut)
     B0       : field for beta [T]; beta is omitted when None
+    particle_weight : optional (N,) real ions per macroparticle, one per row; it
+               replaces `weight` for every species, and u and T become
+               weight-weighted means (needed for the alphas, whose macroparticles
+               each keep their birth weight)
 
     Velocities are moments in the local cylindrical basis (R, phi, Z): the mean
     flow u of a shell is (u_R, u_phi, u_Z), so a toroidal rotation is a flow and
@@ -906,18 +911,27 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
     T = np.full((n_species, n_bins), np.nan)
     p = np.zeros((n_species, n_bins))
     safe_V = np.where(V > 0.0, V, np.inf)
+    pw = None if particle_weight is None else np.asarray(particle_weight, dtype=np.float64)
     for s in range(n_species):
         sel = inside & (types == s)
         k = idx[sel]
         vs = v_cyl[sel]
         c = np.bincount(k, minlength=n_bins)
         count[s] = c
-        n[s] = w_s[s] * c / safe_V
-        safe_c = np.where(c > 0, c, 1)
+        if pw is None:
+            n[s] = w_s[s] * c / safe_V
+            norm = np.where(c > 0, c, 1)
+            ws = None
+        else:
+            ws = pw[sel]
+            wsum = np.bincount(k, weights=ws, minlength=n_bins)
+            n[s] = wsum / safe_V
+            norm = np.where(wsum > 0, wsum, 1.0)
         for d in range(3):
-            u[s, :, d] = np.bincount(k, weights=vs[:, d], minlength=n_bins) / safe_c
+            u[s, :, d] = np.bincount(k, weights=vs[:, d] if ws is None else ws * vs[:, d],
+                                     minlength=n_bins) / norm
         dv2 = np.sum((vs - u[s, k]) ** 2, axis=1)
-        mean_dv2 = np.bincount(k, weights=dv2, minlength=n_bins) / safe_c
+        mean_dv2 = np.bincount(k, weights=dv2 if ws is None else ws * dv2, minlength=n_bins) / norm
         ok = c >= 2
         T[s, ok] = masses[s] * mean_dv2[ok] / 3.0
         p[s, ok] = n[s, ok] * T[s, ok]
@@ -933,7 +947,7 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
         "T": T,
         "T_keV": T / (e_charge * 1.0e3),
         "p": p,
-        "weight": tuple(float(x) for x in w_s),
+        "weight": tuple(float(x) for x in w_s) if pw is None else "per-particle",
     }
     if B0 is not None:
         mu0 = 4.0e-7 * np.pi
@@ -1097,6 +1111,88 @@ def compute_thermal_fusion_power(prof, cfg):
     return P, float(np.sum(P * prof["shell_volume"]))
 
 
+def compute_alpha_birth_rates(prof, cfg):
+    """Thermal D-T reactions per second in each psi_N shell,
+        rate_k = n_D,k n_T,k <sigma v>(T_i,k) V_k = P_k V_k / E_fusion,
+    the same shell sum compute_thermal_fusion_power integrates (one alpha per
+    reaction). Returns an array over the shells."""
+    P, _ = compute_thermal_fusion_power(prof, cfg)
+    return P * prof["shell_volume"] / cfg.E_FUSION_JOULES
+
+
+class AlphaBirthSampler:
+    """Birth positions for fusion alphas: a psi_N shell is drawn with probability
+    proportional to its reaction rate, then a position inside that shell by
+    rejection sampling -- uniform (R, Z) proposals in the shell's bounding box,
+    accepted when psi_N falls in the shell and with probability R / R_box_max
+    (the revolved volume element is 2 pi R dR dZ) -- and a uniform toroidal angle.
+    The reaction density is taken as uniform within a shell, the resolution at
+    which the rates are known.
+
+    Bounding boxes come from the same n_mesh mesh as the shell volumes, padded by
+    two cells, so every point of a shell lies inside its box.
+    """
+
+    def __init__(self, eq, n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_MESH):
+        self.eq = eq
+        self.n_bins = n_bins
+        dR = (eq.psi_R_max - eq.psi_R_min) / n_mesh
+        dZ = (eq.psi_Z_max - eq.psi_Z_min) / n_mesh
+        Rc = eq.psi_R_min + (np.arange(n_mesh) + 0.5) * dR
+        Zc = eq.psi_Z_min + (np.arange(n_mesh) + 0.5) * dZ
+        RR, ZZ = np.meshgrid(Rc, Zc, indexing="ij")
+        x = compute_psi_normalised(RR, ZZ, eq)
+        k = np.where(x <= 1.0, np.minimum((np.clip(x, 0.0, None) * n_bins).astype(np.int64), n_bins - 1), -1)
+        self.box = np.zeros((n_bins, 4))
+        for s in range(n_bins):
+            m = k == s
+            self.box[s] = (max(RR[m].min() - 2 * dR, eq.psi_R_min), min(RR[m].max() + 2 * dR, eq.psi_R_max),
+                           max(ZZ[m].min() - 2 * dZ, eq.psi_Z_min), min(ZZ[m].max() + 2 * dZ, eq.psi_Z_max))
+
+    def draw_shells(self, rates, n):
+        """n shell indices with probability rate_k / sum(rate)."""
+        p = np.asarray(rates, dtype=np.float64)
+        cdf = np.cumsum(p / p.sum())
+        return np.minimum(np.searchsorted(cdf, np.random.random(n), side="right"), self.n_bins - 1)
+
+    def positions_in_shells(self, shells):
+        """(R, Z) for each requested shell index, by rejection sampling."""
+        n = len(shells)
+        R = np.empty(n)
+        Z = np.empty(n)
+        for i, s in enumerate(shells):
+            R0, R1, Z0, Z1 = self.box[s]
+            lo, hi = s / self.n_bins, (s + 1) / self.n_bins
+            while True:
+                Rt = np.random.uniform(R0, R1, 64)
+                Zt = np.random.uniform(Z0, Z1, 64)
+                x = compute_psi_normalised(Rt, Zt, self.eq)
+                ok = (x >= lo) & (x < hi) if s < self.n_bins - 1 else (x >= lo) & (x <= 1.0)
+                ok &= np.random.uniform(0.0, 1.0, 64) < Rt / R1
+                hit = np.nonzero(ok)[0]
+                if hit.size:
+                    R[i], Z[i] = Rt[hit[0]], Zt[hit[0]]
+                    break
+        return R, Z
+
+    def sample(self, rates, n, engine, cfg):
+        """n isotropic 3.5 MeV alphas born in proportion to the shell rates.
+        Returns float32 Cartesian (pos, vel) and the shell indices drawn."""
+        shells = self.draw_shells(rates, n)
+        R, Z = self.positions_in_shells(shells)
+        phi = np.random.uniform(0.0, 2.0 * np.pi, n)
+        _, _, vR, vphi, vZ = engine.spawn_alpha_particles(n, R, Z, cfg.ALPHA_ENERGY_JOULES, cfg.MASS_ALPHA)
+        pos = np.empty((n, 3), dtype=np.float32)
+        vel = np.empty((n, 3), dtype=np.float32)
+        pos[:, 0] = R * np.cos(phi)
+        pos[:, 1] = R * np.sin(phi)
+        pos[:, 2] = Z
+        vel[:, 0] = vR * np.cos(phi) - vphi * np.sin(phi)
+        vel[:, 1] = vR * np.sin(phi) + vphi * np.cos(phi)
+        vel[:, 2] = vZ
+        return pos, vel, shells
+
+
 # Species type codes: 0 thermal D, 1 beam D, 2 alpha, 3 thermal T (-1 lost).
 THERMAL_SPECIES = (0, 3)
 
@@ -1190,35 +1286,39 @@ def update_force_balance_field(cfg, eq, pos, vel, types):
     particles -> (phi_grid, E_R_grid, E_Z_grid, potential_dict). Host arrays."""
     prof = compute_flux_profiles(pos, vel, types, eq, species_masses(cfg), weight=weight_lut(cfg))
     # Both thermal species: e (n_D + n_T) E = grad (p_D + p_T).
-    return compute_force_balance_field(prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
-                                       cfg.nR, cfg.nZ, species=THERMAL_SPECIES)
+    phi, E_R, E_Z, pot = compute_force_balance_field(prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min,
+                                                     cfg.Z_max, cfg.nR, cfg.nZ, species=THERMAL_SPECIES)
+    pot["profile"] = prof        # the thermal profiles, reused for the alpha birth rates
+    return phi, E_R, E_Z, pot
 
 
-def _deposit_weighted(cfg, pos, types, per_particle):
+def _deposit_weighted(cfg, pos, types, per_particle, weights=None):
     pos = np.asarray(pos)
     types = np.asarray(types)
     live = types >= 0
     R = np.ascontiguousarray(np.hypot(pos[live, 0], pos[live, 1]), dtype=np.float64)
     Z = np.ascontiguousarray(pos[live, 2], dtype=np.float64)
-    q = np.ascontiguousarray(per_particle(types[live]) * weight_lut(cfg)[types[live]],
-                             dtype=np.float64)
+    w = (weight_lut(cfg)[types[live]] if weights is None
+         else np.asarray(weights, dtype=np.float64)[live])
+    q = np.ascontiguousarray(per_particle(types[live]) * w, dtype=np.float64)
     return compute_cic_charge_density(R, Z, q, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
                                       cfg.nR, cfg.nZ, False)
 
 
-def deposit_ion_charge_density(cfg, pos, types):
+def deposit_ion_charge_density(cfg, pos, types, weights=None):
     """Weighted CIC ion charge density (C/m^3) of every live particle.
 
-    Each macroparticle carries cfg.WEIGHT[type] ions of its species' charge: e
-    for deuterons and tritons, CHARGE_ALPHA for alphas.
+    Each macroparticle carries cfg.WEIGHT[type] ions -- or weights[i] when a
+    per-row weight array is given (alphas keep their birth weight) -- of its
+    species' charge: e for deuterons and tritons, CHARGE_ALPHA for alphas.
     """
     return _deposit_weighted(cfg, pos, types,
-                             lambda t: np.where(t == 2, cfg.CHARGE_ALPHA, cfg.e_charge))
+                             lambda t: np.where(t == 2, cfg.CHARGE_ALPHA, cfg.e_charge), weights)
 
 
-def deposit_ion_number_density(cfg, pos, types):
+def deposit_ion_number_density(cfg, pos, types, weights=None):
     """Weighted CIC ion number density (m^-3) of every live particle, all species."""
-    return _deposit_weighted(cfg, pos, types, lambda t: np.ones(t.shape[0]))
+    return _deposit_weighted(cfg, pos, types, lambda t: np.ones(t.shape[0]), weights)
 
 
 def resample_grid_to(src_grid, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ,

@@ -771,10 +771,11 @@ def test_beam_ions_do_not_change_T_core():
 # TIER 2 PHASE 4 -- neutral beam calibrated by power
 # =======================================================
 @functools.lru_cache(maxsize=None)
-def _source_run(n_steps, nbi_macro_per_step, n_thermal=400, seed=9):
+def _source_run(n_steps, nbi_macro_per_step, n_thermal=400, seed=9, alpha_macro_per_step=1.0):
     """Small load run through reactor_cpu._run_reactor_loop_cpu for n_steps at the
     given NBI_MACRO_PER_STEP (set before initialize_reactor, which derives the
-    beam weight from it). Returns (cfg, loop output)."""
+    beam weight from it) and ALPHA_MACRO_PER_STEP. Returns (cfg, loop output, the
+    initial (pos, vel, type) arrays, eq)."""
     from config import SimulationConfiguration
     import initialization
     import reactor_cpu
@@ -784,23 +785,25 @@ def _source_run(n_steps, nbi_macro_per_step, n_thermal=400, seed=9):
         cfg.initial_thermal_count = n_thermal
         cfg.reactor_num_steps = n_steps
         cfg.NBI_MACRO_PER_STEP = nbi_macro_per_step
+        cfg.ALPHA_MACRO_PER_STEP = alpha_macro_per_step
         state = np.random.get_state()
         np.random.seed(seed)
         eq, engine, p, v, t, rho, phi, ER, EZ = initialization.initialize_reactor(cfg)
+        init = (p.cpu().numpy().copy(), v.cpu().numpy().copy(), t.cpu().numpy().copy())
         B_R, B_Z, _, _ = compute_poloidal_field_grids(
             eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
             dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min,
             dst_Z_max=cfg.Z_max, dst_nR=cfg.nR, dst_nZ=cfg.nZ)
         out = reactor_cpu._run_reactor_loop_cpu(cfg, engine, p, v, t, rho, phi, ER, EZ, B_R, B_Z)
         np.random.set_state(state)
-    return cfg, out
+    return cfg, out, init, eq
 
 
 def test_nbi_injected_power_equals_P_NBI():
     """The weighted kinetic energy of every injected beam macroparticle, summed in
     the loop from the stored rows, divided by the elapsed time, equals P_NBI
     within 1% over a 2,000-step run; w_beam = P_NBI dt / (E_beam * rate)."""
-    cfg, out = _source_run(2000, 2.0)
+    cfg, out, _, _ = _source_run(2000, 2.0)
     log = out[19]
     E_beam_J = cfg.nbi_energy_keV * 1e3 * cfg.e_charge
     w_expect = cfg.P_NBI_MW * 1e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
@@ -816,7 +819,7 @@ def test_nbi_mean_macroparticles_per_step_fractional_rate():
     within 4 sigma of Bernoulli counting noise, and the injected power matches
     P_NBI within the same relative noise."""
     rate = 1.37
-    cfg, out = _source_run(4000, rate)
+    cfg, out, _, _ = _source_run(4000, rate)
     log = out[19]
     k = log["nbi_per_step"]
     assert len(k) == cfg.reactor_num_steps and set(np.unique(k)) <= {1, 2}
@@ -825,6 +828,135 @@ def test_nbi_mean_macroparticles_per_step_fractional_rate():
     assert abs(k.mean() - rate) < 4 * sigma, f"mean {k.mean():.4f} vs {rate} (sigma {sigma:.4f})"
     P_inj = log["nbi_energy_J"] / (cfg.reactor_num_steps * cfg.reactor_dt)
     assert abs(P_inj / (cfg.P_NBI_MW * 1e6) - 1.0) < 4 * sigma / rate + 1e-3, f"P_inj = {P_inj / 1e6:.4f} MW"
+
+
+# =======================================================
+# TIER 2 PHASE 5 -- fusion-driven alpha source
+# =======================================================
+def test_alpha_birth_rate_equals_fusion_reaction_rate():
+    """sum(w_alpha) over every macro-alpha born, per second, equals the thermal
+    D-T reaction rate the loop computed (time average of the rate in force each
+    step): exactly at ALPHA_MACRO_PER_STEP = 1, within 4 sigma of counting noise
+    at a fractional 0.6. The step-0 rate is P_fusion / E_fusion of the loaded
+    thermal profiles, and sum_k rate_k reproduces compute_thermal_fusion_power."""
+    from physics_engine import (compute_flux_profiles, compute_thermal_fusion_power,
+                                species_masses, weight_lut)
+    for rate, n_steps in ((1.0, 1000), (0.6, 3000)):
+        cfg, out, init, eq = _source_run(n_steps, 2.0, n_thermal=2000, seed=12,
+                                         alpha_macro_per_step=rate)
+        log = out[19]
+        elapsed = n_steps * cfg.reactor_dt
+        mean_rate = float(np.mean(log["alpha_rate_per_step"]))
+        assert mean_rate > 0.0
+        born_rate = log["alpha_birth_weight"] / elapsed
+        if rate == 1.0:
+            assert abs(born_rate / mean_rate - 1.0) < 1e-12, (born_rate, mean_rate)
+            assert np.all(log["alpha_per_step"] == 1)
+            # Step-0 rate from the loaded thermal D and T, independently of the loop.
+            pos0, vel0, typ0 = init
+            th = (typ0 == 0) | (typ0 == 3)
+            prof0 = compute_flux_profiles(pos0[th], vel0[th], typ0[th], eq, species_masses(cfg),
+                                          weight=weight_lut(cfg))
+            _, P0 = compute_thermal_fusion_power(prof0, cfg)
+            r0 = log["alpha_rate_updates"][0].sum()
+            assert abs(r0 / (P0 / cfg.E_FUSION_JOULES) - 1.0) < 1e-12, (r0, P0 / cfg.E_FUSION_JOULES)
+        else:
+            f = rate - int(rate)
+            sigma = np.sqrt(f * (1 - f) / n_steps) / rate
+            assert abs(born_rate / mean_rate - 1.0) < 4 * sigma, (born_rate, mean_rate, sigma)
+
+
+def test_alpha_birth_radial_distribution_matches_rates():
+    """Births land in psi_N shells in proportion to rate_k: chi-square p > 0.01
+    for 20,000 births from AlphaBirthSampler on a peaked rate profile, and for
+    the births of a loop run against the rates in force when each was born.
+    Every birth lies inside its drawn shell, and within shells the births are
+    uniform in volume (KS test of psi_N against the volume CDF, p > 0.01)."""
+    from scipy import stats
+    from physics_engine import (AlphaBirthSampler, compute_psi_normalised,
+                                compute_flux_shell_volumes)
+    cfg, eq, engine, *_ = _production_fields()
+    sampler = AlphaBirthSampler(eq)
+    nb = sampler.n_bins
+    x_c = (np.arange(nb) + 0.5) / nb
+    V = compute_flux_shell_volumes(eq)
+    rates = V * (1 - x_c) ** 2 * np.exp(-((1 - x_c) * 2.0) ** -1)   # peaked, ~0 at the edge
+    state = np.random.get_state()
+    np.random.seed(23)
+    n = 20000
+    pos, vel, shells = sampler.sample(rates, n, engine, cfg)
+    np.random.set_state(state)
+    R = np.hypot(pos[:, 0], pos[:, 1]).astype(np.float64)
+    x = compute_psi_normalised(R, pos[:, 2].astype(np.float64), eq)
+    assert np.all((x >= shells / nb - 1e-6) & (x <= (shells + 1) / nb + 1e-6)), "birth outside its shell"
+    vmag = np.linalg.norm(vel.astype(np.float64), axis=1)
+    v0 = np.sqrt(2 * cfg.ALPHA_ENERGY_JOULES / cfg.MASS_ALPHA)
+    assert np.max(np.abs(vmag / v0 - 1.0)) < 1e-6
+
+    def chi2_p(counts, expected):
+        keep = expected >= 5
+        obs = np.append(counts[keep], counts[~keep].sum())
+        exp = np.append(expected[keep], expected[~keep].sum())
+        if exp[-1] < 5:
+            obs, exp = obs[:-1], exp[:-1]
+        exp = exp * obs.sum() / exp.sum()
+        return stats.chisquare(obs, exp).pvalue
+
+    p = chi2_p(np.bincount(shells, minlength=nb).astype(float), n * rates / rates.sum())
+    assert p > 0.01, f"sampler chi-square p = {p:.4f}"
+
+    # Within shells: volume CDF on 40 sub-bins per shell, from a finer mesh.
+    sub = 40
+    Vf = compute_flux_shell_volumes(eq, n_bins=nb * sub, n_mesh=1200)
+    pf = np.repeat(rates / V, sub) * Vf
+    cdf_nodes = np.concatenate([[0.0], np.cumsum(pf) / pf.sum()])
+    grid = np.linspace(0.0, 1.0, nb * sub + 1)
+    ks = stats.kstest(np.clip(x, 0, 1), lambda q: np.interp(q, grid, cdf_nodes))
+    assert ks.pvalue > 0.01, f"within-shell KS p = {ks.pvalue:.4f} (D = {ks.statistic:.4f})"
+
+    # The loop's own births against the rates in force when each was born.
+    cfg2, out, _, _ = _source_run(3000, 2.0, n_thermal=2000, seed=12, alpha_macro_per_step=1.0)
+    log = out[19]
+    upd = log["alpha_rate_updates"]
+    probs = upd / upd.sum(axis=1, keepdims=True)
+    expected = probs[log["alpha_birth_update"]].sum(axis=0)
+    counts = np.bincount(log["alpha_birth_shells"], minlength=nb).astype(float)
+    p_loop = chi2_p(counts, expected)
+    assert p_loop > 0.01, f"loop births chi-square p = {p_loop:.4f}"
+
+
+def test_per_alpha_weights_follow_compaction_and_conserve_energy():
+    """Each macro-alpha keeps its birth weight: weights written by
+    _ParticlePool.add stay attached to their particles through wall-loss
+    compaction, and the alpha -> bulk transfer driven by those per-alpha weights
+    conserves weighted energy to 1e-12."""
+    from particle_pool import _ParticlePool
+    cfg, eq, engine, *_ = _production_fields()
+    rng = np.random.default_rng(29)
+    pool = _ParticlePool(2000, device=None, with_weight=True)
+    _, a_vel = _isotropic_alphas(cfg, 1200, rng)
+    a_pos = np.zeros_like(a_vel)
+    # Births at three epochs with three different birth weights.
+    w_epochs = (0.8e14, 1.3e14, 2.1e14)
+    for e, w in enumerate(w_epochs):
+        sl = slice(400 * e, 400 * (e + 1))
+        pool.add(a_pos[sl], a_vel[sl], 2, np.arange(400 * e, 400 * (e + 1)), np.full(400, w))
+    alive = np.sort(rng.choice(1200, 700, replace=False))
+    pool.compact(alive)
+    _, vel_v, _, pid_v = pool.views()
+    w_v = pool.weight_view()
+    assert np.array_equal(pid_v, alive)
+    assert np.array_equal(w_v, np.asarray(w_epochs)[alive // 400])
+    assert np.array_equal(vel_v, a_vel[alive])
+
+    n_b = 4000
+    b_vel = rng.normal(0.0, 3e5, (n_b, 3))
+    b_w = np.where(rng.random(n_b) < 0.8, 7.04e15, 2.06e12)
+    a1, (b1,), _ = _alpha_to_bulk_transfer(cfg, engine, vel_v, w_v.copy(),
+                                           [(b_vel, b_w, cfg.m_deuterium)], 1e-2)
+    given = _real_energy(vel_v, w_v, cfg.MASS_ALPHA) - _real_energy(a1, w_v, cfg.MASS_ALPHA)
+    received = _real_energy(b1, b_w, cfg.m_deuterium) - _real_energy(b_vel, b_w, cfg.m_deuterium)
+    assert given > 0.0 and abs(received / given - 1.0) < 1e-12, (given, received)
 
 
 # =======================================================

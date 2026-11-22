@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Alpha pitch-angle diagnostic (Tier 1, Phase 1).
 
-Follows the alpha population through the same kernels the CPU reactor loop
-uses -- injection schedule and RNG draws, reactor_cpu._push_alphas,
-compute_alpha_heating_power and check_confinement_flux -- on the production
-equilibrium, and records every
+Follows an alpha population through the same kernels the CPU reactor loop
+uses -- reactor_cpu._push_alphas, compute_alpha_heating_power and
+check_confinement_flux -- on the production equilibrium, and records every
 alpha's pitch xi = v_par/|v|, R, Z, energy, magnetic moment and birth step at
 a fixed cadence.
 
@@ -13,6 +12,11 @@ The bulk plasma is not simulated. The alphas see the bulk only through E
 loop's own end-of-run E grids instead of zero) and nothing else: collisions
 skip the alpha pool and the alpha->bulk deposit is one-way. That makes the
 alpha-only run a faithful, ~100x cheaper copy of the loop's alpha dynamics.
+
+The alphas here are injected on this tool's own fixed schedule (one every
+ALPHA_EVERY steps, Gaussian about R0_major), the Tier 1 schedule, not the
+reactor's fusion-driven source: the tool tests the pusher, so it keeps the
+population it was validated with.
 
 Variants, one switch each, so a hypothesis is tested by changing one thing:
 
@@ -38,6 +42,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 import numpy as np                                     # noqa: E402
+
+ALPHA_EVERY = 4      # this tool's fixed alpha schedule (the Tier 1 reactor schedule)
 from numba import njit, prange                         # noqa: E402
 
 from config import SimulationConfiguration             # noqa: E402
@@ -166,7 +172,7 @@ def run(args):
 
     for step in range(args.steps):
         t = step * cfg.reactor_dt
-        if step % (cfg.inject_every_n_steps * 2) == 0 and step > 0:
+        if step % ALPHA_EVERY == 0 and step > 0:
             phi_pos = np.random.uniform(0, 2 * np.pi, 1)
             R_birth = np.random.normal(cfg.R0_major, 0.05, 1)
             Z_birth = np.random.normal(0.0, 0.05, 1)

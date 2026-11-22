@@ -34,7 +34,8 @@ def _pid_capacity_bound(cfg, n_init):
 
       NBI    -- one batch per step of int(rate) plus at most one more from the
                 stochastic remainder, rate = cfg.NBI_MACRO_PER_STEP.
-      alphas -- exactly one every cfg.inject_every_n_steps * 2 steps.
+      alphas -- one batch per step of int(rate) plus at most one more,
+                rate = cfg.ALPHA_MACRO_PER_STEP.
 
     Step 8 makes this bound load-bearing in a second way: it also sizes the
     _ParticlePool row capacity, because max rows and max pid are the same
@@ -43,10 +44,9 @@ def _pid_capacity_bound(cfg, n_init):
     wrong bound surfaces immediately instead of being absorbed.
     """
     steps = int(cfg.reactor_num_steps)
-    nbi_events = steps
-    alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
     nbi_max = int(cfg.NBI_MACRO_PER_STEP) + 1
-    return int(n_init + nbi_events * nbi_max + alpha_events) + 1024
+    alpha_max = int(cfg.ALPHA_MACRO_PER_STEP) + 1
+    return int(n_init + steps * nbi_max + steps * alpha_max) + 1024
 
 
 def _require_pid_capacity(next_pid, batch, capacity, where):

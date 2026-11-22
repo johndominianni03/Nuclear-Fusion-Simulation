@@ -55,7 +55,8 @@ def initialize_reactor(cfg):
     w_beam = cfg.P_NBI_MW * 1.0e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
     cfg.WEIGHT = {0: w_thermal,     # thermal D
                   1: w_beam,        # beam D
-                  2: w_thermal,     # alpha
+                  2: 0.0,           # alpha: each macro-alpha carries its own birth weight
+                                    # in the alpha pool; the loop keeps the latest here
                   3: w_thermal}     # thermal T
     print(f"[SYSTEM] Thermal macroparticle weight: {w_thermal:.3e} ions per macroparticle "
           f"(<n> = {cfg.N_AVG_TARGET:.2e} m^-3 over {cfg.PLASMA_VOLUME_M3:.3f} m^3)")

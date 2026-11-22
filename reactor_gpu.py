@@ -20,6 +20,8 @@ from physics_engine import (
     _vectorized_boris_push_metal_dynamic,   # dynamic-shape compile, handles that churn; None if the compile failed at import
     boris_push_substeps_regather_torch,     # alpha sub-stepping (GPU), field re-gathered per sub-step
     relative_weight_lut,                    # per-species weight / thermal-D weight
+    compute_alpha_birth_rates,              # thermal D-T reactions/s per psi_N shell
+    AlphaBirthSampler,                      # shell by rate, position by rejection on psi_N
     weight_lut,
     thermal_temperature_keV,                # T from thermal D + T only
     STORED_ENERGY_SPECIES,
@@ -33,6 +35,7 @@ from profiling import (
 from particle_pool import (
     _ParticlePool,
     _pool_capacity_bounds,
+    _run_log,
 )
 from track_store import (
     _MAX_TRACKED_SLOTS,
@@ -65,19 +68,25 @@ def _push_thermal_tritium_torch(cfg, t_pos, t_vel, B_t, E_t):
     t_vel.copy_(v_tr)
 
 
-def _species_energy_and_count_torch(vel, types, mass, w_lut):
+def _species_energy_and_count_torch(vel, types, mass, w_lut, w_row=None):
     # Twin of physics_engine.species_energy_and_count: per-type sums on the device
     # (scatter-add, float32 -- MPS has no float64), returned to the host as
-    # float64 real energy [J] and real ion count indexed by type code.
+    # float64 real energy [J] and real ion count indexed by type code. w_row: one
+    # weight per row (the alpha pool) instead of the per-species lut.
     n = len(w_lut)
     if vel.shape[0] == 0:
         return np.zeros(n), np.zeros(n)
     e = 0.5 * mass * torch.sum(vel * vel, dim=1)
     idx = types.long()
+    ones = torch.ones_like(e) if w_row is None else w_row
+    if w_row is not None:
+        e = e * w_row
     E = torch.zeros(n, device=vel.device, dtype=torch.float32).scatter_add_(0, idx, e)
-    C = torch.zeros(n, device=vel.device, dtype=torch.float32).scatter_add_(0, idx, torch.ones_like(e))
-    return (E.cpu().numpy().astype(np.float64) * w_lut,
-            C.cpu().numpy().astype(np.float64) * w_lut)
+    C = torch.zeros(n, device=vel.device, dtype=torch.float32).scatter_add_(0, idx, ones)
+    E, C = E.cpu().numpy().astype(np.float64), C.cpu().numpy().astype(np.float64)
+    if w_row is None:
+        E, C = E * w_lut, C * w_lut
+    return E, C
 
 
 def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid):
@@ -150,7 +159,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     rows_t_t = torch.from_numpy(rows_t.astype(np.int64)).to(device)
     bulk_capacity, alpha_capacity, trit_capacity = _pool_capacity_bounds(cfg, len(rows_d), len(rows_t))
     bulk = _ParticlePool(bulk_capacity, device=device)
-    alpha = _ParticlePool(alpha_capacity, device=device)
+    # Per-alpha weight column: each alpha keeps the weight it was born with.
+    alpha = _ParticlePool(alpha_capacity, device=device, with_weight=True)
     trit = _ParticlePool(trit_capacity, device=device)
     bulk.add(pos_tensor[rows_d_t], vel_tensor[rows_d_t], 0, rows_d_t)
     bulk.type[:len(rows_d)] = type_tensor[rows_d_t]
@@ -162,6 +172,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     del pos_tensor, vel_tensor, type_tensor
     b_pos, b_vel, b_type, b_pid = bulk.views()
     a_pos, a_vel, a_type, a_pid = alpha.views()
+    a_wt = alpha.weight_view()
     t_pos, t_vel, t_type, t_pid = trit.views()
     # Liveness and slot assignment stay on the HOST. That is what lets the host
     # know how many rows a sample will write without asking the device, so the
@@ -209,6 +220,12 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     inventory_history, stored_energy_J = [], []
     # Source bookkeeping returned in source_log (twin of the CPU loop).
     nbi_per_step, nbi_energy_J = [], 0.0
+    # Fusion-driven alpha source (twin of the CPU loop; births are sampled on the host).
+    alpha_sampler = AlphaBirthSampler(engine.eq)
+    alpha_rates = np.zeros(alpha_sampler.n_bins)
+    w_alpha = 0.0
+    alpha_per_step, alpha_rate_per_step, alpha_birth_weight = [], [], 0.0
+    alpha_birth_shells, alpha_birth_update, alpha_rate_updates = [], [], []
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
@@ -284,32 +301,57 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("NBI injection", _t)
 
-        # --- BATCH ALPHA INJECTION ---
-        _t = prof.mark()
-        if step % (cfg.inject_every_n_steps * 2) == 0 and step > 0:
-            alpha_batch = 1
-            phi_pos = np.random.uniform(0, 2 * np.pi, alpha_batch)
-            R_birth = np.random.normal(cfg.R0_major, 0.05, alpha_batch)
-            Z_birth = np.random.normal(0.0, 0.05, alpha_batch)
-            aR, aZ, avR, avphi, avZ = engine.spawn_alpha_particles(alpha_batch, R_birth[0], Z_birth[0], cfg.ALPHA_ENERGY_JOULES, cfg.MASS_ALPHA)
 
-            p_alpha = np.zeros((alpha_batch, 3), dtype=np.float32)
-            v_alpha = np.zeros((alpha_batch, 3), dtype=np.float32)
-            p_alpha[:, 0] = aR * np.cos(phi_pos)
-            p_alpha[:, 1] = aR * np.sin(phi_pos)
-            p_alpha[:, 2] = aZ
-            v_alpha[:, 0] = avR * np.cos(phi_pos) - avphi * np.sin(phi_pos)
-            v_alpha[:, 1] = avR * np.sin(phi_pos) + avphi * np.cos(phi_pos)
-            v_alpha[:, 2] = avZ
+        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
+        # Twin of the CPU loop's block: E from thermal-ion force balance, rebuilt at
+        # step 0 and every FIELD_UPDATE_EVERY steps. The profile binning runs on the
+        # host, so the bulk pool crosses to the CPU once per update and only the two
+        # small (nR x nZ) E grids go back. No dead rows can be present here -- see
+        # the CPU twin.
+        _t = prof.mark()
+        if step % cfg.FIELD_UPDATE_EVERY == 0:
+            phi_grid, E_R_grid, E_Z_grid, _pot = update_force_balance_field(
+                cfg, engine.eq, torch.cat((b_pos, t_pos)).cpu().numpy(),
+                torch.cat((b_vel, t_vel)).cpu().numpy(), torch.cat((b_type, t_type)).cpu().numpy())
+            E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
+            E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
+            # Shell reaction rates and birth weight from the same profiles (CPU twin).
+            alpha_rates = compute_alpha_birth_rates(_pot["profile"], cfg)
+            w_alpha = float(alpha_rates.sum()) * cfg.reactor_dt / cfg.ALPHA_MACRO_PER_STEP
+            cfg.WEIGHT[2] = w_alpha
+            cfg.ALPHA_BIRTH_WEIGHT = w_alpha
+            alpha_rate_updates.append(alpha_rates.copy())
+            if step == 0:
+                print(f"[ALPHA] w_alpha = {w_alpha:.3e} alphas per macro-alpha "
+                      f"(thermal D-T rate {alpha_rates.sum():.3e} /s, "
+                      f"{cfg.ALPHA_MACRO_PER_STEP:g} macro-alphas/step)")
+        prof.add("E_r force balance", _t)
+
+        # --- FUSION-DRIVEN ALPHA BIRTHS (twin of the CPU loop) ---
+        _t = prof.mark()
+        alpha_batch = int(cfg.ALPHA_MACRO_PER_STEP)
+        a_frac = cfg.ALPHA_MACRO_PER_STEP - alpha_batch
+        if a_frac > 0.0 and np.random.random() < a_frac:
+            alpha_batch += 1
+        if w_alpha <= 0.0:
+            alpha_batch = 0
+        alpha_per_step.append(alpha_batch)
+        alpha_rate_per_step.append(float(alpha_rates.sum()))
+        if alpha_batch > 0:
+            p_alpha, v_alpha, a_shells = alpha_sampler.sample(alpha_rates, alpha_batch, engine, cfg)
+            alpha_birth_weight += alpha_batch * w_alpha
+            alpha_birth_shells.extend(a_shells.tolist())
+            alpha_birth_update.extend([len(alpha_rate_updates) - 1] * alpha_batch)
 
             _require_pid_capacity(next_pid, alpha_batch, pid_capacity, "GPU alpha injection")
             new_pids = torch.arange(next_pid, next_pid + alpha_batch, device=device, dtype=torch.int64)
             base_row = alpha.add(
                 torch.tensor(p_alpha, device=device, dtype=torch.float32),
                 torch.tensor(v_alpha, device=device, dtype=torch.float32),
-                2, new_pids)
+                2, new_pids,
+                torch.full((alpha_batch,), w_alpha, device=device, dtype=torch.float32))
             a_pos, a_vel, a_type, a_pid = alpha.views()
-
+            a_wt = alpha.weight_view()
             pid_row_t[new_pids] = torch.arange(base_row, base_row + alpha_batch,
                                                device=device, dtype=torch.int64)
             pid_pool[next_pid:next_pid + alpha_batch] = 1
@@ -324,23 +366,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 tracked_alphas += n_new
 
             next_pid += alpha_batch
-
-        prof.add("alpha injection", _t)
-
-        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
-        # Twin of the CPU loop's block: E from thermal-ion force balance, rebuilt at
-        # step 0 and every FIELD_UPDATE_EVERY steps. The profile binning runs on the
-        # host, so the bulk pool crosses to the CPU once per update and only the two
-        # small (nR x nZ) E grids go back. No dead rows can be present here -- see
-        # the CPU twin.
-        _t = prof.mark()
-        if step % cfg.FIELD_UPDATE_EVERY == 0:
-            phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
-                cfg, engine.eq, torch.cat((b_pos, t_pos)).cpu().numpy(),
-                torch.cat((b_vel, t_vel)).cpu().numpy(), torch.cat((b_type, t_type)).cpu().numpy())
-            E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
-            E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
-        prof.add("E_r force balance", _t)
+        prof.add("alpha births", _t)
 
         _t = prof.mark()
         # --- E-FIELD GATHER + ANALYTIC B-FIELD (GPU, torch.compile'd, dynamic shapes) ---
@@ -469,6 +495,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             b_pos, b_vel, b_type, b_pid = bulk.views()
             a_pos, a_vel, a_type, a_pid = alpha.views()
+            a_wt = alpha.weight_view()
             t_pos, t_vel, t_type, t_pid = trit.views()
             # Renumber the device-side pid -> row map for whichever pools moved.
             # pid_pool is untouched -- rows move, pools do not.
@@ -532,7 +559,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             # energy transfer below.
             # Weighted: sum(w_a dE) / w_thermal, the real energy given up.
             new_energies_kev, alpha_deposited_kev = compute_alpha_heating_power_torch(
-                alpha_energies_kev, cfg.reactor_dt, cfg, rel_weights=rel_w_t[a_type.long()])
+                alpha_energies_kev, cfg.reactor_dt, cfg, rel_weights=a_wt / float(w_lut[0]))
             new_v_mags = torch.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
             safe_v_mags = torch.where(v_mags == 0, torch.full_like(v_mags, 1e-10), v_mags)
             scale_factors = new_v_mags / safe_v_mags
@@ -563,7 +590,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # --- STORED ENERGY AND REAL ION COUNT PER SPECIES (twin of the CPU loop) ---
         E_spec, N_spec = _species_energy_and_count_torch(b_vel, b_type, cfg.m_deuterium, w_lut)
         E_t_, N_t_ = _species_energy_and_count_torch(t_vel, t_type, cfg.m_tritium, w_lut)
-        E_a_, N_a_ = _species_energy_and_count_torch(a_vel, a_type, cfg.MASS_ALPHA, w_lut)
+        E_a_, N_a_ = _species_energy_and_count_torch(a_vel, a_type, cfg.MASS_ALPHA, w_lut, w_row=a_wt)
         E_spec = E_spec + E_t_ + E_a_
         N_spec = N_spec + N_t_ + N_a_
         stored_energy_J.append(E_spec[stored_cols])
@@ -650,7 +677,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         if (step + 1) % 500 == 0:
             max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V")
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
 
     if profiling:
         if _sync is not None:
@@ -670,13 +697,17 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     vel_all = torch.cat((b_vel, a_vel, t_vel), dim=0).cpu().numpy()
     type_all = torch.cat((b_type, a_type, t_type), dim=0).cpu().numpy()
     pid_all = torch.cat((b_pid, a_pid, t_pid), dim=0).cpu().numpy()
+    # Real ions per row: the species weight for D and T, each alpha's own.
+    weight_all = np.concatenate((w_lut[b_type.cpu().numpy()], a_wt.cpu().numpy().astype(np.float64),
+                                 w_lut[t_type.cpu().numpy()]))
     legacy_order = np.argsort(pid_all, kind="stable")
     pos_np = np.ascontiguousarray(pos_all[legacy_order])
     vel_np = np.ascontiguousarray(vel_all[legacy_order])
     type_np = np.ascontiguousarray(type_all[legacy_order])
+    weight_np = np.ascontiguousarray(weight_all[legacy_order])
 
     # End-of-run ion density map: weighted CIC of every live ion, computed once.
-    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np)
+    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np, weights=weight_np)
 
     # Flat-array accumulation -> the dict payload, once. This is the only place
     # the sampled vertices and the device-side last_pos/last_vel cross to the host.
@@ -688,5 +719,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
             temp_history, trigger_time, T_core,
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
-            {"nbi_per_step": np.asarray(nbi_per_step, dtype=np.int64),
-             "nbi_energy_J": float(nbi_energy_J)})
+            _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
+                     alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
+                     alpha_rate_updates, weight_np))

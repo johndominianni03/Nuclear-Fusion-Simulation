@@ -15,6 +15,8 @@ from physics_engine import (
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
     relative_weight_lut,                    # per-species weight / thermal-D weight
+    compute_alpha_birth_rates,              # thermal D-T reactions/s per psi_N shell
+    AlphaBirthSampler,                      # shell by rate, position by rejection on psi_N
     weight_lut,
     species_energy_and_count,               # real J and real ion count per species
     thermal_temperature_keV,                # T from thermal D + T only
@@ -36,6 +38,7 @@ from kernels import (
 from particle_pool import (
     _ParticlePool,
     _pool_capacity_bounds,
+    _run_log,
 )
 from track_store import (
     _MAX_TRACKED_SLOTS,
@@ -147,7 +150,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     rows_t = np.nonzero(is_trit)[0]
     bulk_capacity, alpha_capacity, trit_capacity = _pool_capacity_bounds(cfg, len(rows_d), len(rows_t))
     bulk = _ParticlePool(bulk_capacity, device=None)
-    alpha = _ParticlePool(alpha_capacity, device=None)
+    # The alpha pool carries a weight per alpha: each keeps the weight it was born with.
+    alpha = _ParticlePool(alpha_capacity, device=None, with_weight=True)
     trit = _ParticlePool(trit_capacity, device=None)
     bulk.add(pos_init[rows_d], vel_init[rows_d], 0, rows_d.astype(np.int64))
     bulk.type[:len(rows_d)] = type_init[rows_d]   # preserve any non-zero D species from init
@@ -158,6 +162,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pid_pool[rows_t] = 2
     b_pos, b_vel, b_type, b_pid = bulk.views()
     a_pos, a_vel, a_type, a_pid = alpha.views()
+    a_wt = alpha.weight_view()
     t_pos, t_vel, t_type, t_pid = trit.views()
 
     # 500 thermal D + 500 thermal T + the 1000-each NBI and alpha caps below.
@@ -207,6 +212,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # Source bookkeeping returned in source_log: beam macroparticles injected each
     # step and the weighted kinetic energy they carried in.
     nbi_per_step, nbi_energy_J = [], 0.0
+    # Fusion-driven alpha source: shell rates and the birth weight are refreshed at
+    # every field update; alpha_log records what was born and from which rates.
+    alpha_sampler = AlphaBirthSampler(engine.eq)
+    alpha_rates = np.zeros(alpha_sampler.n_bins)
+    w_alpha = 0.0
+    alpha_per_step, alpha_rate_per_step, alpha_birth_weight = [], [], 0.0
+    alpha_birth_shells, alpha_birth_update, alpha_rate_updates = [], [], []
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
@@ -275,28 +287,55 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("NBI injection", _t)
 
-        # --- BATCH ALPHA INJECTION ---
-        _t = prof.mark()
-        if step % (cfg.inject_every_n_steps * 2) == 0 and step > 0:
-            alpha_batch = 1
-            phi_pos = np.random.uniform(0, 2 * np.pi, alpha_batch)
-            R_birth = np.random.normal(cfg.R0_major, 0.05, alpha_batch)
-            Z_birth = np.random.normal(0.0, 0.05, alpha_batch)
-            aR, aZ, avR, avphi, avZ = engine.spawn_alpha_particles(alpha_batch, R_birth[0], Z_birth[0], cfg.ALPHA_ENERGY_JOULES, cfg.MASS_ALPHA)
 
-            p_alpha = np.zeros((alpha_batch, 3), dtype=np.float32)
-            v_alpha = np.zeros((alpha_batch, 3), dtype=np.float32)
-            p_alpha[:, 0] = aR * np.cos(phi_pos)
-            p_alpha[:, 1] = aR * np.sin(phi_pos)
-            p_alpha[:, 2] = aZ
-            v_alpha[:, 0] = avR * np.cos(phi_pos) - avphi * np.sin(phi_pos)
-            v_alpha[:, 1] = avR * np.sin(phi_pos) + avphi * np.cos(phi_pos)
-            v_alpha[:, 2] = avZ
+        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
+        # E from thermal-ion (D + T) radial force balance (no rotation), rebuilt from
+        # the current bulk-D and tritium pools at step 0 and every FIELD_UPDATE_EVERY
+        # steps. The pools are all-live here (the compaction below removes every -1
+        # each step). Twin: the same call in reactor_gpu on host copies of the pools.
+        _t = prof.mark()
+        if step % cfg.FIELD_UPDATE_EVERY == 0:
+            phi_grid, E_R_grid, E_Z_grid, _pot = update_force_balance_field(
+                cfg, engine.eq, np.concatenate((b_pos, t_pos)), np.concatenate((b_vel, t_vel)),
+                np.concatenate((b_type, t_type)))
+            # The same thermal profiles give the D-T reaction rate per shell, and the
+            # birth weight that makes ALPHA_MACRO_PER_STEP macro-alphas per step carry
+            # the computed total rate.
+            alpha_rates = compute_alpha_birth_rates(_pot["profile"], cfg)
+            w_alpha = float(alpha_rates.sum()) * cfg.reactor_dt / cfg.ALPHA_MACRO_PER_STEP
+            cfg.WEIGHT[2] = w_alpha
+            cfg.ALPHA_BIRTH_WEIGHT = w_alpha
+            alpha_rate_updates.append(alpha_rates.copy())
+            if step == 0:
+                print(f"[ALPHA] w_alpha = {w_alpha:.3e} alphas per macro-alpha "
+                      f"(thermal D-T rate {alpha_rates.sum():.3e} /s, "
+                      f"{cfg.ALPHA_MACRO_PER_STEP:g} macro-alphas/step)")
+        prof.add("E_r force balance", _t)
+
+        # --- FUSION-DRIVEN ALPHA BIRTHS ---
+        # ALPHA_MACRO_PER_STEP per step (fractional part stochastic), each of weight
+        # w_alpha, born in a shell drawn by rate_k at a rejection-sampled position,
+        # isotropic at 3.5 MeV. No reactions (zero rate) -> no births.
+        _t = prof.mark()
+        alpha_batch = int(cfg.ALPHA_MACRO_PER_STEP)
+        a_frac = cfg.ALPHA_MACRO_PER_STEP - alpha_batch
+        if a_frac > 0.0 and np.random.random() < a_frac:
+            alpha_batch += 1
+        if w_alpha <= 0.0:
+            alpha_batch = 0
+        alpha_per_step.append(alpha_batch)
+        alpha_rate_per_step.append(float(alpha_rates.sum()))
+        if alpha_batch > 0:
+            p_alpha, v_alpha, a_shells = alpha_sampler.sample(alpha_rates, alpha_batch, engine, cfg)
+            alpha_birth_weight += alpha_batch * w_alpha
+            alpha_birth_shells.extend(a_shells.tolist())
+            alpha_birth_update.extend([len(alpha_rate_updates) - 1] * alpha_batch)
 
             _require_pid_capacity(next_pid, alpha_batch, pid_capacity, "CPU alpha injection")
             new_pids = np.arange(next_pid, next_pid + alpha_batch, dtype=np.int64)
-            base_row = alpha.add(p_alpha, v_alpha, 2, new_pids)
+            base_row = alpha.add(p_alpha, v_alpha, 2, new_pids, np.full(alpha_batch, w_alpha))
             a_pos, a_vel, a_type, a_pid = alpha.views()
+            a_wt = alpha.weight_view()
             pid_row[new_pids] = np.arange(base_row, base_row + alpha_batch,
                                           dtype=np.int64)
             pid_pool[new_pids] = 1
@@ -309,20 +348,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                                          a_pos[rows], a_vel[rows])
                 pid_slot[new_pids[:n_new]] = slots
                 tracked_alphas += n_new
-
-        prof.add("alpha injection", _t)
-
-        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
-        # E from thermal-ion (D + T) radial force balance (no rotation), rebuilt from
-        # the current bulk-D and tritium pools at step 0 and every FIELD_UPDATE_EVERY
-        # steps. The pools are all-live here (the compaction below removes every -1
-        # each step). Twin: the same call in reactor_gpu on host copies of the pools.
-        _t = prof.mark()
-        if step % cfg.FIELD_UPDATE_EVERY == 0:
-            phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
-                cfg, engine.eq, np.concatenate((b_pos, t_pos)), np.concatenate((b_vel, t_vel)),
-                np.concatenate((b_type, t_type)))
-        prof.add("E_r force balance", _t)
+        prof.add("alpha births", _t)
 
         # Bulk gather. The alphas gather inside their sub-step push below.
         _t = prof.mark()
@@ -451,6 +477,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             b_pos, b_vel, b_type, b_pid = bulk.views()
             a_pos, a_vel, a_type, a_pid = alpha.views()
+            a_wt = alpha.weight_view()
             t_pos, t_vel, t_type, t_pid = trit.views()
             # Rebuild the row map for whichever pools moved. pid_pool is NOT
             # touched: a particle cannot change pool, only rows move.
@@ -504,7 +531,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         alpha_deposited_kev = 0.0
         if alpha.n_live > 0:
             alpha_vels = a_vel.astype(np.float64)
-            alpha_deposited_kev = drain_alpha_energy(engine, cfg, alpha_vels, rel_w[a_type],
+            # Per-alpha weights, relative to the thermal-D weight like the bulk's.
+            alpha_deposited_kev = drain_alpha_energy(engine, cfg, alpha_vels, a_wt / w_lut[0],
                                                      cfg.reactor_dt)
             a_vel[:] = alpha_vels.astype(np.float32)
 
@@ -538,7 +566,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # bincount per pool (alphas included, after this step's drag).
         E_spec, N_spec = species_energy_and_count(b_vel, b_type, cfg.m_deuterium, w_lut)
         E_t_, N_t_ = species_energy_and_count(t_vel, t_type, cfg.m_tritium, w_lut)
-        E_a_, N_a_ = species_energy_and_count(a_vel, a_type, cfg.MASS_ALPHA, w_lut)
+        E_a_, N_a_ = species_energy_and_count(a_vel, a_type, cfg.MASS_ALPHA, w_lut, w_row=a_wt)
         E_spec = E_spec + E_t_ + E_a_
         N_spec = N_spec + N_t_ + N_a_
         stored_energy_J.append(E_spec[stored_cols])
@@ -624,7 +652,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         if (step + 1) % 500 == 0:
             max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V")
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
 
     if profiling:
         loop_wall = time.perf_counter() - loop_wall_start
@@ -648,13 +676,16 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     vel_np = np.concatenate((b_vel, a_vel, t_vel), axis=0)
     type_np = np.concatenate((b_type, a_type, t_type), axis=0)
     pid_all = np.concatenate((b_pid, a_pid, t_pid), axis=0)
+    # Real ions per row: the species weight for D and T, each alpha's own.
+    weight_np = np.concatenate((w_lut[b_type], a_wt, w_lut[t_type]))
     legacy_order = np.argsort(pid_all, kind="stable")
     pos_np = np.ascontiguousarray(pos_np[legacy_order])
     vel_np = np.ascontiguousarray(vel_np[legacy_order])
     type_np = np.ascontiguousarray(type_np[legacy_order])
+    weight_np = np.ascontiguousarray(weight_np[legacy_order])
 
     # End-of-run ion density map: weighted CIC of every live ion, computed once.
-    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np)
+    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np, weights=weight_np)
 
     # Tracked-particle metadata is returned as pid-keyed dicts, which removal cannot
     # corrupt -- row indices no longer survive a step now that losses are compacted out.
@@ -668,5 +699,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
             temp_history, trigger_time, T_core,
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
-            {"nbi_per_step": np.asarray(nbi_per_step, dtype=np.int64),
-             "nbi_energy_J": float(nbi_energy_J)})
+            _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
+                     alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
+                     alpha_rate_updates, weight_np))
