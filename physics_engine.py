@@ -80,56 +80,6 @@ class ParticlePusher:
 
         return positions, velocities
 
-    def compute_fluid_moments(self, active_particles, R_min, R_max, Z_min, Z_max, num_bins):
-        # 0th (density) and 2nd (pressure) fluid moments, by binning particles radially.
-        R_edges = np.linspace(R_min, R_max, num_bins + 1)
-        R_centers = 0.5 * (R_edges[:-1] + R_edges[1:])
-        
-        density_profile = np.zeros(num_bins)
-        pressure_profile = np.zeros(num_bins)
-        
-        # Positions and velocities of confined particles
-        R_pos = []
-        vels = []
-        for p in active_particles:
-            if p["status"] == "confined":
-                r = np.sqrt(p["pos"][0]**2 + p["pos"][1]**2)
-                R_pos.append(r)
-                vels.append(p["vel"])
-                
-        R_pos = np.array(R_pos)
-        vels = np.array(vels)
-        
-        if len(R_pos) == 0:
-            return R_centers, density_profile, pressure_profile
-            
-        # Bin radially into fluid rings
-        bin_indices = np.digitize(R_pos, R_edges) - 1
-        
-        for i in range(num_bins):
-            mask = (bin_indices == i)
-            v_in_bin = vels[mask]
-            count = len(v_in_bin)
-            
-            # Cylindrical shell volume
-            V_shell = np.pi * (R_edges[i+1]**2 - R_edges[i]**2) * (Z_max - Z_min)
-
-            if count > 0:
-                # 0th moment: density n(r)
-                n_e = count / V_shell
-                density_profile[i] = n_e
-
-                # 1st moment: bulk velocity u(r)
-                u_bulk = np.mean(v_in_bin, axis=0)
-
-                # 2nd moment: pressure P(r) = (m / 3V) * sum((v - u)^2)
-                v_random_sq = np.sum((v_in_bin - u_bulk)**2, axis=1)
-                P = (self.m / (3.0 * V_shell)) * np.sum(v_random_sq)
-                
-                pressure_profile[i] = P
-                
-        return R_centers, density_profile, pressure_profile
-
     # ====================================================
     # ALPHA PARTICLE SPAWNING & KINEMATICS
     # ====================================================

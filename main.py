@@ -114,21 +114,6 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
 
     prof.add("pkg: history_tracks -> mock_active/mock_alphas", _t)
 
-    # NOTE: this builds one Python dict per surviving particle, then
-    # compute_fluid_moments walks that list in Python. There is no
-    # array-based path here yet, so at 1M particles both lines below are a
-    # real chunk of wall clock -- they are timed separately to make that
-    # visible rather than to hide it inside one "packaging" number.
-    _t = prof.mark()
-    final_active = [{"status": "confined", "pos": p, "vel": v} for p, v, typ in zip(pos_np, vel_np, type_np) if typ != -1]
-    prof.add("pkg: final_active (dict per particle)", _t)
-
-    _t = prof.mark()
-    R_centers, density_profile, pressure_profile = engine.compute_fluid_moments(
-        final_active, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.num_radial_bins
-    )
-    prof.add("pkg: compute_fluid_moments", _t)
-
     # --- TRUE v_parallel FOR THE PHASE-SPACE MAP ---
     # (x*vy - y*vx)/R is v_TOROIDAL, which only equals v_parallel if B is purely toroidal
     # -- and pitch angle against the ACTUAL field line is the whole quantity separating
@@ -182,10 +167,6 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     return {
         "mock_active": mock_active,
         "mock_alphas": mock_alphas,
-        "final_active": final_active,
-        "R_centers": R_centers,
-        "density_profile": density_profile,
-        "pressure_profile": pressure_profile,
         "R_phase": R_phase,
         "v_parallel_phase": v_parallel_phase,
         "species_phase": species_phase,
@@ -206,9 +187,8 @@ def run_reactor_steady_state(save_plots=None):
     plots out of a profiling run, False to suppress them in a normal one.
 
     The diagnostic *computation* is deliberately not gated:
-    package_reactor_results (final_active, compute_fluid_moments, the
-    phase-space projection) runs either way, so profile numbers stay
-    comparable to the step 4/5/6 baselines.
+    package_reactor_results (flux-surface profiles, fusion power, the
+    phase-space projection) runs either way.
     """
     print("==================================================")
     print("      PIC FULL CYCLE (LORENTZ PUSH)      ")
@@ -275,9 +255,6 @@ def run_reactor_steady_state(save_plots=None):
         outer.report(title="STAGE TIMING -- out-of-loop phases")
     mock_active = packaged["mock_active"]
     mock_alphas = packaged["mock_alphas"]
-    R_centers = packaged["R_centers"]
-    density_profile = packaged["density_profile"]
-    pressure_profile = packaged["pressure_profile"]
     R_phase = packaged["R_phase"]
     v_parallel_phase = packaged["v_parallel_phase"]
     P_fusion_grid = packaged["P_fusion_grid"]
@@ -292,7 +269,6 @@ def run_reactor_steady_state(save_plots=None):
         diagnostics.run_steady_state_diagnostics(
             cfg, eq, rho_grid, phi_grid, energy_history_keV, 
             mock_active, total_injected, total_lost, inventory_history,
-            R_centers, density_profile, pressure_profile,
             R_phase, v_parallel_phase, P_fusion_grid,
             alpha_particles=mock_alphas,
             lawson_history=lawson_triple_product_history,

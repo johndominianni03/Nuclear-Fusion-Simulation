@@ -88,7 +88,7 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
-def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_centers=None, density_profile=None, pressure_profile=None, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
+def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
                                  n_ion_grid=None, flux_profiles=None, total_fusion_power_watts=None, species_phase=None):
     
     rho_grid = _scrub_grid(rho_grid)

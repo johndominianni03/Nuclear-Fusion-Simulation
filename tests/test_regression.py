@@ -268,9 +268,6 @@ def run_pipeline(quiet=True):
         "phi_grid": np.asarray(phi_grid_out, dtype=np.float64),
 
         # --- packaged plot inputs
-        "R_centers": _f(packaged["R_centers"]),
-        "density_profile": _f(packaged["density_profile"]),
-        "pressure_profile": _f(packaged["pressure_profile"]),
         "R_phase": _f(packaged["R_phase"]),
         "v_parallel_phase": _f(packaged["v_parallel_phase"]),
         "P_fusion_grid": np.asarray(packaged["P_fusion_grid"], dtype=np.float64),

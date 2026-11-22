@@ -58,9 +58,6 @@ class SimulationConfiguration:
         # plot stays aliased however finely the pusher integrates.
         self.ALPHA_HISTORY_EVERY = 2
 
-        # --- Radial Fluid Bins ---
-        self.num_radial_bins = 50
-
         # --- MHD INSTABILITIES & TEARING MODES ---
         self.b_perturb_initial = 1e-4   # Seed magnetic island amplitude (T)
         self.m_mode = 2                 # Poloidal mode number
