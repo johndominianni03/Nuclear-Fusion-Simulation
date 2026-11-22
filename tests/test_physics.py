@@ -676,6 +676,98 @@ def test_fusion_power_with_equal_d_t_equals_old_formula():
 
 
 # =======================================================
+# TIER 2 PHASE 3 -- thermal diagnostics separate from beam ions
+# =======================================================
+@functools.lru_cache(maxsize=None)
+def _one_step_run(n_beam):
+    """A production-size load (50,000 thermals, seed 8) plus n_beam 50 keV beam
+    ions appended as type 1, run through reactor_cpu._run_reactor_loop_cpu for
+    one step. Returns (cfg, loop output, initial types)."""
+    import torch
+    from config import SimulationConfiguration
+    import initialization
+    import reactor_cpu
+    from physics_engine import compute_poloidal_field_grids
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = SimulationConfiguration()
+        cfg.reactor_num_steps = 1
+        state = np.random.get_state()
+        np.random.seed(8)
+        eq, engine, p, v, t, rho, phi, ER, EZ = initialization.initialize_reactor(cfg)
+        if n_beam:
+            psi_b = (eq.psi_grid, eq.psi_core, eq.psi_R_min, eq.psi_R_max,
+                     eq.psi_Z_min, eq.psi_Z_max, eq.psi_nR, eq.psi_nZ)
+            pb, vb = engine.inject_neutral_beam_cartesian(n_beam, E_keV=cfg.nbi_energy_keV, psi_bounds=psi_b)
+            p = torch.cat((p, torch.tensor(pb, dtype=torch.float32, device=p.device)))
+            v = torch.cat((v, torch.tensor(vb, dtype=torch.float32, device=v.device)))
+            t = torch.cat((t, torch.ones(n_beam, dtype=torch.int32, device=t.device)))
+        np.random.set_state(state)
+        B_R, B_Z, _, _ = compute_poloidal_field_grids(
+            eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
+            dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min,
+            dst_Z_max=cfg.Z_max, dst_nR=cfg.nR, dst_nZ=cfg.nZ)
+        types0 = t.cpu().numpy().copy()
+        out = reactor_cpu._run_reactor_loop_cpu(cfg, engine, p, v, t, rho, phi, ER, EZ, B_R, B_Z)
+    return cfg, eq, out, types0
+
+
+def _loaded_density_weighted_T(eq, T0, n_mesh=800):
+    """<T>_n = int n T dV / int n dV for the loaded n, T proportional to (1 - psi_N),
+    on a fine (R, Z) mesh with dV = 2 pi R dR dZ."""
+    from physics_engine import compute_psi_normalised
+    Rc = eq.psi_R_min + (np.arange(n_mesh) + 0.5) * (eq.psi_R_max - eq.psi_R_min) / n_mesh
+    Zc = eq.psi_Z_min + (np.arange(n_mesh) + 0.5) * (eq.psi_Z_max - eq.psi_Z_min) / n_mesh
+    RR, ZZ = np.meshgrid(Rc, Zc, indexing="ij")
+    x = compute_psi_normalised(RR, ZZ, eq)
+    w = np.where(x <= 1.0, (1.0 - x) * RR, 0.0)
+    return T0 * float(np.sum(w * (1.0 - np.minimum(x, 1.0))) / np.sum(w))
+
+
+def test_T_core_of_fresh_plasma_is_loaded_density_weighted_temperature():
+    """The loop's T_core at step 0 (temp_history[0]) equals the density-weighted
+    temperature of the loaded thermal profiles, <T>_n = T0 int (1-x)^2 dV /
+    int (1-x) dV, within 4 sigma of counting noise (sigma from the spread of
+    (2/3) E_i over the 50,000 loaded thermals)."""
+    from physics_engine import e_charge
+    cfg, eq, out, types0 = _one_step_run(0)
+    pos, vel, typ = out[0], out[1], out[2]
+    T_core0 = out[12][0]
+    expect = _loaded_density_weighted_T(eq, cfg.T_thermal_keV)
+    th = (typ == 0) | (typ == 3)
+    m = np.where(typ[th] == 3, cfg.m_tritium, cfg.m_deuterium)
+    t_i = (2.0 / 3.0) * 0.5 * m * np.sum(vel[th].astype(np.float64) ** 2, axis=1) / (e_charge * 1e3)
+    sigma = float(np.std(t_i)) / np.sqrt(th.sum())
+    assert abs(T_core0 - expect) < 4.0 * sigma, \
+        f"T_core {T_core0:.5f} keV vs loaded <T>_n {expect:.5f} keV (sigma {sigma:.5f})"
+
+
+def test_beam_ions_do_not_change_T_core():
+    """Adding 5,000 beam ions (50 keV, ~100x the thermal energy each) to the same
+    load leaves T_core unchanged, and the per-species stored energy columns are
+    the weighted kinetic energies of each species. Collisions run in the loop
+    (prange thread chunking moves with the beam rows and re-randomised velocities
+    are rebuilt in float32), so "unchanged" is 1e-9, not bit equality."""
+    from physics_engine import STORED_ENERGY_SPECIES
+    cfg0, _, out0, _ = _one_step_run(0)
+    cfg1, _, out1, _ = _one_step_run(5000)
+    T0, T1 = out0[12][0], out1[12][0]
+    assert abs(T1 / T0 - 1.0) < 1e-9, f"T_core {T0:.12f} -> {T1:.12f} keV with beam ions"
+
+    stored = out1[11]                                # (steps, 4), joules
+    vel, typ = out1[1].astype(np.float64), out1[2]
+    masses = {0: cfg1.m_deuterium, 1: cfg1.m_deuterium, 2: cfg1.MASS_ALPHA, 3: cfg1.m_tritium}
+    for col, (code, label) in enumerate(STORED_ENERGY_SPECIES):
+        sel = typ == code
+        expect = cfg1.WEIGHT[code] * float(np.sum(0.5 * masses[code] * np.sum(vel[sel] ** 2, axis=1)))
+        got = float(stored[0, col])
+        if expect == 0.0:
+            assert got == 0.0, (label, got)
+        else:
+            assert abs(got / expect - 1.0) < 1e-12, (label, got, expect)
+    assert stored[0, 2] > stored[0, 0] * 1e-3            # the beam column is populated
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":

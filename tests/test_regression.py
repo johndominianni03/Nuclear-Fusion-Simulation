@@ -233,7 +233,7 @@ def run_pipeline(quiet=True):
 
         (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos,
          tracked_lastvel, tracked_lost, total_injected, total_lost,
-         inventory_history, energy_history_keV,
+         inventory_history, stored_energy_J,
          temp_history, trigger_time, T_core,
          lawson_triple_product_history, _lawson_first_measured_step,
          rho_grid_out, phi_grid_out) = loop_out
@@ -248,7 +248,7 @@ def run_pipeline(quiet=True):
     data = {
         # --- diagnostic time series
         "inventory_history": _f(inventory_history),
-        "energy_history_keV": _f(energy_history_keV),
+        "stored_energy_J": _f(stored_energy_J),
         "temp_history": _f(temp_history),
         "lawson_triple_product_history": _f(lawson_triple_product_history),
 

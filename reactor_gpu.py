@@ -20,6 +20,9 @@ from physics_engine import (
     _vectorized_boris_push_metal_dynamic,   # dynamic-shape compile, handles that churn; None if the compile failed at import
     boris_push_substeps_regather_torch,     # alpha sub-stepping (GPU), field re-gathered per sub-step
     relative_weight_lut,                    # per-species weight / thermal-D weight
+    weight_lut,
+    thermal_temperature_keV,                # T from thermal D + T only
+    STORED_ENERGY_SPECIES,
 )
 from profiling import (
     StageProfiler,
@@ -60,6 +63,21 @@ def _push_thermal_tritium_torch(cfg, t_pos, t_vel, B_t, E_t):
     p_tr, v_tr = _push(t_pos, t_vel, cfg.e_charge, cfg.m_tritium, B_t, E_t, cfg.reactor_dt)
     t_pos.copy_(p_tr)
     t_vel.copy_(v_tr)
+
+
+def _species_energy_and_count_torch(vel, types, mass, w_lut):
+    # Twin of physics_engine.species_energy_and_count: per-type sums on the device
+    # (scatter-add, float32 -- MPS has no float64), returned to the host as
+    # float64 real energy [J] and real ion count indexed by type code.
+    n = len(w_lut)
+    if vel.shape[0] == 0:
+        return np.zeros(n), np.zeros(n)
+    e = 0.5 * mass * torch.sum(vel * vel, dim=1)
+    idx = types.long()
+    E = torch.zeros(n, device=vel.device, dtype=torch.float32).scatter_add_(0, idx, e)
+    C = torch.zeros(n, device=vel.device, dtype=torch.float32).scatter_add_(0, idx, torch.ones_like(e))
+    return (E.cpu().numpy().astype(np.float64) * w_lut,
+            C.cpu().numpy().astype(np.float64) * w_lut)
 
 
 def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid):
@@ -181,10 +199,14 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # device. Twin of the CPU loop's rel_w: energies and counts below read in
     # thermal-D macroparticle units. Equal weights make every entry 1.0.
     rel_w_t = torch.tensor(relative_weight_lut(cfg), device=device, dtype=torch.float32)
+    w_lut = weight_lut(cfg)
+    stored_cols = np.array([code for code, _ in STORED_ENERGY_SPECIES], dtype=np.int64)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
-    inventory_history, energy_history_keV = [], []
+    # stored_energy_J: one row per step, real kinetic energy [J] per species in
+    # STORED_ENERGY_SPECIES order (thermal D, thermal T, beam D, alpha).
+    inventory_history, stored_energy_J = [], []
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
@@ -533,27 +555,19 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 b_vel.copy_(b_vel * boost)
                 t_vel.copy_(t_vel * boost)
 
-        # Weighted macroparticle count of the bulk-D + tritium ions (thermal-D units).
-        r_sum = (float(r_b.sum().item()) if bulk.n_live > 0 else 0.0) \
-            + (float(r_t.sum().item()) if trit.n_live > 0 else 0.0)
-        current_energy_joules = 0.0
-        if bulk.n_live > 0:
-            current_energy_joules += float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
-        if trit.n_live > 0:
-            current_energy_joules += float((r_t * (0.5 * cfg.m_tritium * torch.sum(t_vel**2, dim=1))).sum().item())
-
-        current_energy_keV = current_energy_joules / (cfg.e_charge * 1000.0)
-        energy_history_keV.append(current_energy_keV)
+        # --- STORED ENERGY AND REAL ION COUNT PER SPECIES (twin of the CPU loop) ---
+        E_spec, N_spec = _species_energy_and_count_torch(b_vel, b_type, cfg.m_deuterium, w_lut)
+        E_t_, N_t_ = _species_energy_and_count_torch(t_vel, t_type, cfg.m_tritium, w_lut)
+        E_a_, N_a_ = _species_energy_and_count_torch(a_vel, a_type, cfg.MASS_ALPHA, w_lut)
+        E_spec = E_spec + E_t_ + E_a_
+        N_spec = N_spec + N_t_ + N_a_
+        stored_energy_J.append(E_spec[stored_cols])
 
         current_amp = cfg.b_perturb_initial * np.exp(cfg.gamma_growth * t)
 
-        # --- T_core IS A TEMPERATURE, NOT A TOTAL ---
-        # Assigning the plasma's TOTAL stored energy here made the "core temperature"
-        # read ~50,000 keV, and every consumer (the Lawson triple product, the
-        # quench baseline) was fed that. For a 3D Maxwellian
-        # <E> = (3/2)kT, so kT = (2/3) * <E>, with <E> per real ion (weighted).
-        n_bulk = max(r_sum, 1.0)
-        T_core_kinetic = (2.0 / 3.0) * (current_energy_keV / n_bulk)
+        # --- T_core IS THE THERMAL-ION TEMPERATURE ---
+        # (2/3) <E> per real thermal ion, thermal D and T only (twin of the CPU loop).
+        T_core_kinetic = thermal_temperature_keV(E_spec, N_spec)
 
         if current_amp > cfg.MAX_ISLAND_WIDTH_THRESHOLD and not cfg.SPI_TRIGGERED:
             cfg.SPI_TRIGGERED = True
@@ -564,9 +578,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             print(f"  [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
 
         # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
-        # T_core is the kinetic temperature of the bulk in both regimes, before and
-        # after the SPI trigger, so a quench shows up only because the drain below
-        # removes energy from the particles.
+        # T_core is the kinetic temperature of the thermal ions in both regimes,
+        # before and after the SPI trigger, so a quench shows up only because the
+        # drain below removes energy from the particles.
         T_core = T_core_kinetic
 
         if cfg.SPI_TRIGGERED:
@@ -610,7 +624,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("alpha heating + energy transfer", _t)
 
-        # energy_history_keV / T_core_kinetic above are recorded BEFORE the drain, which
+        # stored_energy_J / T_core_kinetic above are recorded BEFORE the drain, which
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
         # ledger, not retroactively in this one.
         _t = prof.mark()
@@ -618,10 +632,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined real ion count (weighted
-        # macroparticle count times WEIGHT[0]) over the psi_edge volume. Units:
-        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
-        n_e_reactor = (r_sum * cfg.WEIGHT[0]) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the weighted thermal-ion density: real
+        # thermal D + T count over the psi_edge volume (twin of the CPU loop).
+        n_e_reactor = (N_spec[0] + N_spec[3]) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
@@ -667,6 +680,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     return (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
             tracked_lost,
             total_injected, total_lost,
-            inventory_history, energy_history_keV,
+            inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
             temp_history, trigger_time, T_core,
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid)

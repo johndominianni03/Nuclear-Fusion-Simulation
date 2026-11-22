@@ -88,14 +88,15 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # =======================================================
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
-def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV, active_particles, total_injected, total_lost, inventory_history, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
+def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, active_particles, total_injected, total_lost, inventory_history, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
                                  n_ion_grid=None, flux_profiles=None, total_fusion_power_watts=None, species_phase=None):
     
     rho_grid = _scrub_grid(rho_grid)
     phi_grid = _scrub_grid(phi_grid)
     n_ion_grid = _scrub_grid(n_ion_grid)
     P_fusion_grid = _scrub_grid(P_fusion_grid)
-    energy_history_keV = _scrub_1d(energy_history_keV)
+    stored_energy_J = np.nan_to_num(np.asarray(stored_energy_J, dtype=np.float64), nan=0.0,
+                                    posinf=0.0, neginf=0.0)
     inventory_history = _scrub_1d(inventory_history)
     active_particles = _scrub_particles(active_particles)
     alpha_particles = _scrub_particles(alpha_particles)
@@ -210,19 +211,13 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, energy_history_keV
     plt.close()
 
     # --- STORED ENERGY WAVEFORM ---
-    # energy_history_keV is sum_i (w_i / w_thermal) E_i over the bulk-pool
-    # macroparticles (thermal + beam; alphas are not included): real energy in
-    # units of one thermal-D macroparticle. Times WEIGHT[0] it is the stored ion
-    # kinetic energy of the plasma they represent.
+    # stored_energy_J has one row per step and one weighted column per species
+    # (physics_engine.STORED_ENERGY_SPECIES: thermal D, thermal T, beam D, alpha),
+    # real joules. The trace is the thermal + beam ion total (alphas excluded).
     plt.figure(figsize=(8, 4))
-    _w = (getattr(cfg, "WEIGHT", None) or {}).get(0)
-    if _w:
-        plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6,
-                 energy_history_keV * _w * 1.0e3 * cfg.e_charge / 1.0e3, color='firebrick', linewidth=1.5)
-        plt.ylabel("Stored Ion Kinetic Energy (kJ)")
-    else:
-        plt.plot(np.arange(len(energy_history_keV)) * cfg.reactor_dt * 1e6, energy_history_keV, color='firebrick', linewidth=1.5)
-        plt.ylabel("Macroparticle Kinetic Energy (keV)")
+    _ion_J = stored_energy_J[:, :3].sum(axis=1) if stored_energy_J.ndim == 2 else stored_energy_J
+    plt.plot(np.arange(len(_ion_J)) * cfg.reactor_dt * 1e6, _ion_J / 1.0e3, color='firebrick', linewidth=1.5)
+    plt.ylabel("Stored Ion Kinetic Energy (kJ)")
     plt.title("Stored Kinetic Energy of Thermal + Beam Ions vs. Time")
     plt.xlabel("Time ($\\mu s$)")
     plt.grid(True, alpha=0.3)

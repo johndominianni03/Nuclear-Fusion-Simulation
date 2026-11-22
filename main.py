@@ -234,7 +234,7 @@ def run_reactor_steady_state(save_plots=None):
     (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
      tracked_lost,
      total_injected, total_lost,
-     inventory_history, energy_history_keV,
+     inventory_history, stored_energy_J,
      temp_history, trigger_time, T_core,
      lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid
      ) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
@@ -268,7 +268,7 @@ def run_reactor_steady_state(save_plots=None):
               "(no PNGs written).")
     else:
         diagnostics.run_steady_state_diagnostics(
-            cfg, eq, rho_grid, phi_grid, energy_history_keV, 
+            cfg, eq, rho_grid, phi_grid, stored_energy_J,
             mock_active, total_injected, total_lost, inventory_history,
             R_phase, v_parallel_phase, P_fusion_grid,
             alpha_particles=mock_alphas,

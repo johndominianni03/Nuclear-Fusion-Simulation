@@ -15,6 +15,10 @@ from physics_engine import (
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
     relative_weight_lut,                    # per-species weight / thermal-D weight
+    weight_lut,
+    species_energy_and_count,               # real J and real ion count per species
+    thermal_temperature_keV,                # T from thermal D + T only
+    STORED_ENERGY_SPECIES,
     drain_alpha_energy,
     weighted_kinetic_energy_kev,
     bulk_boost_factor,
@@ -192,10 +196,14 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # counts below are weighted with it, so they read in thermal-D macroparticle
     # units (times cfg.WEIGHT[0] = physical). Equal weights make every entry 1.0.
     rel_w = relative_weight_lut(cfg)
+    w_lut = weight_lut(cfg)
+    stored_cols = np.array([code for code, _ in STORED_ENERGY_SPECIES], dtype=np.int64)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
-    inventory_history, energy_history_keV = [], []
+    # stored_energy_J: one row per step, real kinetic energy [J] per species in
+    # STORED_ENERGY_SPECIES order (thermal D, thermal T, beam D, alpha).
+    inventory_history, stored_energy_J = [], []
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
@@ -519,27 +527,24 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 b_vel[:] = (bulk_vels * boost).astype(np.float32)
                 t_vel[:] = (trit_vels * boost).astype(np.float32)
 
-        # Weighted macroparticle count of the bulk-D + tritium ions (thermal-D
-        # units): the confined real ion count is r_sum * WEIGHT[0].
-        r_sum = float(np.sum(r_b)) + float(np.sum(r_t))
-        current_energy_joules = 0.0
-        if bulk.n_live > 0:
-            current_energy_joules += np.sum(r_b * (0.5 * cfg.m_deuterium * (np.linalg.norm(b_vel.astype(np.float64), axis=1)**2)))
-        if trit.n_live > 0:
-            current_energy_joules += np.sum(r_t * (0.5 * cfg.m_tritium * (np.linalg.norm(t_vel.astype(np.float64), axis=1)**2)))
-
-        current_energy_keV = current_energy_joules / (cfg.e_charge * 1000.0)
-        energy_history_keV.append(current_energy_keV)
+        # --- STORED ENERGY AND REAL ION COUNT PER SPECIES ---
+        # Real kinetic energy [J] and real ion count per type code, one weighted
+        # bincount per pool (alphas included, after this step's drag).
+        E_spec, N_spec = species_energy_and_count(b_vel, b_type, cfg.m_deuterium, w_lut)
+        E_t_, N_t_ = species_energy_and_count(t_vel, t_type, cfg.m_tritium, w_lut)
+        E_a_, N_a_ = species_energy_and_count(a_vel, a_type, cfg.MASS_ALPHA, w_lut)
+        E_spec = E_spec + E_t_ + E_a_
+        N_spec = N_spec + N_t_ + N_a_
+        stored_energy_J.append(E_spec[stored_cols])
 
         current_amp = cfg.b_perturb_initial * np.exp(cfg.gamma_growth * t)
 
-        # --- T_core IS A TEMPERATURE, NOT A TOTAL ---
-        # Assigning the plasma's TOTAL stored energy here made the "core temperature"
-        # read ~50,000 keV, and every consumer (the Lawson triple product, the
-        # quench baseline) was fed that. For a 3D Maxwellian
-        # <E> = (3/2)kT, so kT = (2/3) * <E>, with <E> per real ion (weighted).
-        n_bulk = max(r_sum, 1.0)
-        T_core_kinetic = (2.0 / 3.0) * (current_energy_keV / n_bulk)
+        # --- T_core IS THE THERMAL-ION TEMPERATURE ---
+        # (2/3) <E> per real thermal ion, from thermal D and thermal T only: the
+        # 50 keV beam ions and the alphas are not part of the thermal plasma and
+        # used to pull this several keV above it. Feeds the SPI trigger baseline,
+        # the radiative drain and the Lawson triple product.
+        T_core_kinetic = thermal_temperature_keV(E_spec, N_spec)
 
         if current_amp > cfg.MAX_ISLAND_WIDTH_THRESHOLD and not cfg.SPI_TRIGGERED:
             cfg.SPI_TRIGGERED = True
@@ -550,9 +555,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             print(f" [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
 
         # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
-        # T_core is the kinetic temperature of the bulk in both regimes, before and
-        # after the SPI trigger, so a quench shows up only because the drain below
-        # removes energy from the particles.
+        # T_core is the kinetic temperature of the thermal ions in both regimes,
+        # before and after the SPI trigger, so a quench shows up only because the
+        # drain below removes energy from the particles.
         T_core = T_core_kinetic
 
         if cfg.SPI_TRIGGERED:
@@ -591,7 +596,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     b_vel[:] = (b_vel.astype(np.float64) * drain).astype(np.float32)
                     t_vel[:] = (t_vel.astype(np.float64) * drain).astype(np.float32)
 
-        # energy_history_keV / T_core_kinetic above are recorded BEFORE the drain, which
+        # stored_energy_J / T_core_kinetic above are recorded BEFORE the drain, which
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
         # ledger, not retroactively in this one.
 
@@ -602,10 +607,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined real ion count (weighted
-        # macroparticle count times WEIGHT[0]) over the psi_edge volume. Units:
-        # m^-3 * keV * s, matching cfg.lawson_target and the axis label.
-        n_e_reactor = (r_sum * cfg.WEIGHT[0]) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the weighted thermal-ion density: real
+        # thermal D + T count over the psi_edge volume. Units: m^-3 * keV * s,
+        # matching cfg.lawson_target and the axis label.
+        n_e_reactor = (N_spec[0] + N_spec[3]) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
@@ -654,6 +659,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     return (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos, tracked_lastvel,
             tracked_lost,
             total_injected, total_lost,
-            inventory_history, energy_history_keV,
+            inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
             temp_history, trigger_time, T_core,
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid)

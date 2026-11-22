@@ -1122,6 +1122,41 @@ def relative_weight_lut(cfg):
     return lut / lut[0]
 
 
+# Column order of the reactor loops' per-species stored-energy history
+# (stored_energy_J): (type code, label).
+STORED_ENERGY_SPECIES = ((0, "Thermal D"), (3, "Thermal T"), (1, "Beam D"), (2, "Alpha"))
+
+
+def species_energy_and_count(vel, types, mass, w_lut, w_row=None):
+    """Real kinetic energy [J] and real ion count per species for one pool.
+
+    vel (N, 3) and types (N,) are a pool's live rows (types >= 0). Each row
+    carries w_lut[type] real ions, or w_row[i] when per-particle weights are
+    given. Returns two float64 arrays indexed by type code (length len(w_lut)):
+    sum_i w_i (1/2) m |v_i|^2 and sum_i w_i. One bincount per quantity, no masks."""
+    n_species = len(w_lut)
+    v = np.asarray(vel, dtype=np.float64)
+    e = 0.5 * mass * np.sum(v * v, axis=1)
+    t = np.asarray(types, dtype=np.int64)
+    if w_row is None:
+        E = np.bincount(t, weights=e, minlength=n_species) * w_lut
+        N = np.bincount(t, minlength=n_species) * w_lut
+    else:
+        E = np.bincount(t, weights=w_row * e, minlength=n_species)
+        N = np.bincount(t, weights=w_row, minlength=n_species).astype(np.float64)
+    return E, N
+
+
+def thermal_temperature_keV(E_J, N):
+    """Kinetic temperature of the thermal ions (D + T only, no beam ions or
+    alphas): T = (2/3) <E> per real thermal ion, from species_energy_and_count
+    totals indexed by type code."""
+    n_th = N[0] + N[3]
+    if n_th <= 0.0:
+        return 0.0
+    return (2.0 / 3.0) * (E_J[0] + E_J[3]) / n_th / (e_charge * 1.0e3)
+
+
 def weighted_kinetic_energy_kev(vels64, rel_w, mass):
     """sum_i rel_w_i * (1/2) m |v_i|^2, in keV: the real kinetic energy of a set of
     macroparticles in thermal-D macroparticle units."""
