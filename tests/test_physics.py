@@ -171,6 +171,89 @@ def test_alpha_energy_drain_preserves_direction():
 
 
 # =======================================================
+# PHASE 2 -- flux-surface profiles
+# =======================================================
+def _species_masses(cfg):
+    return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA)
+
+
+def _positions_in_psiN(eq, n, rng, lo=0.0, hi=1.0, margin=0.0):
+    """n Cartesian positions with lo <= psi_N < hi, sampled uniformly in (R, Z)."""
+    from physics_engine import compute_psi_normalised
+    R_out, Z_out = [], []
+    got = 0
+    while got < n:
+        R = rng.uniform(eq.psi_R_min + margin, eq.psi_R_max - margin, 4 * n)
+        Z = rng.uniform(eq.psi_Z_min + margin, eq.psi_Z_max - margin, 4 * n)
+        pn = compute_psi_normalised(R, Z, eq)
+        keep = (pn >= lo) & (pn < hi)
+        R_out.append(R[keep]); Z_out.append(Z[keep]); got += int(keep.sum())
+    R = np.concatenate(R_out)[:n]; Z = np.concatenate(Z_out)[:n]
+    phi = rng.uniform(0, 2 * np.pi, n)
+    return np.stack([R * np.cos(phi), R * np.sin(phi), Z], axis=1)
+
+
+def test_flux_shell_volumes_sum_to_plasma_volume():
+    """The psi_N shells tile the plasma, so their volumes must add up to the
+    volume of the revolved psi_edge contour (computed independently, by Pappus
+    on the ray-marched boundary polygon)."""
+    from physics_engine import compute_flux_shell_volumes
+    cfg, eq, *_ = _production_fields()
+    V = compute_flux_shell_volumes(eq)
+    assert np.all(V > 0.0), "an empty psi_N shell"
+    rel = abs(V.sum() / eq.plasma_volume_m3 - 1.0)
+    assert rel < 0.01, f"sum V_k = {V.sum():.4f} vs plasma volume {eq.plasma_volume_m3:.4f} ({rel:.2%})"
+
+
+def test_flux_profile_density_integrates_to_particle_count():
+    """sum_k n_k V_k must recover weight x (particles inside psi_N <= 1) per
+    species, exactly up to float rounding; particles outside are excluded."""
+    from physics_engine import compute_flux_profiles, compute_psi_normalised
+    cfg, eq, *_ = _production_fields()
+    rng = np.random.default_rng(11)
+    pos = _positions_in_psiN(eq, 30000, rng, 0.0, 1.6)   # some outside the LCFS
+    vel = rng.normal(0.0, 3e5, pos.shape)
+    types = rng.choice([0, 1, 2, -1], size=len(pos), p=[0.6, 0.25, 0.1, 0.05])
+    inside = compute_psi_normalised(np.hypot(pos[:, 0], pos[:, 1]), pos[:, 2], eq) <= 1.0
+    assert 0 < inside.sum() < len(pos)
+    for w in (1.0, 7.3e15):
+        prof = compute_flux_profiles(pos, vel, types, eq, _species_masses(cfg), weight=w)
+        for s in range(3):
+            expect = w * np.sum(inside & (types == s))
+            got = float(np.sum(prof["n"][s] * prof["shell_volume"]))
+            assert abs(got - expect) <= 1e-12 * expect, f"species {s}, w={w}: {got} vs {expect}"
+
+
+def test_flux_profile_temperature_of_maxwellian():
+    """A 1 keV Maxwellian comes back as 1 keV within 2%, with and without a
+    rigid toroidal rotation: the flow is a mean velocity, not heat."""
+    from physics_engine import compute_flux_profiles
+    cfg, eq, engine, *_ = _production_fields()
+    rng = np.random.default_rng(5)
+    n = 50000
+    pos = _positions_in_psiN(eq, n, rng, 0.40, 0.44)       # one shell: bin 10
+    state = np.random.get_state()
+    np.random.seed(5)
+    vel = engine.initialize_velocities(n, T_keV=1.0)
+    np.random.set_state(state)
+    masses = (engine.m, engine.m, cfg.MASS_ALPHA)
+    types = np.zeros(n, dtype=np.int64)
+    prof = compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0)
+    assert prof["count"][0, 10] == n
+    T0 = prof["T_keV"][0, 10]
+    assert abs(T0 - 1.0) < 0.02, f"T = {T0:.4f} keV"
+
+    v_rot = 1.0e5                                          # rigid u_phi
+    R = np.hypot(pos[:, 0], pos[:, 1])
+    vel_rot = vel.copy()
+    vel_rot[:, 0] += -v_rot * pos[:, 1] / R
+    vel_rot[:, 1] += v_rot * pos[:, 0] / R
+    prof_rot = compute_flux_profiles(pos, vel_rot, types, eq, masses, weight=1.0)
+    assert abs(prof_rot["u"][0, 10, 1] - v_rot) < 0.01 * v_rot
+    assert abs(prof_rot["T_keV"][0, 10] / T0 - 1.0) < 1e-6, "rotation leaked into T"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":

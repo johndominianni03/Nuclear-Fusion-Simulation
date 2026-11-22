@@ -939,6 +939,146 @@ def compute_plasma_volume(R_wall, Z_wall):
     return float(2.0 * np.pi * R_centroid * abs(A_signed))
 
 
+# =====================================================================
+# FLUX-SURFACE PROFILES
+#
+# Moments binned by normalised poloidal flux
+#     psi_N = (psi_axis - psi) / (psi_axis - psi_edge)
+# 0 on the magnetic axis, 1 on the last closed flux surface (the same psi_edge
+# check_confinement_flux uses as the loss boundary). Shell volumes come from the
+# psi grid itself, so n = weight * count / V_shell is a true number density.
+# =====================================================================
+
+FLUX_PROFILE_BINS = 25
+FLUX_VOLUME_MESH = 400      # fine R-Z mesh per side for the shell volumes
+
+
+def compute_psi_normalised(R, Z, eq):
+    """psi_N at (R, Z), by the same bilinear lookup the confinement test uses."""
+    R = np.ascontiguousarray(R, dtype=np.float64)
+    Z = np.ascontiguousarray(Z, dtype=np.float64)
+    psi = interpolate_psi_array(R.ravel(), Z.ravel(), eq.psi_grid,
+                                eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max,
+                                eq.psi_nR, eq.psi_nZ).reshape(R.shape)
+    return (eq.psi_axis - psi) / (eq.psi_axis - eq.psi_edge)
+
+
+def compute_flux_shell_volumes(eq, n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_MESH):
+    """Volume of each psi_N shell [k/n_bins, (k+1)/n_bins), k = 0..n_bins-1.
+
+    psi is sampled at the cell centres of an n_mesh x n_mesh mesh over the
+    equilibrium box and each cell contributes its revolved volume 2*pi*R*dR*dZ to
+    the shell its psi_N falls in. Cells with psi_N > 1 lie outside the plasma and
+    are dropped. Cached on `eq` per (n_bins, n_mesh): psi never changes in a run.
+    """
+    cache = getattr(eq, "_flux_shell_volume_cache", None)
+    if cache is None:
+        cache = {}
+        eq._flux_shell_volume_cache = cache
+    key = (int(n_bins), int(n_mesh))
+    if key in cache:
+        return cache[key].copy()
+
+    dR = (eq.psi_R_max - eq.psi_R_min) / n_mesh
+    dZ = (eq.psi_Z_max - eq.psi_Z_min) / n_mesh
+    Rc = eq.psi_R_min + (np.arange(n_mesh) + 0.5) * dR
+    Zc = eq.psi_Z_min + (np.arange(n_mesh) + 0.5) * dZ
+    RR, ZZ = np.meshgrid(Rc, Zc, indexing="ij")
+    psi_N = compute_psi_normalised(RR, ZZ, eq)
+    inside = psi_N <= 1.0
+    idx = np.minimum((psi_N[inside] * n_bins).astype(np.int64), n_bins - 1)
+    dV = 2.0 * np.pi * RR[inside] * dR * dZ
+    volumes = np.bincount(idx, weights=dV, minlength=n_bins)
+    cache[key] = volumes
+    return volumes.copy()
+
+
+def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
+                          n_bins=FLUX_PROFILE_BINS, n_mesh=FLUX_VOLUME_MESH, B0=None):
+    """Per-species moments on psi_N shells.
+
+    pos, vel : (N, 3) Cartesian positions [m] and velocities [m/s]
+    types    : (N,) species, 0 thermal, 1 beam, 2 alpha (-1 lost; ignored)
+    masses   : (m_thermal, m_beam, m_alpha) in kg
+    weight   : real ions per macroparticle
+    B0       : field for beta [T]; beta is omitted when None
+
+    Velocities are moments in the local cylindrical basis (R, phi, Z): the mean
+    flow u of a shell is (u_R, u_phi, u_Z), so a toroidal rotation is a flow and
+    not heat. A Cartesian mean over a whole toroidal shell would average a
+    rotation to zero and count it as temperature.
+
+    Per species s and shell k:
+        n  = weight * count / V_k                       [m^-3]
+        u  = <v_cyl>                                    [m/s]
+        T  = m_s <|v_cyl - u|^2> / 3                    [J]   (also T_keV)
+        p  = n T                                        [Pa]
+    Shells with fewer than 2 particles of a species have T = NaN and p = 0.
+    beta_profile = 2 mu0 sum_s p_s / B0^2 per shell, and beta_avg is the same with
+    the volume-averaged pressure sum_k p_k V_k / sum_k V_k.
+    """
+    pos = np.asarray(pos, dtype=np.float64)
+    vel = np.asarray(vel, dtype=np.float64)
+    types = np.asarray(types)
+    V = compute_flux_shell_volumes(eq, n_bins, n_mesh)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    R = np.hypot(pos[:, 0], pos[:, 1])
+    psi_N = compute_psi_normalised(R, pos[:, 2], eq)
+    inside = (types >= 0) & (psi_N <= 1.0)
+    idx = np.minimum((np.clip(psi_N, 0.0, None) * n_bins).astype(np.int64), n_bins - 1)
+
+    safe_R = np.where(R > 0.0, R, 1.0)
+    cphi, sphi = pos[:, 0] / safe_R, pos[:, 1] / safe_R
+    v_cyl = np.stack([vel[:, 0] * cphi + vel[:, 1] * sphi,
+                      -vel[:, 0] * sphi + vel[:, 1] * cphi,
+                      vel[:, 2]], axis=1)
+
+    n_species = 3
+    count = np.zeros((n_species, n_bins), dtype=np.int64)
+    n = np.zeros((n_species, n_bins))
+    u = np.zeros((n_species, n_bins, 3))
+    T = np.full((n_species, n_bins), np.nan)
+    p = np.zeros((n_species, n_bins))
+    safe_V = np.where(V > 0.0, V, np.inf)
+    for s in range(n_species):
+        sel = inside & (types == s)
+        k = idx[sel]
+        vs = v_cyl[sel]
+        c = np.bincount(k, minlength=n_bins)
+        count[s] = c
+        n[s] = weight * c / safe_V
+        safe_c = np.where(c > 0, c, 1)
+        for d in range(3):
+            u[s, :, d] = np.bincount(k, weights=vs[:, d], minlength=n_bins) / safe_c
+        dv2 = np.sum((vs - u[s, k]) ** 2, axis=1)
+        mean_dv2 = np.bincount(k, weights=dv2, minlength=n_bins) / safe_c
+        ok = c >= 2
+        T[s, ok] = masses[s] * mean_dv2[ok] / 3.0
+        p[s, ok] = n[s, ok] * T[s, ok]
+
+    out = {
+        "psiN_edges": edges,
+        "psiN_centers": centers,
+        "rho_centers": np.sqrt(centers),
+        "shell_volume": V,
+        "count": count,
+        "n": n,
+        "u": u,
+        "T": T,
+        "T_keV": T / (e_charge * 1.0e3),
+        "p": p,
+        "weight": float(weight),
+    }
+    if B0 is not None:
+        mu0 = 4.0e-7 * np.pi
+        p_tot = p.sum(axis=0)
+        out["beta_profile"] = 2.0 * mu0 * p_tot / B0**2
+        out["beta_avg"] = 2.0 * mu0 * float(np.sum(p_tot * V) / np.sum(V)) / B0**2
+    return out
+
+
 def resample_grid_to(src_grid, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ,
                      dst_R_min, dst_R_max, dst_Z_min, dst_Z_max, dst_nR, dst_nZ):
     # Bilinearly resample a scalar field from the equilibrium's psi grid (60x60) onto the
