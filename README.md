@@ -19,7 +19,7 @@ Each timestep of the reactor run does the following, in this order:
 1. **Sources.** Neutral beam injection adds 50 keV ions on a decaying schedule. One 3.5 MeV alpha is injected every 4 steps on a fixed schedule.
 2. **Deposition and field solve.** Bulk ions are deposited on a 50×50 (R, Z) grid with cloud-in-cell weights, and one SOR pass of a Poisson solve updates the potential.
 3. **Field lookup.** Each particle gets the local electric field from that grid and a magnetic field made of the toroidal B0·R0/R field, the poloidal field derived from the Grad–Shafranov flux, and a prescribed tearing-mode perturbation.
-4. **Push.** The Boris integrator advances every particle's velocity and position under the Lorentz force. Alphas take 10 sub-steps per global step.
+4. **Push.** The Boris integrator advances every particle's velocity and position under the Lorentz force. Alphas take 10 sub-steps per global step, with the field re-evaluated at each sub-step.
 5. **Collisions.** At a fixed rate, a bulk ion's velocity direction is re-drawn isotropically with its speed unchanged.
 6. **Losses.** Particles that cross the last closed flux surface are counted and removed.
 7. **Alpha slowing-down.** Alphas lose a fixed fraction of their energy per step, and that energy is added to the bulk ions.

@@ -552,79 +552,17 @@ def vectorized_boris_push_numba_fallback(pos_arr, vel_arr, q, m, B_arr, E_arr, d
 # ALPHA SUB-STEPPING
 #
 # A 3.5 MeV alpha covers ~1.3e-2 m per global 1 ns step against a ~2.2e-2 m Larmor
-# radius -- under two samples per gyro-arc, hence jagged orbits. Deuterons are fine at
-# the global step (Larmor radius ~5e-4 m, ~3e-4 m of travel per step).
+# radius. Deuterons are fine at the global step (Larmor radius ~5e-4 m, ~3e-4 m of
+# travel per step), so only the alphas are sub-stepped, and the field is re-gathered
+# at every sub-step. The CPU kernel is kernels.boris_push_substeps_regather (it needs
+# the scalar field helper that lives there); the torch twin is below, after the torch
+# gather it calls.
 #
-# Sub-stepping only the alphas fixes the sampling without paying for it on the far more
-# numerous thermals. E and B are held fixed across the sub-steps -- evaluated once at
-# the start-of-step position, since the point is to resolve gyration about that local B,
-# not to re-gather the field 10x per step.
+# The previous kernels held E and B at the start-of-step position across all
+# sub-steps. That is first-order and not volume-preserving, and in the sheared
+# Grad-Shafranov field it drove every alpha's pitch to xi = -1 within a few
+# microseconds. See tools/alpha_pitch_check.py.
 # =====================================================================
-
-def boris_push_substeps_torch(pos_tensor, vel_tensor, q, m, B_tensor, E_tensor, dt, n_sub):
-    if n_sub is None or n_sub <= 1:
-        return _vectorized_boris_push_metal_impl(pos_tensor, vel_tensor, q, m, B_tensor, E_tensor, dt)
-
-    dt_sub = dt / float(n_sub)
-    pos, vel = pos_tensor, vel_tensor
-    for _ in range(int(n_sub)):
-        pos, vel = _vectorized_boris_push_metal_impl(pos, vel, q, m, B_tensor, E_tensor, dt_sub)
-    return pos, vel
-
-
-@njit(parallel=True, fastmath=True, cache=True)
-def vectorized_boris_push_numba_substeps(pos_arr, vel_arr, q, m, B_arr, E_arr, dt, n_sub):
-    # Numba/CPU counterpart. Mutates pos_arr/vel_arr in place, matching
-    # vectorized_boris_push_numba_fallback's calling convention.
-    #
-    # Scalar components, for the same reason as the single-step kernel above -- and the
-    # slice form paid that allocation cost once PER SUB-STEP. Two extra wins: t and s
-    # depend only on fixed quantities, so they hoist out of the inner loop; and the
-    # float64 accumulators become plain scalars, no .astype() round-trip.
-    # Verified bit-identical to the previous kernel (max abs difference 0.0 in position
-    # and velocity over 20,000 randomised particles at n_sub = 10).
-    dt_sub = dt / n_sub
-    qm = q / m
-    half = dt_sub / 2.0
-    for i in prange(pos_arr.shape[0]):
-        ex = E_arr[i, 0]; ey = E_arr[i, 1]; ez = E_arr[i, 2]
-
-        # Rotation vectors are constant across the sub-steps (B and E are frozen at the
-        # start-of-step position), so hoist them out of the inner loop.
-        tx = qm * B_arr[i, 0] * half
-        ty = qm * B_arr[i, 1] * half
-        tz = qm * B_arr[i, 2] * half
-        f = 2.0 / (1.0 + tx * tx + ty * ty + tz * tz)
-        sx = tx * f; sy = ty * f; sz = tz * f
-
-        # Accumulate in float64: summing ALPHA_SUBSTEPS small position increments in the
-        # arrays' native float32 would reintroduce the roundoff sub-stepping cures.
-        px = np.float64(pos_arr[i, 0]); py = np.float64(pos_arr[i, 1]); pz = np.float64(pos_arr[i, 2])
-        vx = np.float64(vel_arr[i, 0]); vy = np.float64(vel_arr[i, 1]); vz = np.float64(vel_arr[i, 2])
-
-        for _ in range(n_sub):
-            vmx = vx + qm * ex * half
-            vmy = vy + qm * ey * half
-            vmz = vz + qm * ez * half
-
-            ax = vmy * tz - vmz * ty
-            ay = vmz * tx - vmx * tz
-            az = vmx * ty - vmy * tx
-            vpx = vmx + ax; vpy = vmy + ay; vpz = vmz + az
-
-            cx = vpy * sz - vpz * sy
-            cy = vpz * sx - vpx * sz
-            cz = vpx * sy - vpy * sx
-
-            vx = vmx + cx + qm * ex * half
-            vy = vmy + cy + qm * ey * half
-            vz = vmz + cz + qm * ez * half
-
-            px += vx * dt_sub; py += vy * dt_sub; pz += vz * dt_sub
-
-        # Back down to the storage dtype on write-out
-        vel_arr[i, 0] = vx; vel_arr[i, 1] = vy; vel_arr[i, 2] = vz
-        pos_arr[i, 0] = px; pos_arr[i, 1] = py; pos_arr[i, 2] = pz
 
 
 # =====================================================================
@@ -777,6 +715,29 @@ def vectorized_gather_and_B_torch(pos, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_po
         pos, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t, R_min, R_max, Z_min, Z_max, nR, nZ,
         B0, R0, t_tensor, b_perturb, m_mode, n_mode, gamma
     )
+
+
+def boris_push_substeps_regather_torch(pos, vel, q, m, dt, n_sub,
+                                       E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t,
+                                       R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t,
+                                       b_perturb, m_mode, n_mode, gamma):
+    """Torch twin of kernels.boris_push_substeps_regather.
+
+    n_sub Boris sub-steps of dt/n_sub, each with E and B gathered at that
+    sub-step's start position and time level. Returns NEW (pos, vel) tensors;
+    the caller copies them back into the pool views. Positions are stored in
+    float32 between sub-steps (the GPU pools are float32), unlike the CPU
+    kernel's float64 accumulators.
+    """
+    n_sub = max(int(n_sub), 1)
+    dt_sub = dt / float(n_sub)
+    for k in range(n_sub):
+        E, B = vectorized_gather_and_B_torch(
+            pos, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t,
+            R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t + k * dt_sub,
+            b_perturb, m_mode, n_mode, gamma)
+        pos, vel = _vectorized_boris_push_metal_impl(pos, vel, q, m, B, E, dt_sub)
+    return pos, vel
 
 
 # NOTE: the old Cartesian/circular check_confinement_torch was deleted from here -- it

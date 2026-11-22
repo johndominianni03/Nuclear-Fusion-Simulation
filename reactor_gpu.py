@@ -17,7 +17,7 @@ from physics_engine import (
     compute_alpha_heating_power_torch,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     _vectorized_boris_push_metal_dynamic,   # dynamic-shape compile, handles that churn; None if the compile failed at import
-    boris_push_substeps_torch               # alpha sub-stepping (GPU)
+    boris_push_substeps_regather_torch      # alpha sub-stepping (GPU), field re-gathered per sub-step
 )
 from profiling import (
     StageProfiler,
@@ -36,6 +36,19 @@ from track_store import (
     _require_pid_capacity,
     _TrackStore,
 )
+
+
+def _push_alphas_torch(cfg, a_pos, a_vel, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t, t):
+    # Twin of reactor_cpu._push_alphas: sub-stepped Boris with E and B re-gathered
+    # at every sub-step. The kernel returns new tensors, so the results are copied
+    # back into the pool views rather than rebound (kernel mutation contract).
+    p_a, v_a = boris_push_substeps_regather_torch(
+        a_pos, a_vel, cfg.CHARGE_ALPHA, cfg.MASS_ALPHA, cfg.reactor_dt, cfg.ALPHA_SUBSTEPS,
+        E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t,
+        cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
+        cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth)
+    a_pos.copy_(p_a)
+    a_vel.copy_(v_a)
 
 
 def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid):
@@ -292,9 +305,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                         cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
                         cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial,
                         cfg.m_mode, cfg.n_mode, cfg.gamma_growth)
+        # Bulk only; the alphas gather inside their sub-step push below.
         E_b, B_b = vectorized_gather_and_B_torch(b_pos, *_gather_args)
-        if alpha.n_live > 0:
-            E_a, B_a = vectorized_gather_and_B_torch(a_pos, *_gather_args)
         prof.add("vectorized_gather_and_B", _t)
 
         # --- PARTICLE PUSH (GPU; see the note at the top of this function) ---
@@ -311,20 +323,11 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             b_vel.copy_(v_d)
         prof.add("deuteron Boris push", _t)
 
-        # Alphas are sub-stepped: at 3.5 MeV they cover ~1.3e-2 m per global 1 ns step
-        # against a ~2.2e-2 m Larmor radius, under two samples per gyro-arc. Deuterons
-        # stay on the single global step. E and B are held fixed across the sub-steps --
-        # the point is to resolve gyration about the local B, not to re-gather the field.
-        # Stays on-device; boris_push_substeps_torch re-enters the same MPS kernel.
+        # Alphas are sub-stepped, with the field re-gathered every sub-step (see
+        # _push_alphas_torch). Deuterons stay on the single global step.
         _t = prof.mark()
-        # mask_a likewise. Same returns-new-tensors contract, same copy_ back.
         if alpha.n_live > 0:
-            p_a, v_a = boris_push_substeps_torch(
-                a_pos, a_vel, cfg.CHARGE_ALPHA, cfg.MASS_ALPHA,
-                B_a, E_a, cfg.reactor_dt, cfg.ALPHA_SUBSTEPS
-            )
-            a_pos.copy_(p_a)
-            a_vel.copy_(v_a)
+            _push_alphas_torch(cfg, a_pos, a_vel, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t, t)
         prof.add("alpha substep push", _t)
 
         # --- COLLISIONS + CONFINEMENT CHECK (GPU, eager; psi-surface, not circular) ---

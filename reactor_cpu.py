@@ -13,7 +13,6 @@ from physics_engine import (
     vectorized_boris_push_numba_fallback,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
-    vectorized_boris_push_numba_substeps    # alpha sub-stepping (CPU)
 )
 from profiling import (
     StageProfiler,
@@ -23,6 +22,7 @@ from profiling import (
 )
 from kernels import (
     vectorized_gather_and_B_into,
+    boris_push_substeps_regather,           # alpha sub-stepping, field re-gathered per sub-step
     apply_vectorized_collisions,
 )
 from particle_pool import (
@@ -58,6 +58,19 @@ def _boris_push_adaptive(pos, vel, q, m, B, E, dt, device):
         vel[:] = vn.cpu().numpy()
     else:
         vectorized_boris_push_numba_fallback(pos, vel, q, m, B, E, dt)
+
+
+def _push_alphas(cfg, a_pos, a_vel, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid, t):
+    # Alphas are sub-stepped: at 3.5 MeV they cover ~1.3e-2 m per global 1 ns step
+    # against a ~2.2e-2 m Larmor radius. E and B are re-gathered at every sub-step
+    # inside the kernel; holding them at the start-of-step position collapsed every
+    # alpha's pitch to xi = -1 (see kernels.boris_push_substeps_regather). Mutates
+    # a_pos / a_vel in place. Twin: reactor_gpu._push_alphas_torch.
+    boris_push_substeps_regather(
+        a_pos, a_vel, cfg.CHARGE_ALPHA, cfg.MASS_ALPHA, cfg.reactor_dt, cfg.ALPHA_SUBSTEPS,
+        E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+        cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
+        cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth)
 
 
 def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid,
@@ -140,15 +153,14 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # which writes every row it is given, so stale rows past n are never read.
     # Capacity starts above the initial count (NBI and alpha injection grow the
     # pools) and doubles only if the live count outruns it.
-    # One field-buffer pair per pool, each sized from that pool's capacity rather
-    # than a second, independently-grown number. Two capacities that can disagree
-    # is exactly the bug this avoids: vectorized_gather_and_B_into does not
-    # bounds-check its E_out/B_out stores, so a field buffer shorter than n_live
-    # is a silent out-of-range write, not an IndexError.
+    # Sized from the bulk pool's capacity rather than a second, independently-grown
+    # number. Two capacities that can disagree is exactly the bug this avoids:
+    # vectorized_gather_and_B_into does not bounds-check its E_out/B_out stores, so
+    # a field buffer shorter than n_live is a silent out-of-range write, not an
+    # IndexError. The alpha pool needs no buffer: _push_alphas gathers its field
+    # inside the sub-step kernel.
     E_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
     B_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
-    E_buf_a = np.empty((alpha.capacity, 3), dtype=np.float32)
-    B_buf_a = np.empty((alpha.capacity, 3), dtype=np.float32)
 
     total_injected = cfg.initial_thermal_count
     total_lost = 0
@@ -280,7 +292,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 sor_iter_counts.append(_sor_iters)
         prof.add("solve_fields (Poisson)", _t)
 
-        # Gather runs per pool, each into its own buffer pair.
+        # Bulk gather. The alphas gather inside their sub-step push below.
         _t = prof.mark()
         E_b = E_buf_b[:bulk.n_live]
         B_b = B_buf_b[:bulk.n_live]
@@ -290,15 +302,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
             cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
         )
-        E_a = E_buf_a[:alpha.n_live]
-        B_a = B_buf_a[:alpha.n_live]
-        if alpha.n_live > 0:
-            vectorized_gather_and_B_into(
-                a_pos, E_a, B_a,
-                E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
-                cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
-                cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
-            )
         prof.add("vectorized_gather_and_B", _t)
 
         # --- PARTICLE PUSH: Numba/CPU below PUSH_GPU_THRESHOLD, eager-GPU above it ---
@@ -317,18 +320,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             push_prof.add("masked write-back", _ts)
         prof.add("deuteron Boris push", _t)
 
-        # Alphas are sub-stepped: at 3.5 MeV they cover ~1.3e-2 m per global 1 ns step
-        # against a ~2.2e-2 m Larmor radius, under two samples per gyro-arc. Deuterons
-        # stay on the single global step (Larmor radius ~5e-4 m, already resolved).
+        # Alphas are sub-stepped, with the field re-gathered every sub-step (see
+        # _push_alphas). Deuterons stay on the single global step (Larmor radius
+        # ~5e-4 m, already resolved). The alpha pool IS the alpha set, so the kernel
+        # gets the contiguous float32 views and mutates them in place.
         _t = prof.mark()
-        # mask_a is gone for the same reason: the alpha pool IS the alpha set.
-        # The views are already contiguous float32, so the ascontiguousarray
-        # copies the old form needed are gone too.
         if alpha.n_live > 0:
-            vectorized_boris_push_numba_substeps(
-                a_pos, a_vel, cfg.CHARGE_ALPHA, cfg.MASS_ALPHA,
-                B_a, E_a, cfg.reactor_dt, cfg.ALPHA_SUBSTEPS
-            )
+            _push_alphas(cfg, a_pos, a_vel, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid, t)
         prof.add("alpha substep push", _t)
 
         _t = prof.mark()
