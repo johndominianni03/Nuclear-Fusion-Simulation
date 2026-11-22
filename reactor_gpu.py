@@ -52,6 +52,16 @@ def _push_alphas_torch(cfg, a_pos, a_vel, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z
     a_vel.copy_(v_a)
 
 
+def _push_thermal_tritium_torch(cfg, t_pos, t_vel, B_t, E_t):
+    # Twin of reactor_cpu._push_thermal_tritium: one Boris step, q = e, m = m_T.
+    # The kernel returns new tensors, so the results are copied back into the
+    # pool views (kernel mutation contract).
+    _push = _vectorized_boris_push_metal_dynamic or _vectorized_boris_push_metal_impl
+    p_tr, v_tr = _push(t_pos, t_vel, cfg.e_charge, cfg.m_tritium, B_t, E_t, cfg.reactor_dt)
+    t_pos.copy_(p_tr)
+    t_vel.copy_(v_tr)
+
+
 def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid):
     # GPU-resident pipeline, selected only when GPU_PARTICLE_THRESHOLD is set to an int
     # <= cfg.initial_thermal_count. It is None by default, so this loop is opt-in -- see
@@ -110,21 +120,31 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # with a scatter and the sampler can gather rows without a sync.
     pid_capacity = _pid_capacity_bound(cfg, n_init)
     pid_row_t = torch.full((pid_capacity,), -1, device=device, dtype=torch.int64)
-    pid_row_t[:n_init] = torch.arange(n_init, device=device, dtype=torch.int64)
 
-    # Device-resident capacity pool, replacing the torch.cat growth below. Same
-    # hard-ceiling contract as the CPU path: add() raises rather than growing.
-    bulk_capacity, alpha_capacity = _pool_capacity_bounds(cfg, n_init)
+    # Device-resident capacity pools (bulk D, alpha, tritium), split once here by
+    # type exactly as the CPU twin does. Same hard-ceiling contract: add() raises
+    # rather than growing.
+    type_np_init = type_tensor.cpu().numpy()
+    is_trit = type_np_init == 3
+    rows_d = np.nonzero(~is_trit)[0]
+    rows_t = np.nonzero(is_trit)[0]
+    rows_d_t = torch.from_numpy(rows_d.astype(np.int64)).to(device)
+    rows_t_t = torch.from_numpy(rows_t.astype(np.int64)).to(device)
+    bulk_capacity, alpha_capacity, trit_capacity = _pool_capacity_bounds(cfg, len(rows_d), len(rows_t))
     bulk = _ParticlePool(bulk_capacity, device=device)
     alpha = _ParticlePool(alpha_capacity, device=device)
-    bulk.add(pos_tensor, vel_tensor, 0,
-             torch.arange(n_init, device=device, dtype=torch.int64))
-    bulk.type[:n_init] = type_tensor
-    # The input tensors have been copied into the pool; drop the names so nothing
+    trit = _ParticlePool(trit_capacity, device=device)
+    bulk.add(pos_tensor[rows_d_t], vel_tensor[rows_d_t], 0, rows_d_t)
+    bulk.type[:len(rows_d)] = type_tensor[rows_d_t]
+    trit.add(pos_tensor[rows_t_t], vel_tensor[rows_t_t], 3, rows_t_t)
+    pid_row_t[rows_d_t] = torch.arange(len(rows_d), device=device, dtype=torch.int64)
+    pid_row_t[rows_t_t] = torch.arange(len(rows_t), device=device, dtype=torch.int64)
+    # The input tensors have been copied into the pools; drop the names so nothing
     # downstream can read the stale pre-pool copies.
     del pos_tensor, vel_tensor, type_tensor
     b_pos, b_vel, b_type, b_pid = bulk.views()
     a_pos, a_vel, a_type, a_pid = alpha.views()
+    t_pos, t_vel, t_type, t_pid = trit.views()
     # Liveness and slot assignment stay on the HOST. That is what lets the host
     # know how many rows a sample will write without asking the device, so the
     # vertex write pointer advances with no .item() sync. Tracked particles die
@@ -133,23 +153,29 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
     # pid -> pool, host-side and write-once at birth; see the CPU path for why
     # compaction never touches it (species cannot migrate).
+    # Pool codes: 0 = bulk D, 1 = alpha, 2 = tritium.
     pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
-    pid_pool[:n_init] = 0
+    pid_pool[rows_d] = 0
+    pid_pool[rows_t] = 2
     slot_alive = np.zeros(_MAX_TRACKED_SLOTS, dtype=bool)
 
-    n_track = min(1000, n_init)
+    # 500 thermal D + 500 thermal T, the first of each pool (ascending pid), as
+    # in the CPU twin.
     # host_dtype float64: this path records its injection vertex straight from
     # the float64 array inject_neutral_beam_cartesian returns, before the cast
     # onto the device, and that is the value it recorded before this rewrite.
     tracks = _TrackStore(_MAX_TRACKED_SLOTS, device=device, host_dtype=np.float64)
-    init_pids = np.arange(n_track, dtype=np.int64)
-    init_slots = tracks.add_slots(init_pids, 0,
-                                  pos_np_init[:n_track], vel_np_init[:n_track])
-    pid_slot[init_pids] = init_slots
-    slot_alive[init_slots] = True
+    max_tracked_pid = -1
+    for _rows, _species in ((rows_d, 0), (rows_t, 3)):
+        init_pids = _rows[:min(500, len(_rows))].astype(np.int64)
+        init_slots = tracks.add_slots(init_pids, _species,
+                                      pos_np_init[init_pids], vel_np_init[init_pids])
+        pid_slot[init_pids] = init_slots
+        slot_alive[init_slots] = True
+        if init_pids.size:
+            max_tracked_pid = max(max_tracked_pid, int(init_pids[-1]))
     tracked_nbis = 0
     tracked_alphas = 0
-    max_tracked_pid = n_track - 1
 
     # Per-species weight relative to thermal D, indexed by type code, on the
     # device. Twin of the CPU loop's rel_w: energies and counts below read in
@@ -179,7 +205,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             _sync = torch.cuda.synchronize
     prof = StageProfiler(profiling, sync=_sync, label="GPU path")
     if profiling:
-        _profile_header(cfg, f"GPU path ({device.type})", bulk.n_live + alpha.n_live)
+        _profile_header(cfg, f"GPU path ({device.type})", bulk.n_live + alpha.n_live + trit.n_live)
         if _sync is None:
             print("   [WARN] no synchronize for this device: GPU stage times "
                   "will measure enqueue, not execution.")
@@ -283,7 +309,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         _t = prof.mark()
         if step % cfg.FIELD_UPDATE_EVERY == 0:
             phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
-                cfg, engine.eq, b_pos.cpu().numpy(), b_vel.cpu().numpy(), b_type.cpu().numpy())
+                cfg, engine.eq, torch.cat((b_pos, t_pos)).cpu().numpy(),
+                torch.cat((b_vel, t_vel)).cpu().numpy(), torch.cat((b_type, t_type)).cpu().numpy())
             E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
             E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
         prof.add("E_r force balance", _t)
@@ -297,8 +324,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                         cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
                         cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial,
                         cfg.m_mode, cfg.n_mode, cfg.gamma_growth)
-        # Bulk only; the alphas gather inside their sub-step push below.
+        # Bulk D and tritium; the alphas gather inside their sub-step push below.
         E_b, B_b = vectorized_gather_and_B_torch(b_pos, *_gather_args)
+        E_t, B_t = vectorized_gather_and_B_torch(t_pos, *_gather_args)
         prof.add("vectorized_gather_and_B", _t)
 
         # --- PARTICLE PUSH (GPU; see the note at the top of this function) ---
@@ -314,6 +342,12 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             b_pos.copy_(p_d)
             b_vel.copy_(v_d)
         prof.add("deuteron Boris push", _t)
+
+        # Thermal tritium: twin of the CPU loop, own mass, copied back into the pool.
+        _t = prof.mark()
+        if trit.n_live > 0:
+            _push_thermal_tritium_torch(cfg, t_pos, t_vel, B_t, E_t)
+        prof.add("tritium Boris push", _t)
 
         # Alphas are sub-stepped, with the field re-gathered every sub-step (see
         # _push_alphas_torch). Deuterons stay on the single global step.
@@ -340,6 +374,11 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         vel_updated = apply_vectorized_collisions_torch(b_vel, b_type, cfg.nu_c, cfg.reactor_dt)
         if vel_updated is not b_vel:
             b_vel.copy_(vel_updated)
+        # Thermal tritium collides too (eligible mask admits type 3); same write-back.
+        if trit.n_live > 0:
+            vel_updated = apply_vectorized_collisions_torch(t_vel, t_type, cfg.nu_c, cfg.reactor_dt)
+            if vel_updated is not t_vel:
+                t_vel.copy_(vel_updated)
         prof.add("apply_vectorized_collisions", _t)
 
         _t = prof.mark()
@@ -354,7 +393,11 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             a_type, lost_a = check_confinement_torch(a_pos, a_type, *_psi_args)
         else:
             lost_a = 0
-        newly_lost = lost_b + lost_a
+        if trit.n_live > 0:
+            t_type, lost_t = check_confinement_torch(t_pos, t_type, *_psi_args)
+        else:
+            lost_t = 0
+        newly_lost = lost_b + lost_a + lost_t
         prof.add("check_confinement_flux", _t)
         total_lost += newly_lost
 
@@ -368,7 +411,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         if newly_lost > 0:
             for _pool, _pos, _vel, _type, _pid, _lost in (
                     (bulk, b_pos, b_vel, b_type, b_pid, lost_b),
-                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a)):
+                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a),
+                    (trit, t_pos, t_vel, t_type, t_pid, lost_t)):
                 if _lost == 0:
                     continue
                 alive = _type != -1
@@ -398,12 +442,15 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             b_pos, b_vel, b_type, b_pid = bulk.views()
             a_pos, a_vel, a_type, a_pid = alpha.views()
+            t_pos, t_vel, t_type, t_pid = trit.views()
             # Renumber the device-side pid -> row map for whichever pools moved.
             # pid_pool is untouched -- rows move, pools do not.
             if lost_b:
                 pid_row_t[b_pid] = torch.arange(bulk.n_live, device=device, dtype=torch.int64)
             if lost_a:
                 pid_row_t[a_pid] = torch.arange(alpha.n_live, device=device, dtype=torch.int64)
+            if lost_t:
+                pid_row_t[t_pid] = torch.arange(trit.n_live, device=device, dtype=torch.int64)
         prof.add("wall-loss compaction", _t)
 
         # Pull only the tracked particles (<=2000) needed for trajectory plots, never the
@@ -430,7 +477,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     # decided on the HOST, which is what keeps the vertex write
                     # pointer free of any .item() sync.
                     sel_pools = pid_pool[tracks.pids[sel_slots]]
-                    for _which, _pos, _vel in ((0, b_pos, b_vel), (1, a_pos, a_vel)):
+                    for _which, _pos, _vel in ((0, b_pos, b_vel), (1, a_pos, a_vel), (2, t_pos, t_vel)):
                         grp = sel_pools == _which
                         if not np.any(grp):
                             continue
@@ -464,31 +511,36 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             scale_factors = new_v_mags / safe_v_mags
             a_vel.copy_(alpha_vels * scale_factors.unsqueeze(1))
 
-        # The bulk pool holds nothing but types 0 and 1, and the compaction above
-        # removed every -1 this step, so its live count IS the confined count --
-        # and reading it costs no device sync, unlike the old .sum().item().
-        current_confined = int(bulk.n_live)
+        # The bulk-D and tritium pools hold nothing but types 0, 1 and 3, and the
+        # compaction above removed every -1 this step, so their live counts ARE the
+        # confined ion count -- and reading them costs no device sync.
+        current_confined = int(bulk.n_live) + int(trit.n_live)
         inventory_history.append(current_confined)
 
         # --- ALPHA -> BULK ENERGY TRANSFER (energy conservation) ---
         # Energy drained from the alphas used to vanish -- removed from the fast
         # population and given to nothing, so the thermal plasma never felt the heating.
-        # Deposit it by scaling every bulk speed by one factor. Both sides are
-        # weighted (twin of the CPU loop), so real energy is conserved even when
-        # the species weights differ.
+        # Deposit it by scaling every bulk-D and tritium speed by one common factor.
+        # Both sides are weighted (twin of the CPU loop), so real energy is
+        # conserved even when the species weights differ.
         r_b = rel_w_t[b_type.long()]
-        if alpha_deposited_kev > 0.0 and bulk.n_live > 0:
-            bulk_energy_kev = float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item()) / 1.602e-16
+        r_t = rel_w_t[t_type.long()]
+        if alpha_deposited_kev > 0.0 and (bulk.n_live + trit.n_live) > 0:
+            bulk_energy_kev = (float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
+                               + float((r_t * (0.5 * cfg.m_tritium * torch.sum(t_vel**2, dim=1))).sum().item())) / 1.602e-16
             if bulk_energy_kev > 0.0:
                 boost = float(np.sqrt(1.0 + alpha_deposited_kev / bulk_energy_kev))
                 b_vel.copy_(b_vel * boost)
+                t_vel.copy_(t_vel * boost)
 
-        # Weighted macroparticle count of the bulk (thermal-D units).
-        r_sum = float(r_b.sum().item()) if bulk.n_live > 0 else 0.0
+        # Weighted macroparticle count of the bulk-D + tritium ions (thermal-D units).
+        r_sum = (float(r_b.sum().item()) if bulk.n_live > 0 else 0.0) \
+            + (float(r_t.sum().item()) if trit.n_live > 0 else 0.0)
+        current_energy_joules = 0.0
         if bulk.n_live > 0:
-            current_energy_joules = float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
-        else:
-            current_energy_joules = 0.0
+            current_energy_joules += float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
+        if trit.n_live > 0:
+            current_energy_joules += float((r_t * (0.5 * cfg.m_tritium * torch.sum(t_vel**2, dim=1))).sum().item())
 
         current_energy_keV = current_energy_joules / (cfg.e_charge * 1000.0)
         energy_history_keV.append(current_energy_keV)
@@ -538,10 +590,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             #
             # kT is measured, so the drain stays proportional to the energy the particles
             # actually hold. Energy goes as v^2, so removing fraction f means scaling
-            # every bulk velocity by sqrt(1 - f).
+            # every bulk-D and tritium velocity by sqrt(1 - f).
             T_kin_joules = T_core_kinetic * 1000.0 * cfg.e_charge
             W_thermal = 1.5 * 1.0e20 * T_kin_joules
-            if W_thermal > 0.0 and bulk.n_live > 0:
+            if W_thermal > 0.0 and (bulk.n_live + trit.n_live) > 0:
                 loss_fraction = float(P_rad) * cfg.reactor_dt / W_thermal
                 # Radiation cools toward the post-quench floor, not through it: cap the
                 # drain at the energy above POST_QUENCH_TEMP so a large P_rad can never
@@ -554,6 +606,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     # alpha-drag drain this multiply does not round back to the original.
                     drain = float(np.sqrt(1.0 - loss_fraction))
                     b_vel.copy_(b_vel * drain)
+                    t_vel.copy_(t_vel * drain)
 
         prof.add("alpha heating + energy transfer", _t)
 
@@ -595,10 +648,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # bare concatenate puts every alpha after every bulk particle, which is a
     # different order from the single-pool version. Sorting by pid restores it,
     # and pids are unique across both pools from the one shared counter.
-    pos_all = torch.cat((b_pos, a_pos), dim=0).cpu().numpy()
-    vel_all = torch.cat((b_vel, a_vel), dim=0).cpu().numpy()
-    type_all = torch.cat((b_type, a_type), dim=0).cpu().numpy()
-    pid_all = torch.cat((b_pid, a_pid), dim=0).cpu().numpy()
+    pos_all = torch.cat((b_pos, a_pos, t_pos), dim=0).cpu().numpy()
+    vel_all = torch.cat((b_vel, a_vel, t_vel), dim=0).cpu().numpy()
+    type_all = torch.cat((b_type, a_type, t_type), dim=0).cpu().numpy()
+    pid_all = torch.cat((b_pid, a_pid, t_pid), dim=0).cpu().numpy()
     legacy_order = np.argsort(pid_all, kind="stable")
     pos_np = np.ascontiguousarray(pos_all[legacy_order])
     vel_np = np.ascontiguousarray(vel_all[legacy_order])

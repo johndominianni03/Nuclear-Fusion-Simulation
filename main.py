@@ -149,8 +149,8 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
 
     print("[SYSTEM] Thermal D-T fusion power from flux-surface profiles")
     _t = prof.mark()
-    # Weighted thermal-ion n(psi_N), T(psi_N); n_D = n_T = n_thermal / 2 is an
-    # assumption (there is no tritium species). Beam ions and alphas are excluded.
+    # Weighted thermal-D and thermal-T n(psi_N), T(psi_N); P = n_D n_T <sigma v>(T_i) E
+    # at the density-weighted thermal-ion temperature. Beam ions and alphas are excluded.
     flux_profiles = compute_flux_profiles(pos_np, vel_np, type_np, eq, species_masses(cfg),
                                           weight=weight_lut(cfg), B0=cfg.B0)
     P_fusion_profile, total_fusion_power_watts = compute_thermal_fusion_power(flux_profiles, cfg)
@@ -161,7 +161,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     prof.add("pkg: flux profiles + thermal fusion power", _t)
 
     print("==================================================")
-    print(f" THERMAL D-T FUSION POWER (50/50 D-T assumed, beams and alphas excluded): "
+    print(f" THERMAL D-T FUSION POWER (thermal D and T profiles, beams and alphas excluded): "
           f"{total_fusion_power_watts:.3e} W ")
     print("==================================================")
 

@@ -6,6 +6,7 @@ class SimulationConfiguration:
         # --- PHYSICS CONSTANTS ---
         self.e_charge = 1.602e-19       # Elementary charge (C)
         self.m_deuterium = 3.344e-27    # Deuterium mass (kg)
+        self.m_tritium = 3.016 * 1.660539e-27   # Tritium mass (kg), 3.016 u
 
         # --- MAGNETIC FIELD ---
         self.B0 = 12.0                  # Toroidal field (T)
@@ -39,7 +40,9 @@ class SimulationConfiguration:
         self.initial_thermal_count = 50000
         # Thermal ions are loaded over the whole last closed flux surface with peaked
         # profiles n = n0 (1 - psi_N), T = T0 (1 - psi_N); T_thermal_keV is T0, the
-        # on-axis temperature. n0 follows from N_AVG_TARGET below.
+        # on-axis temperature. n0 follows from N_AVG_TARGET below. The count is split
+        # evenly between thermal deuterium (type 0) and thermal tritium (type 3), each
+        # with those same profiles and the same weight; tritium has its own pool.
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
         self.inject_every_n_steps = 2

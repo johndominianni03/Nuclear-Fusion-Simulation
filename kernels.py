@@ -230,7 +230,8 @@ def vectorized_gather_and_B(pos_arr, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_g
 def apply_vectorized_collisions(vel_arr, type_arr, nu_c, dt):
     N = vel_arr.shape[0]
     for i in prange(N):
-        if (type_arr[i] == 0 or type_arr[i] == 1) and np.random.rand() < nu_c * dt:
+        # Thermal D (0), beam D (1) and thermal T (3) collide; alphas (2) do not.
+        if (type_arr[i] == 0 or type_arr[i] == 1 or type_arr[i] == 3) and np.random.rand() < nu_c * dt:
             speed = np.linalg.norm(vel_arr[i])
             costheta = 2.0 * np.random.rand() - 1.0
             sintheta = np.sqrt(1.0 - costheta**2)

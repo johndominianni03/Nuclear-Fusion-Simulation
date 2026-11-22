@@ -46,22 +46,29 @@ def initialize_reactor(cfg):
     print(f"[SYSTEM] Confined plasma volume from psi_edge surface: {eq.plasma_volume_m3:.3f} m^3")
 
     # Real ions per macroparticle, per species (keyed by type code), so that the
-    # thermal population represents a volume-averaged density of N_AVG_TARGET.
+    # thermal population (D + T together) represents a volume-averaged ion density
+    # of N_AVG_TARGET.
     w_thermal = cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / cfg.initial_thermal_count
     cfg.WEIGHT = {0: w_thermal,     # thermal D
                   1: w_thermal,     # beam D
-                  2: w_thermal}     # alpha
+                  2: w_thermal,     # alpha
+                  3: w_thermal}     # thermal T
     print(f"[SYSTEM] Thermal macroparticle weight: {w_thermal:.3e} ions per macroparticle "
           f"(<n> = {cfg.N_AVG_TARGET:.2e} m^-3 over {cfg.PLASMA_VOLUME_M3:.3f} m^3)")
 
-    print(f"[SYSTEM] Initializing thermal background ({cfg.initial_thermal_count:,} particles, "
+    # Thermal D and thermal T, half each (D gets the odd one out of an odd count).
+    N = cfg.initial_thermal_count
+    N_D = N - N // 2
+    N_T = N // 2
+    print(f"[SYSTEM] Initializing thermal background ({N_D:,} D + {N_T:,} T macroparticles, "
           f"n and T proportional to 1 - psi_N, T = {cfg.T_thermal_keV} keV on axis)...")
 
     # 1. Positions: peaked density n = n0 (1 - psi_N) over the whole last closed flux
     # surface. A sample uniform in (R, Z) represents a 3D density proportional to 1/R
     # (a cell's revolved volume is 2 pi R dR dZ), so each is accepted with probability
     # R (1 - psi_N) / R_max, which leaves the accepted set with n proportional to (1 - psi_N).
-    N = cfg.initial_thermal_count
+    # The samples are independent, so the first N_D become deuterons and the rest
+    # tritons: each species gets the same density profile.
     R_accum = np.empty(0, dtype=np.float64)
     Z_accum = np.empty(0, dtype=np.float64)
     while R_accum.shape[0] < N:
@@ -77,9 +84,12 @@ def initialize_reactor(cfg):
     R = R_accum[:N]
     Z = Z_accum[:N]
 
-    # 2. Velocities: a local Maxwellian at T = T0 (1 - psi_N)
+    # 2. Velocities: a local Maxwellian at T = T0 (1 - psi_N), each species at its
+    # own mass (the deuteron rows keep engine.m, the mass they were loaded with
+    # before tritium existed).
     T_local_keV = cfg.T_thermal_keV * (1.0 - compute_psi_normalised(R, Z, eq))
-    thermal_velocities = engine.initialize_velocities_profile(T_local_keV)
+    mass_row = np.concatenate([np.full(N_D, engine.m), np.full(N_T, cfg.m_tritium)])
+    thermal_velocities = engine.initialize_velocities_profile(T_local_keV, mass=mass_row)
 
     phi = np.random.uniform(0, 2 * np.pi, cfg.initial_thermal_count)
 
@@ -88,8 +98,9 @@ def initialize_reactor(cfg):
     pos_arr[:, 1] = R * np.sin(phi)
     pos_arr[:, 2] = Z
 
-    # 3. Particle types (0 = Thermal, 1 = NBI, 2 = Alpha, -1 = Lost)
+    # 3. Particle types (0 = thermal D, 1 = beam D, 2 = alpha, 3 = thermal T, -1 = lost)
     type_arr = np.zeros(cfg.initial_thermal_count, dtype=np.int32)
+    type_arr[N_D:] = 3
 
     # 4. Load into Apple Metal unified memory (PyTorch tensors)
     pos_tensor = torch.tensor(pos_arr, device=cfg.HPC_DEVICE, dtype=torch.float32)

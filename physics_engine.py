@@ -19,11 +19,13 @@ class ParticlePusher:
         velocities = np.random.normal(0, v_thermal / np.sqrt(2), (num_particles, 3))
         return velocities
 
-    def initialize_velocities_profile(self, T_keV):
+    def initialize_velocities_profile(self, T_keV, mass=None):
         # Maxwellian with a per-particle temperature: each Cartesian component is
-        # normal with variance T/m.
+        # normal with variance T/m. mass: one value or one per particle (default:
+        # the deuteron mass).
         T_Joules = np.asarray(T_keV, dtype=np.float64) * 1e3 * abs(self.q)
-        sigma = np.sqrt(T_Joules / self.m)
+        m = self.m if mass is None else np.asarray(mass, dtype=np.float64)
+        sigma = np.sqrt(T_Joules / m)
         return np.random.normal(0.0, 1.0, (T_Joules.shape[0], 3)) * sigma[:, None]
 
     def plot_velocity_diagnostic(self, velocities, T_keV, filename="velocity_diagnostic.png"):
@@ -605,7 +607,7 @@ def apply_vectorized_collisions_torch(vel_tensor, type_tensor, nu_c, dt):
     device = vel_tensor.device
     N = vel_tensor.shape[0]
 
-    eligible = (type_tensor == 0) | (type_tensor == 1)
+    eligible = (type_tensor == 0) | (type_tensor == 1) | (type_tensor == 3)
     rolls = torch.rand((N, 3), device=device)
     collide_mask = eligible & (rolls[:, 0] < (nu_c * dt))
 
@@ -858,7 +860,7 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
     """Per-species moments on psi_N shells.
 
     pos, vel : (N, 3) Cartesian positions [m] and velocities [m/s]
-    types    : (N,) species, 0 thermal, 1 beam, 2 alpha (-1 lost; ignored)
+    types    : (N,) species, 0 thermal D, 1 beam D, 2 alpha, 3 thermal T (-1 lost; ignored)
     masses   : per-species masses in kg, indexed by type code (species_masses)
     weight   : real ions per macroparticle, either one number for every species
                or a per-species sequence indexed by type code (weight_lut)
@@ -999,9 +1001,14 @@ def compute_force_balance_potential(prof, species=0, min_count=FIELD_MIN_COUNT, 
     Maxwellian) and dp/dpsi_N is the spline's analytic derivative. The fine mesh
     runs from 0 to the last supported shell centre; Phi = 0 there and beyond.
 
+    `species` is one type code or several; several are summed (n, p and counts),
+    which is the force balance of a multi-species ion fluid of charge e:
+    e (n_D + n_T) E = grad (p_D + p_T).
+
     Returns dict(x, Phi, dPhi_dx, x_end) with Phi in volts.
     """
-    c = prof["count"][species]
+    sp = np.atleast_1d(species)
+    c = prof["count"][sp].sum(axis=0)
     centers = prof["psiN_centers"]
     K = 0
     while K < len(c) and c[K] >= min_count:
@@ -1010,8 +1017,8 @@ def compute_force_balance_potential(prof, species=0, min_count=FIELD_MIN_COUNT, 
     if K < 4:                                      # a cubic needs 4 points
         return {"x": x, "Phi": np.zeros_like(x), "dPhi_dx": np.zeros_like(x), "x_end": 0.0}
     xs = centers[:K]
-    n = prof["n"][species, :K]
-    p = prof["p"][species, :K]
+    n = prof["n"][sp, :K].sum(axis=0)
+    p = prof["p"][sp, :K].sum(axis=0)
     ck = c[:K].astype(np.float64)
     n_spl = smooth_profile(xs, n, n / np.sqrt(ck))
     p_spl = smooth_profile(xs, p, p * np.sqrt(5.0 / (3.0 * ck)))
@@ -1057,29 +1064,46 @@ def map_flux_profile_to_grid(values, centers, eq, R_min, R_max, Z_min, Z_max, nR
     return np.where(psiN <= 1.0, np.interp(psiN, centers, values), 0.0)
 
 
+def thermal_ion_temperature_keV(prof):
+    """Thermal-ion temperature per shell: the density-weighted mean of the thermal
+    D and thermal T temperatures,
+        T_i = (n_D T_D + n_T T_T) / (n_D + n_T) = (p_D + p_T) / (n_D + n_T),
+    i.e. the temperature of the combined thermal-ion pressure. A species whose
+    shell temperature is undefined (fewer than 2 particles) is left out of that
+    shell's mean; 0 where neither is defined."""
+    n_D, n_T = prof["n"][0], prof["n"][3]
+    T_D, T_T = prof["T_keV"][0], prof["T_keV"][3]
+    okD, okT = np.isfinite(T_D), np.isfinite(T_T)
+    num = np.where(okD, n_D * np.nan_to_num(T_D), 0.0) + np.where(okT, n_T * np.nan_to_num(T_T), 0.0)
+    den = np.where(okD, n_D, 0.0) + np.where(okT, n_T, 0.0)
+    return np.where(den > 0.0, num / np.where(den > 0.0, den, 1.0), 0.0)
+
+
 def compute_thermal_fusion_power(prof, cfg):
     """Thermal D-T fusion power density per psi_N shell and its volume integral.
 
-    ASSUMPTION: the simulation has one thermal ion species (deuterons) and no
-    tritium, so the thermal ions are taken as a 50/50 D-T mix,
-        n_D = n_T = n_thermal / 2,
-    at the thermal ion temperature T(psi_N). Then per shell k
-        P_k = n_D n_T <sigma v>(T_k) E_fusion          [W/m^3]
+    Per shell k, from the weighted thermal-D and thermal-T profiles,
+        P_k = n_D,k n_T,k <sigma v>(T_i,k) E_fusion     [W/m^3]
         P_total = sum_k P_k V_k                         [W]
-    with the Bosch-Hale reactivity. Beam ions and alphas are excluded: this is the
-    thermonuclear power of the thermal population only. Shells without a
-    temperature (fewer than 2 thermals) contribute nothing.
+    with the Bosch-Hale reactivity at the thermal-ion temperature T_i (the
+    density-weighted mean of T_D and T_T, thermal_ion_temperature_keV). Beam ions
+    and alphas are excluded: this is the thermonuclear power of the thermal
+    population only. Shells without a temperature contribute nothing.
     Returns (P_k, P_total).
     """
-    n_half = 0.5 * prof["n"][0]
-    T = np.nan_to_num(prof["T_keV"][0], nan=0.0)
-    P = compute_volumetric_fusion_power(n_half[None, :], n_half[None, :], T[None, :], cfg)[0]
+    n_D, n_T = prof["n"][0], prof["n"][3]
+    T = thermal_ion_temperature_keV(prof)
+    P = compute_volumetric_fusion_power(n_D[None, :], n_T[None, :], T[None, :], cfg)[0]
     return P, float(np.sum(P * prof["shell_volume"]))
 
 
+# Species type codes: 0 thermal D, 1 beam D, 2 alpha, 3 thermal T (-1 lost).
+THERMAL_SPECIES = (0, 3)
+
+
 def species_masses(cfg):
-    """Per-species masses indexed by type code: (thermal D, beam D, alpha)."""
-    return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA)
+    """Per-species masses indexed by type code: (thermal D, beam D, alpha, thermal T)."""
+    return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA, cfg.m_tritium)
 
 
 def weight_lut(cfg):
@@ -1130,8 +1154,9 @@ def update_force_balance_field(cfg, eq, pos, vel, types):
     """The reactor loops' field update: thermal-ion profiles of the given
     particles -> (phi_grid, E_R_grid, E_Z_grid, potential_dict). Host arrays."""
     prof = compute_flux_profiles(pos, vel, types, eq, species_masses(cfg), weight=weight_lut(cfg))
+    # Both thermal species: e (n_D + n_T) E = grad (p_D + p_T).
     return compute_force_balance_field(prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
-                                       cfg.nR, cfg.nZ, species=0)
+                                       cfg.nR, cfg.nZ, species=THERMAL_SPECIES)
 
 
 def _deposit_weighted(cfg, pos, types, per_particle):
@@ -1150,7 +1175,7 @@ def deposit_ion_charge_density(cfg, pos, types):
     """Weighted CIC ion charge density (C/m^3) of every live particle.
 
     Each macroparticle carries cfg.WEIGHT[type] ions of its species' charge: e
-    for thermal and beam deuterons, CHARGE_ALPHA for alphas.
+    for deuterons and tritons, CHARGE_ALPHA for alphas.
     """
     return _deposit_weighted(cfg, pos, types,
                              lambda t: np.where(t == 2, cfg.CHARGE_ALPHA, cfg.e_charge))

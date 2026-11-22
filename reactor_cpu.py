@@ -77,6 +77,14 @@ def _push_alphas(cfg, a_pos, a_vel, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_gr
         cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth)
 
 
+def _push_thermal_tritium(cfg, t_pos, t_vel, B_t, E_t):
+    # Thermal tritons: one Boris step at the global dt with q = e, m = m_T (their
+    # 1 keV Larmor radius, ~6e-4 m, is resolved like the deuterons'). Mutates
+    # t_pos / t_vel in place. Twin: reactor_gpu._push_thermal_tritium_torch.
+    _boris_push_adaptive(t_pos, t_vel, cfg.e_charge, cfg.m_tritium,
+                         B_t, E_t, cfg.reactor_dt, cfg.HPC_DEVICE)
+
+
 def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid,
                           B_R_pol_grid, B_Z_pol_grid):
     # The whole per-step pipeline runs on Numpy/Numba. At this particle count (~10k-20k,
@@ -105,48 +113,59 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # never reused, so injection walks them past the initial count.
     pid_capacity = _pid_capacity_bound(cfg, n_init)
     pid_row = np.full(pid_capacity, -1, dtype=np.int64)
-    pid_row[:n_init] = np.arange(n_init, dtype=np.int64)
     # pid -> track slot, -1 when the pid is not plotted. Replaces the
     # `dpid in history_tracks` dict membership test in the compaction below.
     pid_slot = np.full(pid_capacity, -1, dtype=np.int64)
-    # pid -> which pool the row index above is relative to: 0 = bulk, 1 = alpha.
-    # With the pools split, pid_row alone is ambiguous -- row 7 means a different
-    # particle in each pool -- so the two arrays are only meaningful together.
+    # pid -> which pool the row index above is relative to: 0 = bulk D,
+    # 1 = alpha, 2 = tritium. With the pools split, pid_row alone is ambiguous --
+    # row 7 means a different particle in each pool -- so the two arrays are only
+    # meaningful together.
     #
     # WRITE-ONCE, at birth, and deliberately NOT updated by compaction. That is
     # sound rather than an oversight: species never migrates. type is written only
-    # at birth (0/1/2) and at death (-1) -- THERMALIZATION_ENERGY_KEV gates whether
+    # at birth (0/1/2/3) and at death (-1) -- THERMALIZATION_ENERGY_KEV gates whether
     # an alpha keeps heating, it does not reclassify it -- so a particle can never
     # change pool. Only its row moves, and pid_row carries that.
     pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
-    pid_pool[:n_init] = 0
 
-    # --- SPLIT POOLS (step 9) ---
-    # bulk holds types 0 and 1, alpha holds type 2. The masks that used to select
-    # them out of one mixed pool (mask_d, mask_a, mask_valid, mask_alphas) are
-    # gone: each kernel now runs on a contiguous [:n_live] view with no gather,
-    # no .copy() and no masked write-back.
+    # --- SPLIT POOLS ---
+    # bulk holds deuterium (types 0 and 1), alpha holds type 2, trit holds thermal
+    # tritium (type 3). Each kernel runs on a contiguous [:n_live] view with no
+    # gather, no .copy() and no masked write-back; the one boolean split below
+    # happens once, before the loop.
     #
-    # ORDER IS LOAD-BEARING. The single pool was always ascending by pid --
+    # ORDER IS LOAD-BEARING. Each pool is independently ascending by pid --
     # injection appends and compaction is an order-preserving forward gather --
-    # so a boolean mask over it yielded each species in ascending-pid order. Each
-    # split pool is independently ascending by pid, so the profile binning over
-    # the bulk and the alpha energy accumulation see each species in ascending-pid
-    # order, and the end-of-run rejoin below restores the single-pool order.
-    bulk_capacity, alpha_capacity = _pool_capacity_bounds(cfg, n_init)
+    # so the profile binning and the energy sums see each species in ascending-pid
+    # order, and the end-of-run rejoin below restores one ascending-pid order.
+    is_trit = type_init == 3
+    rows_d = np.nonzero(~is_trit)[0]
+    rows_t = np.nonzero(is_trit)[0]
+    bulk_capacity, alpha_capacity, trit_capacity = _pool_capacity_bounds(cfg, len(rows_d), len(rows_t))
     bulk = _ParticlePool(bulk_capacity, device=None)
     alpha = _ParticlePool(alpha_capacity, device=None)
-    bulk.add(pos_init, vel_init, 0, np.arange(n_init, dtype=np.int64))
-    bulk.type[:n_init] = type_init   # preserve any non-zero species from init
+    trit = _ParticlePool(trit_capacity, device=None)
+    bulk.add(pos_init[rows_d], vel_init[rows_d], 0, rows_d.astype(np.int64))
+    bulk.type[:len(rows_d)] = type_init[rows_d]   # preserve any non-zero D species from init
+    trit.add(pos_init[rows_t], vel_init[rows_t], 3, rows_t.astype(np.int64))
+    pid_row[rows_d] = np.arange(len(rows_d), dtype=np.int64)
+    pid_row[rows_t] = np.arange(len(rows_t), dtype=np.int64)
+    pid_pool[rows_d] = 0
+    pid_pool[rows_t] = 2
     b_pos, b_vel, b_type, b_pid = bulk.views()
     a_pos, a_vel, a_type, a_pid = alpha.views()
+    t_pos, t_vel, t_type, t_pid = trit.views()
 
-    n_track = min(1000, n_init)
-    # 1000 initial thermals + the 1000-each NBI and alpha caps below.
+    # 500 thermal D + 500 thermal T + the 1000-each NBI and alpha caps below.
     tracks = _TrackStore(_MAX_TRACKED_SLOTS, device=None, host_dtype=np.float32)
-    init_slots = tracks.add_slots(b_pid[:n_track], 0,
-                                  b_pos[:n_track], b_vel[:n_track])
-    pid_slot[b_pid[:n_track]] = init_slots
+    n_track_d = min(500, bulk.n_live)
+    init_slots = tracks.add_slots(b_pid[:n_track_d], 0,
+                                  b_pos[:n_track_d], b_vel[:n_track_d])
+    pid_slot[b_pid[:n_track_d]] = init_slots
+    n_track_t = min(500, trit.n_live)
+    init_slots = tracks.add_slots(t_pid[:n_track_t], 3,
+                                  t_pos[:n_track_t], t_vel[:n_track_t])
+    pid_slot[t_pid[:n_track_t]] = init_slots
     tracked_nbis = 0
     tracked_alphas = 0
 
@@ -165,6 +184,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # inside the sub-step kernel.
     E_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
     B_buf_b = np.empty((bulk.capacity, 3), dtype=np.float32)
+    # Same contract for the tritium pool, sized from its own capacity.
+    E_buf_t = np.empty((trit.capacity, 3), dtype=np.float32)
+    B_buf_t = np.empty((trit.capacity, 3), dtype=np.float32)
 
     # Per-species weight relative to thermal D, indexed by type code. Energies and
     # counts below are weighted with it, so they read in thermal-D macroparticle
@@ -192,7 +214,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # B, E) and two masked scatters, all over the full particle array.
     push_prof = StageProfiler(profiling, label="deuteron push breakdown")
     if profiling:
-        _profile_header(cfg, "CPU / Numba path", bulk.n_live + alpha.n_live)
+        _profile_header(cfg, "CPU / Numba path", bulk.n_live + alpha.n_live + trit.n_live)
     loop_wall_start = time.perf_counter() if profiling else None
 
     for step in range(cfg.reactor_num_steps):
@@ -277,14 +299,15 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("alpha injection", _t)
 
         # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
-        # E from thermal-ion radial force balance (no rotation), rebuilt from the
-        # current bulk pool at step 0 and every FIELD_UPDATE_EVERY steps. The bulk
-        # pool is all-live here (the compaction below removes every -1 each step).
-        # Twin: the same call in reactor_gpu on host copies of the pool.
+        # E from thermal-ion (D + T) radial force balance (no rotation), rebuilt from
+        # the current bulk-D and tritium pools at step 0 and every FIELD_UPDATE_EVERY
+        # steps. The pools are all-live here (the compaction below removes every -1
+        # each step). Twin: the same call in reactor_gpu on host copies of the pools.
         _t = prof.mark()
         if step % cfg.FIELD_UPDATE_EVERY == 0:
             phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
-                cfg, engine.eq, b_pos, b_vel, b_type)
+                cfg, engine.eq, np.concatenate((b_pos, t_pos)), np.concatenate((b_vel, t_vel)),
+                np.concatenate((b_type, t_type)))
         prof.add("E_r force balance", _t)
 
         # Bulk gather. The alphas gather inside their sub-step push below.
@@ -293,6 +316,14 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         B_b = B_buf_b[:bulk.n_live]
         vectorized_gather_and_B_into(
             b_pos, E_b, B_b,
+            E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
+            cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
+            cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
+        )
+        E_t = E_buf_t[:trit.n_live]
+        B_t = B_buf_t[:trit.n_live]
+        vectorized_gather_and_B_into(
+            t_pos, E_t, B_t,
             E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid,
             cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
             cfg.B0, cfg.R0_major, t, cfg.b_perturb_initial, cfg.m_mode, cfg.n_mode, cfg.gamma_growth
@@ -314,6 +345,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             _ts = push_prof.mark()
             push_prof.add("masked write-back", _ts)
         prof.add("deuteron Boris push", _t)
+
+        # Thermal tritium: same single global step (Larmor radius ~6e-4 m at 1 keV),
+        # its own mass, its own contiguous pool.
+        _t = prof.mark()
+        if trit.n_live > 0:
+            _push_thermal_tritium(cfg, t_pos, t_vel, B_t, E_t)
+        prof.add("tritium Boris push", _t)
 
         # Alphas are sub-stepped, with the field re-gathered every sub-step (see
         # _push_alphas). Deuterons stay on the single global step (Larmor radius
@@ -337,6 +375,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # now walks. Mutates in place and returns the same array, so the
         # rebinding is a no-op and b_vel stays the pool view.
         b_vel = apply_vectorized_collisions(b_vel, b_type, cfg.nu_c, cfg.reactor_dt)
+        # Thermal tritium collides too (the kernel's guard admits type 3); same
+        # in-place contract, so t_vel stays the pool view.
+        t_vel = apply_vectorized_collisions(t_vel, t_type, cfg.nu_c, cfg.reactor_dt)
         prof.add("apply_vectorized_collisions", _t)
 
         # Confinement against the psi flux surface, not a circle
@@ -350,7 +391,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     engine.eq.psi_nR, engine.eq.psi_nZ)
         lost_b = check_confinement_flux(b_pos, b_type, *psi_args)
         lost_a = check_confinement_flux(a_pos, a_type, *psi_args) if alpha.n_live > 0 else 0
-        newly_lost = lost_b + lost_a
+        lost_t = check_confinement_flux(t_pos, t_type, *psi_args) if trit.n_live > 0 else 0
+        newly_lost = lost_b + lost_a + lost_t
         prof.add("check_confinement_flux", _t)
         total_lost += newly_lost
 
@@ -366,7 +408,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             # pool the index belongs to.
             for _pool, _pos, _vel, _type, _pid, _lost in (
                     (bulk, b_pos, b_vel, b_type, b_pid, lost_b),
-                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a)):
+                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a),
+                    (trit, t_pos, t_vel, t_type, t_pid, lost_t)):
                 if _lost == 0:
                     continue
                 alive = _type != -1
@@ -394,12 +437,15 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
             b_pos, b_vel, b_type, b_pid = bulk.views()
             a_pos, a_vel, a_type, a_pid = alpha.views()
+            t_pos, t_vel, t_type, t_pid = trit.views()
             # Rebuild the row map for whichever pools moved. pid_pool is NOT
             # touched: a particle cannot change pool, only rows move.
             if lost_b:
                 pid_row[b_pid] = np.arange(bulk.n_live, dtype=np.int64)
             if lost_a:
                 pid_row[a_pid] = np.arange(alpha.n_live, dtype=np.int64)
+            if lost_t:
+                pid_row[t_pid] = np.arange(trit.n_live, dtype=np.int64)
         prof.add("wall-loss compaction", _t)
 
         # --- TRAJECTORY SAMPLING (pid-keyed, so removal cannot corrupt it) ---
@@ -425,7 +471,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 sel_slots = due[keep]
                 sel_rows = rows[keep]
                 sel_pools = pid_pool[due_pids[keep]]
-                for _which, _pos, _vel in ((0, b_pos, b_vel), (1, a_pos, a_vel)):
+                for _which, _pos, _vel in ((0, b_pos, b_vel), (1, a_pos, a_vel), (2, t_pos, t_vel)):
                     grp = sel_pools == _which
                     if not np.any(grp):
                         continue
@@ -448,32 +494,39 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                                                      cfg.reactor_dt)
             a_vel[:] = alpha_vels.astype(np.float32)
 
-        # The bulk pool holds nothing but types 0 and 1, and the compaction above
-        # removed every -1 this step, so its live count IS the confined count.
-        current_confined = int(bulk.n_live)
+        # The bulk-D and tritium pools hold nothing but types 0, 1 and 3, and the
+        # compaction above removed every -1 this step, so their live counts ARE the
+        # confined ion count (alphas are not counted, as before).
+        current_confined = int(bulk.n_live) + int(trit.n_live)
         inventory_history.append(current_confined)
 
         # --- ALPHA -> BULK ENERGY TRANSFER (energy conservation) ---
         # Energy drained from the alphas used to vanish -- removed from the fast
         # population and given to nothing, so the thermal plasma never felt the heating.
-        # Deposit it by scaling every bulk speed by one factor. Both sides are
-        # weighted -- given up sum(w_a dE_a), received sum(w_b dE_b) -- so real
-        # energy is conserved even when the species weights differ.
+        # Deposit it by scaling every bulk-D and tritium speed by one common factor.
+        # Both sides are weighted -- given up sum(w_a dE_a), received sum(w_b dE_b)
+        # over both pools -- so real energy is conserved even when the species
+        # weights differ.
         r_b = rel_w[b_type]
-        if alpha_deposited_kev > 0.0 and bulk.n_live > 0:
+        r_t = rel_w[t_type]
+        if alpha_deposited_kev > 0.0 and (bulk.n_live + trit.n_live) > 0:
             bulk_vels = b_vel.astype(np.float64)
-            bulk_energy_kev = weighted_kinetic_energy_kev(bulk_vels, r_b, cfg.m_deuterium)
+            trit_vels = t_vel.astype(np.float64)
+            bulk_energy_kev = (weighted_kinetic_energy_kev(bulk_vels, r_b, cfg.m_deuterium)
+                               + weighted_kinetic_energy_kev(trit_vels, r_t, cfg.m_tritium))
             if bulk_energy_kev > 0.0:
                 boost = bulk_boost_factor(alpha_deposited_kev, bulk_energy_kev)
                 b_vel[:] = (bulk_vels * boost).astype(np.float32)
+                t_vel[:] = (trit_vels * boost).astype(np.float32)
 
-        # Weighted macroparticle count of the bulk (thermal-D units): the confined
-        # real ion count is r_sum * WEIGHT[0].
-        r_sum = float(np.sum(r_b))
+        # Weighted macroparticle count of the bulk-D + tritium ions (thermal-D
+        # units): the confined real ion count is r_sum * WEIGHT[0].
+        r_sum = float(np.sum(r_b)) + float(np.sum(r_t))
+        current_energy_joules = 0.0
         if bulk.n_live > 0:
-            current_energy_joules = np.sum(r_b * (0.5 * cfg.m_deuterium * (np.linalg.norm(b_vel.astype(np.float64), axis=1)**2)))
-        else:
-            current_energy_joules = 0.0
+            current_energy_joules += np.sum(r_b * (0.5 * cfg.m_deuterium * (np.linalg.norm(b_vel.astype(np.float64), axis=1)**2)))
+        if trit.n_live > 0:
+            current_energy_joules += np.sum(r_t * (0.5 * cfg.m_tritium * (np.linalg.norm(t_vel.astype(np.float64), axis=1)**2)))
 
         current_energy_keV = current_energy_joules / (cfg.e_charge * 1000.0)
         energy_history_keV.append(current_energy_keV)
@@ -523,10 +576,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             #
             # kT is measured, so the drain stays proportional to the energy the particles
             # actually hold. Energy goes as v^2, so removing fraction f means scaling
-            # every bulk velocity by sqrt(1 - f).
+            # every bulk-D and tritium velocity by sqrt(1 - f).
             T_kin_joules = T_core_kinetic * 1000.0 * cfg.e_charge
             W_thermal = 1.5 * 1.0e20 * T_kin_joules
-            if W_thermal > 0.0 and bulk.n_live > 0:
+            if W_thermal > 0.0 and (bulk.n_live + trit.n_live) > 0:
                 loss_fraction = float(P_rad) * cfg.reactor_dt / W_thermal
                 # Radiation cools toward the post-quench floor, not through it: cap the
                 # drain at the energy above POST_QUENCH_TEMP so a large P_rad can never
@@ -536,6 +589,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                 if loss_fraction > 0.0:
                     drain = np.sqrt(1.0 - loss_fraction)
                     b_vel[:] = (b_vel.astype(np.float64) * drain).astype(np.float32)
+                    t_vel[:] = (t_vel.astype(np.float64) * drain).astype(np.float32)
 
         # energy_history_keV / T_core_kinetic above are recorded BEFORE the drain, which
         # is correct: the radiation covers [t, t+dt] and so lands in the next step's
@@ -579,10 +633,10 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # concatenation by pid restores exactly that order. pids are unique across
     # both pools (one shared counter), so the sort is total; kind="stable" is
     # belt-and-braces.
-    pos_np = np.concatenate((b_pos, a_pos), axis=0)
-    vel_np = np.concatenate((b_vel, a_vel), axis=0)
-    type_np = np.concatenate((b_type, a_type), axis=0)
-    pid_all = np.concatenate((b_pid, a_pid), axis=0)
+    pos_np = np.concatenate((b_pos, a_pos, t_pos), axis=0)
+    vel_np = np.concatenate((b_vel, a_vel, t_vel), axis=0)
+    type_np = np.concatenate((b_type, a_type, t_type), axis=0)
+    pid_all = np.concatenate((b_pid, a_pid, t_pid), axis=0)
     legacy_order = np.argsort(pid_all, kind="stable")
     pos_np = np.ascontiguousarray(pos_np[legacy_order])
     vel_np = np.ascontiguousarray(vel_np[legacy_order])

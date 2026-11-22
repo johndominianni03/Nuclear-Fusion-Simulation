@@ -17,9 +17,9 @@ import numpy as np
 import torch
 
 
-# Hard ceiling on plotted trajectories: 1000 initial thermals plus the
-# tracked_nbis and tracked_alphas caps of 1000 each, all three enforced at the
-# injection sites. _TrackStore raises rather than silently overrunning.
+# Hard ceiling on plotted trajectories: 500 thermal D and 500 thermal T plus
+# the tracked_nbis and tracked_alphas caps of 1000 each, all enforced where the
+# loops add slots. _TrackStore raises rather than silently overrunning.
 _MAX_TRACKED_SLOTS = 3000
 
 

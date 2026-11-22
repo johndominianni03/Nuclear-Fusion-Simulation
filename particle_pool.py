@@ -131,8 +131,8 @@ class _ParticlePool:
         return m
 
 
-def _pool_capacity_bounds(cfg, n_init):
-    """Per-pool row ceilings for the split bulk/alpha pools.
+def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
+    """Per-pool row ceilings for the split bulk-D / alpha / tritium pools.
 
     Step 8 sized ONE pool from _pid_capacity_bound, so the alpha rows and the
     bulk rows shared a single allocation and either could borrow the other's
@@ -143,13 +143,14 @@ def _pool_capacity_bounds(cfg, n_init):
     Both are derived from the same injection schedule _pid_capacity_bound counts,
     just attributed to the pool that actually receives the particles:
 
-      bulk  -- n_init thermals, plus every NBI batch. A batch is int(rate) plus
+      bulk  -- n_bulk_init thermal deuterons, plus every NBI batch. A batch is int(rate) plus
                at most one more from the stochastic remainder, and rate never
                exceeds cfg.NBI_BATCH_SIZE because the exponential taper only
                shrinks it.
       alpha -- one particle per alpha event, because alpha_batch is the literal
                1 at both injection sites. If that ever becomes a variable, this
                bound has to follow it.
+      trit  -- n_trit_init thermal tritons; nothing is ever injected into it.
 
     Neither can be exceeded by a run the single-pool version survived: species
     never migrates, so a particle is counted against exactly one pool for its
@@ -161,6 +162,7 @@ def _pool_capacity_bounds(cfg, n_init):
     nbi_events = steps // max(1, int(cfg.inject_every_n_steps)) + 1
     alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
     nbi_max = int(cfg.NBI_BATCH_SIZE) + 1
-    bulk_cap = int(n_init + nbi_events * nbi_max) + 1024
+    bulk_cap = int(n_bulk_init + nbi_events * nbi_max) + 1024
     alpha_cap = int(alpha_events) + 1024
-    return bulk_cap, alpha_cap
+    trit_cap = int(n_trit_init) + 1024
+    return bulk_cap, alpha_cap, trit_cap

@@ -174,7 +174,8 @@ def test_alpha_energy_drain_preserves_direction():
 # PHASE 2 -- flux-surface profiles
 # =======================================================
 def _species_masses(cfg):
-    return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA)
+    from physics_engine import species_masses
+    return species_masses(cfg)          # (thermal D, beam D, alpha, thermal T)
 
 
 def _positions_in_psiN(eq, n, rng, lo=0.0, hi=1.0, margin=0.0):
@@ -360,8 +361,9 @@ def test_force_balance_field_zero_outside_lcfs_and_inward():
 
 
 def test_initial_loading_profiles_and_weight():
-    """initialize_reactor loads n = n0 (1 - psi_N), T = T0 (1 - psi_N) with
-    <n> = N_AVG_TARGET, and WEIGHT[0] = N_AVG_TARGET * V / N."""
+    """initialize_reactor loads n = n0 (1 - psi_N), T = T0 (1 - psi_N) for thermal D
+    and thermal T each, with <n_D + n_T> = N_AVG_TARGET and
+    WEIGHT[0] = WEIGHT[3] = N_AVG_TARGET * V / N."""
     from config import SimulationConfiguration
     import initialization
     from physics_engine import compute_flux_profiles
@@ -373,20 +375,25 @@ def test_initial_loading_profiles_and_weight():
         np.random.set_state(state)
     N = cfg.initial_thermal_count
     assert cfg.WEIGHT[0] == cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / N
+    assert cfg.WEIGHT[3] == cfg.WEIGHT[0]
     pos, vel, typ = p.cpu().numpy(), v.cpu().numpy(), t.cpu().numpy()
-    prof = compute_flux_profiles(pos, vel, typ, eq, _species_masses(cfg), weight=cfg.WEIGHT[0])
+    prof = compute_flux_profiles(pos, vel, typ, eq, _species_masses(cfg),
+                                 weight=[cfg.WEIGHT[s] for s in range(4)])
     V = prof["shell_volume"]
-    n_avg = np.sum(prof["n"][0] * V) / V.sum()
+    n_avg = np.sum((prof["n"][0] + prof["n"][3]) * V) / V.sum()
     assert abs(n_avg / cfg.N_AVG_TARGET - 1.0) < 1e-3, f"<n> = {n_avg:.4e}"
     x = prof["psiN_centers"]
-    core = x < 0.8                                       # >= ~1000 ions per shell
-    # Fit n = n0 (1 - x) and T = T0 (1 - x) by least squares over the core shells.
-    n0 = np.sum(prof["n"][0, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
-    T0 = np.sum(prof["T_keV"][0, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
-    assert abs(T0 / cfg.T_thermal_keV - 1.0) < 0.02, f"fitted T0 = {T0:.4f} keV"
-    resid_n = np.abs(prof["n"][0, core] / (n0 * (1 - x[core])) - 1.0)
-    resid_T = np.abs(prof["T_keV"][0, core] / (T0 * (1 - x[core])) - 1.0)
-    assert resid_n.max() < 0.1 and resid_T.max() < 0.1, (resid_n.max(), resid_T.max())
+    core = x < 0.8                                       # >= ~500 ions per shell per species
+    for s in (0, 3):
+        # Fit n = n0 (1 - x) and T = T0 (1 - x) by least squares over the core shells.
+        n0 = np.sum(prof["n"][s, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
+        T0 = np.sum(prof["T_keV"][s, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
+        assert abs(T0 / cfg.T_thermal_keV - 1.0) < 0.02, f"species {s}: fitted T0 = {T0:.4f} keV"
+        resid_n = np.abs(prof["n"][s, core] / (n0 * (1 - x[core])) - 1.0)
+        resid_T = np.abs(prof["T_keV"][s, core] / (T0 * (1 - x[core])) - 1.0)
+        # Half the ions per species, so the per-shell counting noise is sqrt(2)
+        # larger than when one species held them all (bound 0.1 -> 0.15).
+        assert resid_n.max() < 0.15 and resid_T.max() < 0.15, (s, resid_n.max(), resid_T.max())
 
 
 # =======================================================
@@ -405,26 +412,35 @@ def test_bosch_hale_reactivity_at_10_keV():
     assert abs(sv / 1.136e-22 - 1.0) < 0.01, f"<sigma v>(10 keV) = {sv:.4e}"
 
 
-def _profile_for_power(eq, n_of_x, T_keV_of_x):
+def _profile_for_power(eq, n_of_x, T_keV_of_x, nT_of_x=None, TT_keV_of_x=None):
+    """Synthetic profile with thermal D in species 0 and thermal T in species 3.
+    With only n_of_x / T_keV_of_x given, n_of_x is the TOTAL thermal density,
+    split n_D = n_T = n/2 at one temperature (the old 50/50 layout); otherwise
+    n_of_x, T_keV_of_x are D's and nT_of_x, TT_keV_of_x are T's."""
     from physics_engine import compute_flux_shell_volumes
     V = compute_flux_shell_volumes(eq)
     x = 0.5 * (np.linspace(0, 1, len(V) + 1)[:-1] + np.linspace(0, 1, len(V) + 1)[1:])
-    z = np.zeros((3, len(V)))
-    prof = {"psiN_centers": x, "shell_volume": V, "n": z.copy(), "T_keV": np.full((3, len(V)), np.nan)}
-    prof["n"][0] = n_of_x(x)
-    prof["T_keV"][0] = T_keV_of_x(x)
+    z = np.zeros((4, len(V)))
+    prof = {"psiN_centers": x, "shell_volume": V, "n": z.copy(), "T_keV": np.full((4, len(V)), np.nan)}
+    if nT_of_x is None:
+        prof["n"][0] = prof["n"][3] = 0.5 * n_of_x(x)
+        prof["T_keV"][0] = prof["T_keV"][3] = T_keV_of_x(x)
+    else:
+        prof["n"][0], prof["T_keV"][0] = n_of_x(x), T_keV_of_x(x)
+        prof["n"][3], prof["T_keV"][3] = nT_of_x(x), TT_keV_of_x(x)
     return prof
 
 
 def test_thermal_fusion_power_is_the_shell_sum():
-    """P_total = sum_k P_k V_k, and each P_k = (n_k/2)^2 <sigma v>(T_k) E_fus."""
+    """P_total = sum_k P_k V_k, and each P_k = (n_k/2)^2 <sigma v>(T_k) E_fus
+    for a total thermal density n_k split evenly between D and T."""
     from physics_engine import compute_thermal_fusion_power
     cfg, eq, *_ = _production_fields()
     prof = _profile_for_power(eq, lambda x: 2e20 * (1 - x), lambda x: 12.0 * (1 - x))
     P, total = compute_thermal_fusion_power(prof, cfg)
     assert abs(total - np.sum(P * prof["shell_volume"])) <= 1e-12 * total
     for k in (0, 7, 15):
-        n, T = prof["n"][0, k], prof["T_keV"][0, k]
+        n, T = prof["n"][0, k] + prof["n"][3, k], prof["T_keV"][0, k]
         expect = (n / 2) ** 2 * _bosch_hale(cfg, T) * cfg.E_FUSION_JOULES
         assert abs(P[k] / expect - 1.0) < 1e-12
     assert P[-1] < P[0]
@@ -454,17 +470,17 @@ def test_flux_profile_density_with_unequal_species_weights():
     rng = np.random.default_rng(31)
     pos = _positions_in_psiN(eq, 30000, rng, 0.0, 1.0)
     vel = rng.normal(0.0, 3e5, pos.shape)
-    types = rng.choice([0, 1, 2, -1], size=len(pos), p=[0.6, 0.25, 0.1, 0.05])
+    types = rng.choice([0, 1, 2, 3, -1], size=len(pos), p=[0.35, 0.2, 0.1, 0.3, 0.05])
     inside = compute_psi_normalised(np.hypot(pos[:, 0], pos[:, 1]), pos[:, 2], eq) <= 1.0
-    w = (7.04e15, 2.1e12, 3.3e3)
+    w = (7.04e15, 2.1e12, 3.3e3, 5.5e15)
     prof = compute_flux_profiles(pos, vel, types, eq, _species_masses(cfg), weight=w)
-    for s in range(3):
+    for s in range(4):
         expect = w[s] * np.sum(inside & (types == s))
         got = float(np.sum(prof["n"][s] * prof["shell_volume"]))
         assert abs(got - expect) <= 1e-12 * expect, f"species {s}: {got} vs {expect}"
 
     saved = cfg.WEIGHT
-    cfg.WEIGHT = {s: w[s] for s in range(3)}
+    cfg.WEIGHT = {s: w[s] for s in range(4)}
     try:
         rho = deposit_ion_charge_density(cfg, pos, types)
     finally:
@@ -473,7 +489,8 @@ def test_flux_profile_density_with_unequal_species_weights():
     dZ = (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
     R_nodes = cfg.R_min + np.arange(cfg.nR) * dR
     total = float(np.sum(rho * 2.0 * np.pi * R_nodes[:, None] * dR * dZ))
-    expect = (cfg.e_charge * (w[0] * np.sum(types == 0) + w[1] * np.sum(types == 1))
+    expect = (cfg.e_charge * (w[0] * np.sum(types == 0) + w[1] * np.sum(types == 1)
+                              + w[3] * np.sum(types == 3))
               + cfg.CHARGE_ALPHA * w[2] * np.sum(types == 2))
     assert abs(total / expect - 1.0) < 1e-10, f"{total:.12e} vs {expect:.12e}"
 
@@ -519,6 +536,143 @@ def test_alpha_to_bulk_transfer_conserves_weighted_energy():
     received = _real_energy(b1, b_w, cfg.m_deuterium) - _real_energy(b_vel, b_w, cfg.m_deuterium)
     assert given > 0.0
     assert abs(received / given - 1.0) < 1e-12, f"given {given:.15e} J, received {received:.15e} J"
+
+
+# =======================================================
+# TIER 2 PHASE 2 -- thermal tritium
+# =======================================================
+def _gyro_phase_rate(push, cfg, mass, B_mag, dt, steps=400):
+    """Angular rate of v_perp for one ion in a uniform B = B_mag z_hat, E = 0,
+    pushed by `push(cfg, pos, vel, B, E)` with cfg.reactor_dt = dt."""
+    pos = np.array([[1.1, 0.0, 0.0]], dtype=np.float32)
+    vel = np.array([[2.0e5, 0.0, 1.0e5]], dtype=np.float32)
+    B = np.array([[0.0, 0.0, B_mag]], dtype=np.float32)
+    E = np.zeros((1, 3), dtype=np.float32)
+    saved = cfg.reactor_dt
+    cfg.reactor_dt = dt
+    try:
+        ang = [np.arctan2(vel[0, 1], vel[0, 0])]
+        for _ in range(steps):
+            push(cfg, pos, vel, B, E)
+            ang.append(np.arctan2(vel[0, 1], vel[0, 0]))
+    finally:
+        cfg.reactor_dt = saved
+    phase = np.unwrap(np.asarray(ang, dtype=np.float64))
+    return abs(phase[-1] - phase[0]) / (steps * dt)
+
+
+def test_tritium_gyrofrequency():
+    """reactor_cpu._push_thermal_tritium (the loop's triton push) gyrates at
+    Omega = e B / m_T: at the production dt it matches the Boris rotation
+    2 atan(Omega dt / 2) / dt to float32 precision, and as dt -> 0 it converges
+    on e B / m_T itself. m_T is 3.016 u."""
+    import reactor_cpu
+    cfg, *_ = _production_fields()
+    assert abs(cfg.m_tritium / (3.016 * 1.660539e-27) - 1.0) < 1e-12
+    B_mag = 12.0
+    omega = cfg.e_charge * B_mag / cfg.m_tritium
+    push = reactor_cpu._push_thermal_tritium
+    w_prod = _gyro_phase_rate(push, cfg, cfg.m_tritium, B_mag, cfg.reactor_dt)
+    boris = 2.0 * np.arctan(0.5 * omega * cfg.reactor_dt) / cfg.reactor_dt
+    assert abs(w_prod / boris - 1.0) < 1e-5, f"{w_prod:.6e} vs Boris {boris:.6e} rad/s"
+    w_fine = _gyro_phase_rate(push, cfg, cfg.m_tritium, B_mag, 1e-11, steps=2000)
+    assert abs(w_fine / omega - 1.0) < 1e-4, f"{w_fine:.6e} vs eB/m_T {omega:.6e} rad/s"
+
+
+def test_tritium_gyrofrequency_gpu_twin():
+    """Same Boris rotation rate through reactor_gpu._push_thermal_tritium_torch,
+    the GPU loop's triton push, on cfg.HPC_DEVICE (float32 throughout)."""
+    import torch
+    import reactor_gpu
+    cfg, *_ = _production_fields()
+    f32 = dict(device=cfg.HPC_DEVICE, dtype=torch.float32)
+
+    def push(cfg_, pos, vel, B, E):
+        p_t, v_t = torch.tensor(pos, **f32), torch.tensor(vel, **f32)
+        reactor_gpu._push_thermal_tritium_torch(cfg_, p_t, v_t, torch.tensor(B, **f32),
+                                                torch.tensor(E, **f32))
+        pos[:] = p_t.cpu().numpy()
+        vel[:] = v_t.cpu().numpy()
+
+    omega = cfg.e_charge * 12.0 / cfg.m_tritium
+    w = _gyro_phase_rate(push, cfg, cfg.m_tritium, 12.0, cfg.reactor_dt, steps=200)
+    boris = 2.0 * np.arctan(0.5 * omega * cfg.reactor_dt) / cfg.reactor_dt
+    assert abs(w / boris - 1.0) < 1e-4, f"{w:.6e} vs Boris {boris:.6e} rad/s"
+
+
+def test_tritium_push_conserves_magnetic_moment():
+    """mu = m_T v_perp^2 / 2|B| is conserved by the loop's triton push in the
+    production equilibrium (field gathered every step, as the loop does): 1 keV
+    tritons have a ~0.5 mm Larmor radius, far below the field scale length."""
+    import reactor_cpu
+    from kernels import vectorized_gather_and_B_into
+    cfg, eq, engine, B_R, B_Z = _production_fields()
+    rng = np.random.default_rng(17)
+    n = 256
+    pos = _positions_in_psiN(eq, n, rng, 0.05, 0.6).astype(np.float32)
+    vel = engine.initialize_velocities_profile(np.full(n, 1.0), mass=cfg.m_tritium).astype(np.float32)
+    pos, vel = np.ascontiguousarray(pos), np.ascontiguousarray(vel)
+    _, mu0 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, cfg.m_tritium)
+    zero = np.zeros((cfg.nR, cfg.nZ))
+    E = np.empty((n, 3), dtype=np.float32)
+    B = np.empty((n, 3), dtype=np.float32)
+    for step in range(1500):
+        vectorized_gather_and_B_into(pos, E, B, zero, zero, B_R, B_Z,
+                                     cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
+                                     cfg.B0, cfg.R0_major, 0.0, 0.0, cfg.m_mode, cfg.n_mode, 0.0)
+        reactor_cpu._push_thermal_tritium(cfg, pos, vel, B, E)
+    _, mu1 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, cfg.m_tritium)
+    ratio = mu1 / mu0
+    ok = mu0 > 1e-3 * np.median(mu0)          # drop near-parallel ions (mu ~ 0)
+    med = float(np.median(ratio[ok]))
+    assert 0.99 < med < 1.01, f"median mu(end)/mu(start) = {med:.5f}"
+    assert np.percentile(np.abs(ratio[ok] - 1.0), 90) < 0.05
+
+
+def test_loaded_thermal_counts_are_half_d_half_t():
+    """The production load is exactly 25,000 thermal D (type 0) and 25,000
+    thermal T (type 3), nothing else."""
+    from config import SimulationConfiguration
+    import initialization
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = SimulationConfiguration()
+        state = np.random.get_state()
+        np.random.seed(4)
+        eq, engine, p, v, t, *_ = initialization.initialize_reactor(cfg)
+        np.random.set_state(state)
+    typ = t.cpu().numpy()
+    assert cfg.initial_thermal_count == 50000
+    assert int(np.sum(typ == 0)) == 25000 and int(np.sum(typ == 3)) == 25000
+    assert len(typ) == 50000
+
+
+def test_fusion_power_with_equal_d_t_equals_old_formula():
+    """With n_D = n_T = n/2 and T_D = T_T = T on every shell, the D-T power
+    equals the old 50/50 formula (n/2)^2 <sigma v>(T) E_fus shell by shell;
+    with n_D != n_T and T_D != T_T it is n_D n_T <sigma v>(T_i) E_fus at the
+    density-weighted T_i = (n_D T_D + n_T T_T) / (n_D + n_T)."""
+    from physics_engine import compute_thermal_fusion_power, compute_volumetric_fusion_power
+    cfg, eq, *_ = _production_fields()
+    n_tot = lambda x: 1.5e20 * (1 - x) ** 0.7
+    T_of = lambda x: 9.0 * (1 - x) + 0.5
+    prof = _profile_for_power(eq, n_tot, T_of)
+    P, total = compute_thermal_fusion_power(prof, cfg)
+    x = prof["psiN_centers"]
+    half = 0.5 * n_tot(x)                                   # the old formula, verbatim
+    P_old = compute_volumetric_fusion_power(half[None, :], half[None, :], T_of(x)[None, :], cfg)[0]
+    assert np.all(np.abs(P - P_old) <= 1e-12 * np.abs(P_old))
+    assert abs(total / float(np.sum(P_old * prof["shell_volume"])) - 1.0) < 1e-12
+
+    nD = lambda x: 1.0e20 * (1 - x)
+    nT = lambda x: 0.6e20 * (1 - x) ** 2 + 1e18
+    TD = lambda x: 8.0 * (1 - x) + 0.5
+    TT = lambda x: 4.0 * (1 - x) + 0.5
+    prof = _profile_for_power(eq, nD, TD, nT, TT)
+    P, _ = compute_thermal_fusion_power(prof, cfg)
+    for k in (0, 6, 13, 20):
+        Ti = (nD(x[k]) * TD(x[k]) + nT(x[k]) * TT(x[k])) / (nD(x[k]) + nT(x[k]))
+        expect = nD(x[k]) * nT(x[k]) * _bosch_hale(cfg, Ti) * cfg.E_FUSION_JOULES
+        assert abs(P[k] / expect - 1.0) < 1e-12, (k, P[k], expect)
 
 
 # =======================================================
