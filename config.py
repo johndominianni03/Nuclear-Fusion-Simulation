@@ -45,13 +45,17 @@ class SimulationConfiguration:
         # with those same profiles and the same weight; tritium has its own pool.
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
-        self.inject_every_n_steps = 2
+        self.inject_every_n_steps = 2   # alpha schedule only (one alpha every 2x this)
 
-        # Decaying beam source (a fixed batch forever meant inventory only grew, so no
-        # steady state): rate(step) = NBI_BATCH_SIZE * exp(-step / NBI_DECAY_TAU_STEPS).
-        # Fractional rates are realised stochastically so the beam thins out smoothly.
-        self.NBI_BATCH_SIZE = 5
-        self.NBI_DECAY_TAU_STEPS = 2500.0
+        # Neutral beam source, calibrated by injected power. P_NBI_MW is an INPUT, not
+        # a result: 33 MW is ITER's design neutral-beam heating power. The beam is
+        # injected at a constant NBI_MACRO_PER_STEP beam macroparticles per step
+        # (fractional rates realised stochastically), each carrying
+        #     WEIGHT[1] = P_NBI * dt / (E_beam * NBI_MACRO_PER_STEP)
+        # real ions (~2e12, about 3,500x lighter than a thermal macroparticle), so
+        # the weighted injected power is P_NBI while the beam keeps good statistics.
+        self.P_NBI_MW = 33.0
+        self.NBI_MACRO_PER_STEP = 2.0
 
         # 3.5 MeV alphas cover ~1.3e-2 m per global step against a ~2.2e-2 m Larmor
         # radius -- under two samples per gyro-arc, hence jagged orbits. Sub-step only

@@ -143,10 +143,9 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
     Both are derived from the same injection schedule _pid_capacity_bound counts,
     just attributed to the pool that actually receives the particles:
 
-      bulk  -- n_bulk_init thermal deuterons, plus every NBI batch. A batch is int(rate) plus
-               at most one more from the stochastic remainder, and rate never
-               exceeds cfg.NBI_BATCH_SIZE because the exponential taper only
-               shrinks it.
+      bulk  -- n_bulk_init thermal deuterons, plus the NBI source: one batch per
+               step of int(rate) plus at most one more from the stochastic
+               remainder, rate = cfg.NBI_MACRO_PER_STEP (constant).
       alpha -- one particle per alpha event, because alpha_batch is the literal
                1 at both injection sites. If that ever becomes a variable, this
                bound has to follow it.
@@ -159,9 +158,9 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
     injected.
     """
     steps = int(cfg.reactor_num_steps)
-    nbi_events = steps // max(1, int(cfg.inject_every_n_steps)) + 1
+    nbi_events = steps
     alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
-    nbi_max = int(cfg.NBI_BATCH_SIZE) + 1
+    nbi_max = int(cfg.NBI_MACRO_PER_STEP) + 1
     bulk_cap = int(n_bulk_init + nbi_events * nbi_max) + 1024
     alpha_cap = int(alpha_events) + 1024
     trit_cap = int(n_trit_init) + 1024

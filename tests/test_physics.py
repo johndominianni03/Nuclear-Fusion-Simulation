@@ -768,6 +768,66 @@ def test_beam_ions_do_not_change_T_core():
 
 
 # =======================================================
+# TIER 2 PHASE 4 -- neutral beam calibrated by power
+# =======================================================
+@functools.lru_cache(maxsize=None)
+def _source_run(n_steps, nbi_macro_per_step, n_thermal=400, seed=9):
+    """Small load run through reactor_cpu._run_reactor_loop_cpu for n_steps at the
+    given NBI_MACRO_PER_STEP (set before initialize_reactor, which derives the
+    beam weight from it). Returns (cfg, loop output)."""
+    from config import SimulationConfiguration
+    import initialization
+    import reactor_cpu
+    from physics_engine import compute_poloidal_field_grids
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = SimulationConfiguration()
+        cfg.initial_thermal_count = n_thermal
+        cfg.reactor_num_steps = n_steps
+        cfg.NBI_MACRO_PER_STEP = nbi_macro_per_step
+        state = np.random.get_state()
+        np.random.seed(seed)
+        eq, engine, p, v, t, rho, phi, ER, EZ = initialization.initialize_reactor(cfg)
+        B_R, B_Z, _, _ = compute_poloidal_field_grids(
+            eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
+            dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min,
+            dst_Z_max=cfg.Z_max, dst_nR=cfg.nR, dst_nZ=cfg.nZ)
+        out = reactor_cpu._run_reactor_loop_cpu(cfg, engine, p, v, t, rho, phi, ER, EZ, B_R, B_Z)
+        np.random.set_state(state)
+    return cfg, out
+
+
+def test_nbi_injected_power_equals_P_NBI():
+    """The weighted kinetic energy of every injected beam macroparticle, summed in
+    the loop from the stored rows, divided by the elapsed time, equals P_NBI
+    within 1% over a 2,000-step run; w_beam = P_NBI dt / (E_beam * rate)."""
+    cfg, out = _source_run(2000, 2.0)
+    log = out[19]
+    E_beam_J = cfg.nbi_energy_keV * 1e3 * cfg.e_charge
+    w_expect = cfg.P_NBI_MW * 1e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
+    assert abs(cfg.WEIGHT[1] / w_expect - 1.0) < 1e-12
+    elapsed = cfg.reactor_num_steps * cfg.reactor_dt
+    P_inj = log["nbi_energy_J"] / elapsed
+    assert abs(P_inj / (cfg.P_NBI_MW * 1e6) - 1.0) < 0.01, f"P_inj = {P_inj / 1e6:.4f} MW"
+    assert int(log["nbi_per_step"].sum()) == 2 * cfg.reactor_num_steps
+
+
+def test_nbi_mean_macroparticles_per_step_fractional_rate():
+    """At a fractional rate (1.37 per step) the realised mean per step matches it
+    within 4 sigma of Bernoulli counting noise, and the injected power matches
+    P_NBI within the same relative noise."""
+    rate = 1.37
+    cfg, out = _source_run(4000, rate)
+    log = out[19]
+    k = log["nbi_per_step"]
+    assert len(k) == cfg.reactor_num_steps and set(np.unique(k)) <= {1, 2}
+    f = rate - int(rate)
+    sigma = np.sqrt(f * (1 - f) / len(k))
+    assert abs(k.mean() - rate) < 4 * sigma, f"mean {k.mean():.4f} vs {rate} (sigma {sigma:.4f})"
+    P_inj = log["nbi_energy_J"] / (cfg.reactor_num_steps * cfg.reactor_dt)
+    assert abs(P_inj / (cfg.P_NBI_MW * 1e6) - 1.0) < 4 * sigma / rate + 1e-3, f"P_inj = {P_inj / 1e6:.4f} MW"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":

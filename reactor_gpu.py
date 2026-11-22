@@ -207,6 +207,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # stored_energy_J: one row per step, real kinetic energy [J] per species in
     # STORED_ENERGY_SPECIES order (thermal D, thermal T, beam D, alpha).
     inventory_history, stored_energy_J = [], []
+    # Source bookkeeping returned in source_log (twin of the CPU loop).
+    nbi_per_step, nbi_energy_J = [], 0.0
     temp_history, lawson_triple_product_history = [], []
     trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
@@ -241,41 +243,44 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     for step in range(cfg.reactor_num_steps):
         t = step * cfg.reactor_dt
 
-        # --- BATCH NBI INJECTION (tapering source) ---
-        # Same decaying source as the CPU path, driven by the same two cfg knobs:
-        # exp(-step/tau), with fractional rates realised stochastically.
+        # --- NBI INJECTION (constant power) ---
+        # Twin of the CPU path: NBI_MACRO_PER_STEP beam macroparticles every step,
+        # fractional part realised stochastically, each of weight WEIGHT[1].
         _t = prof.mark()
-        if step % cfg.inject_every_n_steps == 0 and step > 0:
-            nbi_rate = cfg.NBI_BATCH_SIZE * np.exp(-step / cfg.NBI_DECAY_TAU_STEPS)
-            batch_size = int(nbi_rate)
-            if np.random.random() < (nbi_rate - batch_size):
-                batch_size += 1
+        batch_size = int(cfg.NBI_MACRO_PER_STEP)
+        nbi_frac = cfg.NBI_MACRO_PER_STEP - batch_size
+        if nbi_frac > 0.0 and np.random.random() < nbi_frac:
+            batch_size += 1
+        nbi_per_step.append(batch_size)
 
-            if batch_size > 0:
-                p_nbi, v_nbi = engine.inject_neutral_beam_cartesian(num_ions=batch_size, E_keV=cfg.nbi_energy_keV, psi_bounds=psi_bounds)
-                _require_pid_capacity(next_pid, batch_size, pid_capacity, "GPU NBI injection")
-                new_pids = torch.arange(next_pid, next_pid + batch_size, device=device, dtype=torch.int64)
-                base_row = bulk.add(
-                    torch.tensor(p_nbi, device=device, dtype=torch.float32),
-                    torch.tensor(v_nbi, device=device, dtype=torch.float32),
-                    1, new_pids)
-                b_pos, b_vel, b_type, b_pid = bulk.views()
-                total_injected += batch_size
+        if batch_size > 0:
+            p_nbi, v_nbi = engine.inject_neutral_beam_cartesian(num_ions=batch_size, E_keV=cfg.nbi_energy_keV, psi_bounds=psi_bounds)
+            _require_pid_capacity(next_pid, batch_size, pid_capacity, "GPU NBI injection")
+            new_pids = torch.arange(next_pid, next_pid + batch_size, device=device, dtype=torch.int64)
+            base_row = bulk.add(
+                torch.tensor(p_nbi, device=device, dtype=torch.float32),
+                torch.tensor(v_nbi, device=device, dtype=torch.float32),
+                1, new_pids)
+            # Injected power bookkeeping, from the float32 values the pool holds.
+            _vb = v_nbi.astype(np.float32).astype(np.float64)
+            nbi_energy_J += cfg.WEIGHT[1] * float(np.sum(0.5 * cfg.m_deuterium * np.sum(_vb * _vb, axis=1)))
+            b_pos, b_vel, b_type, b_pid = bulk.views()
+            total_injected += batch_size
 
-                pid_row_t[new_pids] = torch.arange(base_row, base_row + batch_size,
-                                                   device=device, dtype=torch.int64)
-                pid_pool[next_pid:next_pid + batch_size] = 0
+            pid_row_t[new_pids] = torch.arange(base_row, base_row + batch_size,
+                                               device=device, dtype=torch.int64)
+            pid_pool[next_pid:next_pid + batch_size] = 0
 
-                n_new = min(batch_size, 1000 - tracked_nbis)
-                if n_new > 0:
-                    host_pids = np.arange(next_pid, next_pid + n_new, dtype=np.int64)
-                    slots = tracks.add_slots(host_pids, 1, p_nbi[:n_new], v_nbi[:n_new])
-                    pid_slot[host_pids] = slots
-                    slot_alive[slots] = True
-                    max_tracked_pid = max(max_tracked_pid, int(host_pids[-1]))
-                    tracked_nbis += n_new
+            n_new = min(batch_size, 1000 - tracked_nbis)
+            if n_new > 0:
+                host_pids = np.arange(next_pid, next_pid + n_new, dtype=np.int64)
+                slots = tracks.add_slots(host_pids, 1, p_nbi[:n_new], v_nbi[:n_new])
+                pid_slot[host_pids] = slots
+                slot_alive[slots] = True
+                max_tracked_pid = max(max_tracked_pid, int(host_pids[-1]))
+                tracked_nbis += n_new
 
-                next_pid += batch_size
+            next_pid += batch_size
 
         prof.add("NBI injection", _t)
 
@@ -682,4 +687,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             total_injected, total_lost,
             inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
             temp_history, trigger_time, T_core,
-            lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid)
+            lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
+            {"nbi_per_step": np.asarray(nbi_per_step, dtype=np.int64),
+             "nbi_energy_J": float(nbi_energy_J)})

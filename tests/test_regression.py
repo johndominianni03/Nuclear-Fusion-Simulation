@@ -236,7 +236,7 @@ def run_pipeline(quiet=True):
          inventory_history, stored_energy_J,
          temp_history, trigger_time, T_core,
          lawson_triple_product_history, _lawson_first_measured_step,
-         rho_grid_out, phi_grid_out) = loop_out
+         rho_grid_out, phi_grid_out, _source_log) = loop_out
 
         packaged = main.package_reactor_results(
             cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,

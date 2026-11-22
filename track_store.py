@@ -32,10 +32,8 @@ def _pid_capacity_bound(cfg, n_init):
     5,200-step disruption run reaches ~n_init + 34,000). The bound below counts
     the injections the loop can actually perform:
 
-      NBI    -- one batch every cfg.inject_every_n_steps steps, and a batch is
-                int(rate) plus at most one more from the stochastic remainder,
-                with rate <= cfg.NBI_BATCH_SIZE because the exponential taper
-                only ever shrinks it.
+      NBI    -- one batch per step of int(rate) plus at most one more from the
+                stochastic remainder, rate = cfg.NBI_MACRO_PER_STEP.
       alphas -- exactly one every cfg.inject_every_n_steps * 2 steps.
 
     Step 8 makes this bound load-bearing in a second way: it also sizes the
@@ -45,9 +43,9 @@ def _pid_capacity_bound(cfg, n_init):
     wrong bound surfaces immediately instead of being absorbed.
     """
     steps = int(cfg.reactor_num_steps)
-    nbi_events = steps // max(1, int(cfg.inject_every_n_steps)) + 1
+    nbi_events = steps
     alpha_events = steps // max(1, int(cfg.inject_every_n_steps) * 2) + 1
-    nbi_max = int(cfg.NBI_BATCH_SIZE) + 1
+    nbi_max = int(cfg.NBI_MACRO_PER_STEP) + 1
     return int(n_init + nbi_events * nbi_max + alpha_events) + 1024
 
 
