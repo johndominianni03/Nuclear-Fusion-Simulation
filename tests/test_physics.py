@@ -390,6 +390,58 @@ def test_initial_loading_profiles_and_weight():
 
 
 # =======================================================
+# PHASE 4 -- thermal fusion power from the profiles
+# =======================================================
+def _bosch_hale(cfg, T_keV):
+    from physics_engine import compute_bosch_hale_reactivity
+    return compute_bosch_hale_reactivity(T_keV, cfg.BH_C1, cfg.BH_C2, cfg.BH_C3,
+                                         cfg.BH_C4, cfg.BH_C5, cfg.BH_C6, cfg.BH_C7)
+
+
+def test_bosch_hale_reactivity_at_10_keV():
+    """D-T <sigma v>(10 keV) = 1.136e-22 m^3/s (Bosch & Hale 1992, Table VIII)."""
+    cfg, *_ = _production_fields()
+    sv = _bosch_hale(cfg, 10.0)
+    assert abs(sv / 1.136e-22 - 1.0) < 0.01, f"<sigma v>(10 keV) = {sv:.4e}"
+
+
+def _profile_for_power(eq, n_of_x, T_keV_of_x):
+    from physics_engine import compute_flux_shell_volumes
+    V = compute_flux_shell_volumes(eq)
+    x = 0.5 * (np.linspace(0, 1, len(V) + 1)[:-1] + np.linspace(0, 1, len(V) + 1)[1:])
+    z = np.zeros((3, len(V)))
+    prof = {"psiN_centers": x, "shell_volume": V, "n": z.copy(), "T_keV": np.full((3, len(V)), np.nan)}
+    prof["n"][0] = n_of_x(x)
+    prof["T_keV"][0] = T_keV_of_x(x)
+    return prof
+
+
+def test_thermal_fusion_power_is_the_shell_sum():
+    """P_total = sum_k P_k V_k, and each P_k = (n_k/2)^2 <sigma v>(T_k) E_fus."""
+    from physics_engine import compute_thermal_fusion_power
+    cfg, eq, *_ = _production_fields()
+    prof = _profile_for_power(eq, lambda x: 2e20 * (1 - x), lambda x: 12.0 * (1 - x))
+    P, total = compute_thermal_fusion_power(prof, cfg)
+    assert abs(total - np.sum(P * prof["shell_volume"])) <= 1e-12 * total
+    for k in (0, 7, 15):
+        n, T = prof["n"][0, k], prof["T_keV"][0, k]
+        expect = (n / 2) ** 2 * _bosch_hale(cfg, T) * cfg.E_FUSION_JOULES
+        assert abs(P[k] / expect - 1.0) < 1e-12
+    assert P[-1] < P[0]
+
+
+def test_thermal_fusion_power_uniform_profile():
+    """Uniform n and T: P_total = n^2/4 <sigma v>(T) E_fus V_plasma."""
+    from physics_engine import compute_thermal_fusion_power
+    cfg, eq, *_ = _production_fields()
+    n, T = 1.0e20, 10.0
+    prof = _profile_for_power(eq, lambda x: np.full_like(x, n), lambda x: np.full_like(x, T))
+    _, total = compute_thermal_fusion_power(prof, cfg)
+    expect = n**2 / 4 * 1.136e-22 * cfg.E_FUSION_JOULES * eq.plasma_volume_m3
+    assert abs(total / expect - 1.0) < 0.01, f"{total:.4e} W vs {expect:.4e} W"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":

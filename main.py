@@ -1,8 +1,11 @@
 import numpy as np
 
 from physics_engine import (
-    compute_volumetric_fusion_power,
     compute_poloidal_field_grids,           # psi-derived poloidal B (real grad-B / mirror force)
+    compute_flux_profiles,                  # weighted per-species moments on psi_N shells
+    compute_thermal_fusion_power,           # thermal D-T power from those profiles
+    map_flux_profile_to_grid,
+    species_masses,
 )
 from config import SimulationConfiguration
 import initialization
@@ -60,8 +63,7 @@ GPU_PARTICLE_THRESHOLD = None
 def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
                             pos_np, vel_np, type_np,
                             history_tracks, tracked_type, tracked_lastpos,
-                            tracked_lastvel, tracked_lost,
-                            rho_grid, T_core, prof=None):
+                            tracked_lastvel, tracked_lost, prof=None):
     """Turns the reactor loop's raw output into the arrays diagnostics plots.
 
     Lifted verbatim out of run_reactor_steady_state so a regression test can
@@ -69,10 +71,7 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     this is the packaging, and rendering is a third step. run_reactor_steady_state
     calls this and forwards the contents to diagnostics exactly as before.
 
-    `eq` is not read here today -- the poloidal field it produced arrives
-    already resampled as B_R_pol_grid/B_Z_pol_grid. It stays in the signature
-    so callers pass the same equilibrium object they pass everywhere else, and
-    so a future moment that needs psi does not change every call site.
+    `eq` supplies psi for the flux-surface profiles and the fusion power map.
 
     Returns a dict of exactly the products the caller forwards onward.
 
@@ -81,7 +80,6 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
     """
     if prof is None:
         prof = StageProfiler(False)
-    dR, dZ = (cfg.R_max - cfg.R_min) / (cfg.nR - 1), (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
 
     print("[SYSTEM] Packaging particle arrays for Graphing Utilities...")
     _t = prof.mark()
@@ -161,26 +159,21 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
 
     prof.add("pkg: v_parallel phase-space projection", _t)
 
-    print("[SYSTEM] Mapping Volumetric Fusion Power ")
+    print("[SYSTEM] Thermal D-T fusion power from flux-surface profiles")
     _t = prof.mark()
-    n_e_grid_raw = np.abs(rho_grid / cfg.e_charge)
-    scale_factor = 1.0e20 / (np.max(n_e_grid_raw) + 1e-10)
-    n_e_grid_scaled = n_e_grid_raw * scale_factor
-    n_D_grid = n_T_grid = 0.5 * n_e_grid_scaled
-    T_i_grid_keV = T_core * (n_e_grid_raw / (np.max(n_e_grid_raw) + 1e-10))
-    P_fusion_grid = compute_volumetric_fusion_power(n_D_grid, n_T_grid, T_i_grid_keV, cfg)
-
-    total_fusion_power_watts = 0.0
-    for i in range(cfg.nR):
-        R_i = cfg.R_min + i * dR
-        cell_volume = 2.0 * np.pi * R_i * dR * dZ if R_i > 0 else 1.0
-        for j in range(cfg.nZ):
-            total_fusion_power_watts += P_fusion_grid[i, j] * cell_volume
-            
-    prof.add("pkg: fusion power grid + volume integral", _t)
+    # Weighted thermal-ion n(psi_N), T(psi_N); n_D = n_T = n_thermal / 2 is an
+    # assumption (there is no tritium species). Beam ions and alphas are excluded.
+    flux_profiles = compute_flux_profiles(pos_np, vel_np, type_np, eq, species_masses(cfg),
+                                          weight=cfg.MACRO_WEIGHT, B0=cfg.B0)
+    P_fusion_profile, total_fusion_power_watts = compute_thermal_fusion_power(flux_profiles, cfg)
+    P_fusion_grid = map_flux_profile_to_grid(
+        P_fusion_profile, flux_profiles["psiN_centers"], eq,
+        cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ)
+    prof.add("pkg: flux profiles + thermal fusion power", _t)
 
     print("==================================================")
-    print(f" TOTAL INTEGRATED FUSION POWER: {total_fusion_power_watts / 1e6:.2f} MW ")
+    print(f" THERMAL D-T FUSION POWER (50/50 D-T assumed, beams and alphas excluded): "
+          f"{total_fusion_power_watts:.3e} W ")
     print("==================================================")
 
     return {
@@ -193,7 +186,9 @@ def package_reactor_results(cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
         "R_phase": R_phase,
         "v_parallel_phase": v_parallel_phase,
         "P_fusion_grid": P_fusion_grid,
+        "P_fusion_profile": P_fusion_profile,
         "total_fusion_power_watts": total_fusion_power_watts,
+        "flux_profiles": flux_profiles,
     }
 
 
@@ -263,8 +258,7 @@ def run_reactor_steady_state(save_plots=None):
         cfg, eq, engine, B_R_pol_grid, B_Z_pol_grid,
         pos_np, vel_np, type_np,
         history_tracks, tracked_type, tracked_lastpos,
-        tracked_lastvel, tracked_lost,
-        rho_grid, T_core, prof=outer,
+        tracked_lastvel, tracked_lost, prof=outer,
     )
     outer.add("package_reactor_results (total)", _t)
 

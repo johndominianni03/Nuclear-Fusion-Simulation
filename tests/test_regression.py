@@ -243,7 +243,6 @@ def run_pipeline(quiet=True):
             pos_np, vel_np, type_np,
             history_tracks, tracked_type, tracked_lastpos,
             tracked_lastvel, tracked_lost,
-            rho_grid_out, T_core,
         )
 
     data = {

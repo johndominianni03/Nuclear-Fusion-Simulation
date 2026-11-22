@@ -321,12 +321,15 @@ def compute_bosch_hale_reactivity(T_i_keV, C1, C2, C3, C4, C5, C6, C7):
     denominator = 1.0 + T_i_keV * (C3 + T_i_keV * (C5 + T_i_keV * C7))
     theta = T_i_keV / (1.0 - numerator / denominator)
 
-    # Dimensionless parameter xi (B_G = 34.3827)
+    # Dimensionless parameter xi (Gamow constant B_G = 34.3827 keV^1/2)
     B_G_sq = 1182.17005929
     xi = (B_G_sq / (4.0 * theta))**(1.0/3.0)
 
-    # Bosch-Hale fit, cm^3/s
-    sigmav_cm3_s = C1 * theta * np.sqrt(xi / (T_i_keV**3)) * np.exp(-3.0 * xi)
+    # Bosch-Hale fit, cm^3/s:  C1 theta sqrt(xi / (m_r c^2 T^3)) exp(-3 xi), with the
+    # D-T reduced-mass energy m_r c^2 = 1,124,656 keV (Bosch & Hale 1992, Table VII).
+    # It was missing, which put every <sigma v> sqrt(1124656) = 1060x too high.
+    MRC2_KEV = 1124656.0
+    sigmav_cm3_s = C1 * theta * np.sqrt(xi / (MRC2_KEV * T_i_keV**3)) * np.exp(-3.0 * xi)
 
     return sigmav_cm3_s * 1e-6  # -> m^3/s
 
@@ -1080,6 +1083,37 @@ def compute_force_balance_field(prof, eq, R_min, R_max, Z_min, Z_max, nR, nZ,
     E_R = np.ascontiguousarray(-dPhi * gR)
     E_Z = np.ascontiguousarray(-dPhi * gZ)
     return np.ascontiguousarray(phi), E_R, E_Z, pot
+
+
+def map_flux_profile_to_grid(values, centers, eq, R_min, R_max, Z_min, Z_max, nR, nZ):
+    """A shell profile f(psi_N) on the (nR, nZ) grid nodes: linear in psi_N between
+    shell centres, held at the end values inside the first/last half shell, and 0
+    outside the last closed flux surface."""
+    Rd = np.linspace(R_min, R_max, nR)
+    Zd = np.linspace(Z_min, Z_max, nZ)
+    RR, ZZ = np.meshgrid(Rd, Zd, indexing="ij")
+    psiN = compute_psi_normalised(RR, ZZ, eq)
+    return np.where(psiN <= 1.0, np.interp(psiN, centers, values), 0.0)
+
+
+def compute_thermal_fusion_power(prof, cfg):
+    """Thermal D-T fusion power density per psi_N shell and its volume integral.
+
+    ASSUMPTION: the simulation has one thermal ion species (deuterons) and no
+    tritium, so the thermal ions are taken as a 50/50 D-T mix,
+        n_D = n_T = n_thermal / 2,
+    at the thermal ion temperature T(psi_N). Then per shell k
+        P_k = n_D n_T <sigma v>(T_k) E_fusion          [W/m^3]
+        P_total = sum_k P_k V_k                         [W]
+    with the Bosch-Hale reactivity. Beam ions and alphas are excluded: this is the
+    thermonuclear power of the thermal population only. Shells without a
+    temperature (fewer than 2 thermals) contribute nothing.
+    Returns (P_k, P_total).
+    """
+    n_half = 0.5 * prof["n"][0]
+    T = np.nan_to_num(prof["T_keV"][0], nan=0.0)
+    P = compute_volumetric_fusion_power(n_half[None, :], n_half[None, :], T[None, :], cfg)[0]
+    return P, float(np.sum(P * prof["shell_volume"]))
 
 
 def species_masses(cfg):
