@@ -1,34 +1,34 @@
 {
   "expected_count": 11,
-  "generated": "2026-11-22T03:34:48Z",
+  "generated": "2026-11-22T04:39:22Z",
   "missing": [],
   "plots": {
     "alpha_orbits.png": {
-      "bytes": 900012,
+      "bytes": 898559,
       "height": 2400,
       "path": "alpha_orbits.png",
-      "sha256": "5630d5949bbc7cc61cd7a4e03a76b12703e8f976d06484296e87557222b9e916",
+      "sha256": "bf6e05cb6c13dfa5d824470359b2b8ca01904b4f81ad8cfc64612852589c9a3b",
       "width": 2400
     },
     "benchmark_scaling.png": {
-      "bytes": 227230,
+      "bytes": 240281,
       "height": 1800,
       "path": "benchmark_scaling.png",
-      "sha256": "9cbefdff7d427ecd231ea3f1e44231fc89024dbb02109b8fafda6dec371cf9ee",
+      "sha256": "0534965ad7e5c43b05320a5500b35bef3789ecce3382b60bd01474ed4af7b851",
       "width": 2700
     },
     "fusion_power_density.png": {
-      "bytes": 275906,
+      "bytes": 274770,
       "height": 1800,
       "path": "fusion_power_density.png",
-      "sha256": "64ae4f0c06464947f388bb36a7ea3ee759bc466da6c83497c10c74d97672ff69",
+      "sha256": "012f4f749b91839b86ab9d1d8a1cf373f5914127e7d0b71fa8cec21cacee8add",
       "width": 2100
     },
     "ion_density_map.png": {
-      "bytes": 339205,
+      "bytes": 400593,
       "height": 1800,
       "path": "ion_density_map.png",
-      "sha256": "4c11e7e0d14d68a3b3ced74e8faeb7aae50ba0dc0e2cf0edc4066037f4cbec26",
+      "sha256": "75301c716e19c189a2f0c25a6c8dcce0fd79a797aea6c2cab30dc45ccae4f873",
       "width": 2100
     },
     "lawson_triple_product.png": {
@@ -39,48 +39,48 @@
       "width": 2700
     },
     "phase_space_map.png": {
-      "bytes": 458305,
+      "bytes": 510047,
       "height": 1800,
       "path": "phase_space_map.png",
-      "sha256": "bac4ebe8760d223da3cc7bdc98e32f28aa74fdae6dee2a7fbde4ceb8450893b0",
+      "sha256": "e4648f24e5693ea5938e165886b48043728361f66812a9bb371d8e2d4d8bd5b0",
       "width": 3900
     },
     "plasma_stored_energy_time.png": {
-      "bytes": 107288,
-      "height": 1200,
+      "bytes": 102562,
+      "height": 1350,
       "path": "plasma_stored_energy_time.png",
-      "sha256": "619232d6456881cd945ba04cc308b06f66fed626383c2161e8d4eb63d0e56b2a",
+      "sha256": "9e1b39f7d6bd4e2fc81d56592e3c813bec1afe47e1509e65f434f79889704d40",
       "width": 2400
     },
     "potential_field_map.png": {
-      "bytes": 258272,
+      "bytes": 258551,
       "height": 1800,
       "path": "potential_field_map.png",
-      "sha256": "f371a7b46c58f2ce8a2f9470d67154d99ff2e60b10acc7cef49d10019fa3412d",
+      "sha256": "ace61183d90d028ab0deec7f816da17b831bfe0c931c5d282d6d4fcabe4414bf",
       "width": 2100
     },
     "radial_profiles.png": {
-      "bytes": 339979,
+      "bytes": 312629,
       "height": 3000,
       "path": "radial_profiles.png",
-      "sha256": "d7833de80b7d8f5974d78e97ca74e9a49240ecebb6d9a04783d06a5103740a47",
+      "sha256": "baf773cb3a805e7dc49dc98c2cce20bb76272fa18e38b7c79d77d44f7451cc05",
       "width": 2400
     },
     "tokamak_reactor_2d.png": {
-      "bytes": 925274,
+      "bytes": 898785,
       "height": 2400,
       "path": "tokamak_reactor_2d.png",
-      "sha256": "003527ed9e48b7801ab05152b55e3d3808f536f980ee70eac67768720c6db6e3",
+      "sha256": "2b08e7769f8c3537adb701404fa46e014ddb616610f1ca1adb72d4e89f2566e7",
       "width": 2400
     },
     "tokamak_reactor_3d.png": {
-      "bytes": 939297,
+      "bytes": 935467,
       "height": 2400,
       "path": "tokamak_reactor_3d.png",
-      "sha256": "222a6991debdad61cca44b6cbc104f0f944a133472d5772f30b68bd224491596",
+      "sha256": "f4b24e7efe2f61a289eba525ca925917a2d874e94637f79d9c072f9d3844fe49",
       "width": 3000
     }
   },
-  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_7r81ivfd",
+  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_hxafl2tl",
   "version": 1
 }

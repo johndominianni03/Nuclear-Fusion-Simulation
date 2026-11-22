@@ -18,7 +18,10 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from visualizer import PlasmaVisualizer
-from physics_engine import interpolate_psi_array
+from physics_engine import interpolate_psi_array, STORED_ENERGY_SPECIES
+
+# One colour per species for the line plots (profiles, stored energy), keyed by type code.
+SPECIES_COLOR = {0: "tab:blue", 1: "tab:orange", 2: "tab:pink", 3: "tab:green"}
 
 
 def _show():
@@ -213,12 +216,21 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     # --- STORED ENERGY WAVEFORM ---
     # stored_energy_J has one row per step and one weighted column per species
     # (physics_engine.STORED_ENERGY_SPECIES: thermal D, thermal T, beam D, alpha),
-    # real joules. The trace is the thermal + beam ion total (alphas excluded).
-    plt.figure(figsize=(8, 4))
-    _ion_J = stored_energy_J[:, :3].sum(axis=1) if stored_energy_J.ndim == 2 else stored_energy_J
-    plt.plot(np.arange(len(_ion_J)) * cfg.reactor_dt * 1e6, _ion_J / 1.0e3, color='firebrick', linewidth=1.5)
-    plt.ylabel("Stored Ion Kinetic Energy (kJ)")
-    plt.title("Stored Kinetic Energy of Thermal + Beam Ions vs. Time")
+    # real joules. One trace per species on a log axis: the thermal ions hold
+    # ~1e4 J, the 33 MW beam ~1e2 J after 10 us, the fusion alphas ~1e-4 J.
+    plt.figure(figsize=(8, 4.5))
+    _t_us = np.arange(stored_energy_J.shape[0]) * cfg.reactor_dt * 1e6
+    for _col, (_code, _label) in enumerate(STORED_ENERGY_SPECIES):
+        _E = stored_energy_J[:, _col]
+        _ok = _E > 0.0
+        if np.any(_ok):
+            # Thermal T dashed: it lies on top of thermal D (same load, same weight).
+            plt.plot(_t_us[_ok], _E[_ok], color=SPECIES_COLOR[_code], linewidth=1.5, label=_label,
+                     linestyle='--' if _code == 3 else '-')
+    plt.yscale('log')
+    plt.ylabel("Stored Kinetic Energy (J)")
+    plt.legend(loc='best')
+    plt.title("Stored Kinetic Energy per Species vs. Time")
     plt.xlabel("Time ($\\mu s$)")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -266,6 +278,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
             ax.plot(R_path[-1], Z_path[-1], marker='x', color='crimson', markersize=5, alpha=0.8, zorder=2)
         elif p["type"] == 1:
             ax.plot(R_path, Z_path, color='gold', alpha=0.7, linewidth=1.2, zorder=4)
+        elif p["type"] == 3:
+            ax.plot(R_path, Z_path, color='limegreen', alpha=0.2, linewidth=0.8, zorder=3)
         else:
             ax.plot(R_path, Z_path, color='dodgerblue', alpha=0.2, linewidth=0.8, zorder=3)
 
@@ -281,7 +295,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
 
     custom_lines = [
         Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions (Injected)'),
-        Line2D([0], [0], color='dodgerblue', lw=2, label='1 keV Thermal Core Plasma'),
+        Line2D([0], [0], color='dodgerblue', lw=2, label='Thermal Deuterium'),
+        Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
         Line2D([0], [0], color='crimson', lw=2, label='Lost past last closed flux surface'),
         Line2D([0], [0], color='black', lw=1.4, linestyle='--',
                label='Last Closed Flux Surface ($\\psi_{edge}$)')
@@ -305,8 +320,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     # rho = sqrt(psi_N). Log axes: the alpha temperature is ~1000x the thermal one.
     if flux_profiles is not None:
         rho_c = flux_profiles["rho_centers"]
-        species = ((0, "Thermal D", "tab:blue"), (1, "Beam D (50 keV NBI)", "tab:orange"),
-                   (2, "Alpha (3.5 MeV birth)", "tab:pink"))
+        species = ((0, "Thermal D", SPECIES_COLOR[0]), (3, "Thermal T", SPECIES_COLOR[3]),
+                   (1, "Beam D (50 keV NBI)", SPECIES_COLOR[1]),
+                   (2, "Alpha (3.5 MeV birth)", SPECIES_COLOR[2]))
         fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
         for s_idx, s_label, s_color in species:
             n_s = flux_profiles["n"][s_idx]
@@ -333,7 +349,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         if "beta_avg" in flux_profiles:
             mu0 = 4.0e-7 * np.pi
             V = flux_profiles["shell_volume"]
-            beta_th = 2.0 * mu0 * float(np.sum(flux_profiles["p"][0] * V) / np.sum(V)) / cfg.B0**2
+            p_th = flux_profiles["p"][0] + flux_profiles["p"][3]          # thermal D + T
+            beta_th = 2.0 * mu0 * float(np.sum(p_th * V) / np.sum(V)) / cfg.B0**2
             beta_txt = (f"\n$\\langle\\beta\\rangle$ = {flux_profiles['beta_avg']:.2e} all species, "
                         f"{beta_th:.2e} thermal  ($B_0$ = {cfg.B0:g} T)")
         axes[0].set_title("Flux-Surface Profiles at End of Run (weighted)" + beta_txt)
@@ -343,15 +360,16 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         plt.close()
 
     # --- PHASE-SPACE DISTRIBUTION ---
-    # Deuterons and alphas on separate panels, each scaled to its own largest |v_par|:
-    # alpha speeds (~1.3e7 m/s) are ~40x the thermal ones, so one shared axis either
-    # crushes the deuterons onto v_par = 0 or clips the fastest alphas.
+    # Thermal/beam ions and alphas on separate panels, each scaled to its own largest
+    # |v_par|: alpha speeds (~1.3e7 m/s) are ~40x the thermal ones, so one shared axis
+    # either crushes the ions onto v_par = 0 or clips the fastest alphas.
     if R_phase is not None and v_parallel_phase is not None and len(R_phase) > 0:
         R_ph = _scrub_1d(R_phase)
         v_ph = _scrub_1d(v_parallel_phase)
         sp = np.asarray(species_phase, dtype=int) if species_phase is not None and len(species_phase) == len(R_ph) \
             else np.zeros(len(R_ph), dtype=int)
-        groups = [("Thermal and beam deuterons", ((0, 'darkviolet', 'Thermal D'), (1, 'darkorange', 'Beam D'))),
+        groups = [("Thermal D and T, beam D", ((0, 'darkviolet', 'Thermal D'), (3, 'seagreen', 'Thermal T'),
+                                               (1, 'darkorange', 'Beam D'))),
                   ("Alphas", ((2, '#FF66CC', 'Alpha'),))]
         fig, axes = plt.subplots(1, 2, figsize=(13, 6))
         for ax_ph, (g_title, members) in zip(axes, groups):
@@ -377,9 +395,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         plt.close()
 
     # --- THERMAL D-T FUSION POWER DENSITY ---
-    # P(psi_N) = (n_th/2)^2 <sigma v>(T_th) E_fus from the weighted thermal-ion profiles,
-    # mapped through psi_N. 50/50 D-T is assumed (no tritium species); beam ions and
-    # alphas are excluded.
+    # P(psi_N) = n_D n_T <sigma v>(T_i) E_fus from the weighted thermal D and thermal T
+    # profiles (T_i density-weighted), mapped through psi_N. Beam ions and alphas are
+    # excluded.
     if P_fusion_grid is not None:
         plt.figure(figsize=(7, 6))
         P_clean = np.where(_confinement_mask, np.nan, P_fusion_grid.T)
@@ -389,7 +407,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         plt.colorbar(contour_pf, label="Fusion Power Density (W/m$^3$)")
         total_txt = f", total {total_fusion_power_watts:.3g} W" if total_fusion_power_watts is not None else ""
         plt.title("Thermal D-T Fusion Power Density" + total_txt +
-                  "\n(50/50 D-T assumed; beam ions and alphas excluded)")
+                  "\n(thermal D and T profiles; beam ions and alphas excluded)")
         plt.xlabel("Major Radius R (m)")
         plt.ylabel("Height Z (m)")
         _draw_wall(plt.gca())
@@ -409,6 +427,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         eq.plot_equilibrium(ax=ax)
 
         thermal_count = 0
+        trit_count = 0
         nbi_count = 0
         
         # 1. Background particles first (zorder 1 and 2) so they don't cover the alphas
@@ -419,6 +438,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
                 if p.get("type") == 0 and thermal_count < 50:
                     ax.plot(R_path, traj[:, 2], color='cyan', alpha=0.4, linewidth=1.0, zorder=1)
                     thermal_count += 1
+                elif p.get("type") == 3 and trit_count < 50:
+                    ax.plot(R_path, traj[:, 2], color='limegreen', alpha=0.4, linewidth=1.0, zorder=1)
+                    trit_count += 1
                 elif p.get("type") == 1 and nbi_count < 50:
                     ax.plot(R_path, traj[:, 2], color='orange', alpha=0.4, linewidth=1.0, zorder=2)
                     nbi_count += 1
@@ -466,13 +488,15 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         ax.set_ylim(*VIEW_YLIM)
         ax.set_aspect('equal')
                 
-        ax.set_title("3.5 MeV Alpha Orbits vs Thermal Background")
+        ax.set_title("3.5 MeV Alpha Orbits vs Thermal Background\n"
+                     "(alphas born from the computed thermal D-T fusion rate)")
         ax.set_xlabel("Major Radius R (m)")
         ax.set_ylabel("Height Z (m)")
         
         custom_lines = [
             Line2D([0], [0], color='#FF66CC', lw=2, label='3.5 MeV Helium-4 (Alpha)'),
-            Line2D([0], [0], color='cyan', lw=2, label='Thermal Background Ion'),
+            Line2D([0], [0], color='cyan', lw=2, label='Thermal Deuterium'),
+            Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
             Line2D([0], [0], color='orange', lw=2, label='50 keV NBI Fast Ion')
         ]
         _leg_a = ax.legend(handles=custom_lines, loc='upper right', framealpha=0.95)

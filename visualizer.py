@@ -35,7 +35,7 @@ class PlasmaVisualizer:
         output_file: str = "multi_particle_torus.png",
         R0: float = 1.0,
         r0: float = 0.3,
-        classifications: list = None,  # Optional: 0 = Passing, 1 = Trapped, -1 = Lost
+        classifications: list = None,  # Optional species codes: 0 thermal D, 1 beam D, 2 alpha, 3 thermal T, -1 lost
         wall_contour=None,             # Optional (R, Z) polygon of the psi_edge surface
     ):
         fig = plt.figure(figsize=(10, 8))
@@ -84,7 +84,11 @@ class PlasmaVisualizer:
                     line_alpha = 0.3
                     line_width = 1.2
                 elif c_type == 0:
-                    line_color = "dodgerblue"  # Passing particles
+                    line_color = "dodgerblue"  # Thermal deuterium
+                    line_alpha = 0.25
+                    line_width = 0.8
+                elif c_type == 3:
+                    line_color = "limegreen"   # Thermal tritium
                     line_alpha = 0.25
                     line_width = 0.8
                 elif c_type == -1:
@@ -131,7 +135,8 @@ class PlasmaVisualizer:
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions'),
-            Line2D([0], [0], color='dodgerblue', lw=2, label='1 keV Thermal Core Plasma'),
+            Line2D([0], [0], color='dodgerblue', lw=2, label='Thermal Deuterium'),
+            Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
             Line2D([0], [0], color='magenta', lw=2, label='3.5 MeV Alphas (Banana Orbits)'),
             Line2D([0], [0], color='crimson', lw=2, label='Lost past last closed flux surface'),
             Line2D([0], [0], color='gray', lw=6, alpha=0.35,
