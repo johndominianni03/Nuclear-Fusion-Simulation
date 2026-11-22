@@ -19,6 +19,13 @@ class ParticlePusher:
         velocities = np.random.normal(0, v_thermal / np.sqrt(2), (num_particles, 3))
         return velocities
 
+    def initialize_velocities_profile(self, T_keV):
+        # Maxwellian with a per-particle temperature: each Cartesian component is
+        # normal with variance T/m.
+        T_Joules = np.asarray(T_keV, dtype=np.float64) * 1e3 * abs(self.q)
+        sigma = np.sqrt(T_Joules / self.m)
+        return np.random.normal(0.0, 1.0, (T_Joules.shape[0], 3)) * sigma[:, None]
+
     def plot_velocity_diagnostic(self, velocities, T_keV, filename="velocity_diagnostic.png"):
         speeds = np.linalg.norm(velocities, axis=1)
         plt.figure(figsize=(8, 6))
@@ -29,24 +36,6 @@ class ParticlePusher:
         plt.grid(True, alpha=0.3)
         plt.savefig(filename, dpi=300)
         plt.close()
-
-    def solve_fields(self, rho_grid, R_min, R_max, Z_min, Z_max, phi_init=None, return_iters=False):
-        nR, nZ = rho_grid.shape
-        dR = (R_max - R_min) / (nR - 1)
-        dZ = (Z_max - Z_min) / (nZ - 1)
-
-        # Warm-start SOR from the previous step's converged phi: the field barely
-        # shifts step-to-step, so it reaches the same tolerance in far fewer iterations.
-        if phi_init is None:
-            phi_init = np.zeros((nR, nZ), dtype=np.float64)
-
-        phi, sor_iters = solve_poisson_sor_cylindrical(rho_grid, R_min, R_max, Z_min, Z_max, phi_init)
-        E_R, E_Z = compute_electric_field(phi, dR, dZ)
-        # Default return shape is unchanged for every existing caller;
-        # return_iters is opt-in for the profiler.
-        if return_iters:
-            return phi, E_R, E_Z, sor_iters
-        return phi, E_R, E_Z
 
     def inject_neutral_beam_cartesian(self, num_ions, E_keV=50.0, R_target=1.05, Z_target=0.0, psi_bounds=None):
         E_Joules = E_keV * 1e3 * abs(self.q)
@@ -237,56 +226,6 @@ def compute_cic_charge_density(R_coords, Z_coords, charges, R_min, R_max, Z_min,
         rho -= avg_rho
 
     return rho
-
-
-@njit(fastmath=True)
-def solve_poisson_sor_cylindrical(rho, R_min, R_max, Z_min, Z_max, phi_init, max_iter=500, tol=1e-5):
-    nR, nZ = rho.shape
-    dR = (R_max - R_min) / (nR - 1)
-    dZ = (Z_max - Z_min) / (nZ - 1)
-    phi = phi_init.copy()
-    omega = 1.8
-    
-    dR2 = dR**2
-    dZ2 = dZ**2
-    inv_denom = 1.0 / (2.0/dR2 + 2.0/dZ2)
-
-    for it in range(max_iter):
-        max_diff = 0.0
-        for i in range(1, nR - 1):
-            R_i = R_min + i * dR
-            for j in range(1, nZ - 1):
-                phi_old = phi[i, j]
-                
-                term_R = (phi[i+1, j] + phi[i-1, j]) / dR2
-                term_R_grad = (phi[i+1, j] - phi[i-1, j]) / (2.0 * R_i * dR)
-                term_Z = (phi[i, j+1] + phi[i, j-1]) / dZ2
-                
-                phi_new = inv_denom * (term_R + term_R_grad + term_Z + rho[i, j] / 8.854e-12)
-                phi[i, j] = (1.0 - omega) * phi_old + omega * phi_new
-                
-                diff = abs(phi[i, j] - phi_old)
-                if diff > max_diff: max_diff = diff
-                    
-        if max_diff < tol: break
-    # Iteration count is returned so a profiled run can tell a warm-started
-    # solve that exits in a handful of sweeps from one pinned at max_iter.
-    # Diagnostic only -- phi is bit-for-bit what it always was.
-    return phi, it + 1
-
-
-@njit(fastmath=True)
-def compute_electric_field(phi, dR, dZ):
-    nR, nZ = phi.shape
-    E_R = np.zeros((nR, nZ), dtype=np.float64)
-    E_Z = np.zeros((nR, nZ), dtype=np.float64)
-    
-    for i in range(1, nR - 1):
-        for j in range(1, nZ - 1):
-            E_R[i, j] = -(phi[i+1, j] - phi[i-1, j]) / (2.0 * dR)
-            E_Z[i, j] = -(phi[i, j+1] - phi[i, j-1]) / (2.0 * dZ)
-            
-    return E_R, E_Z
 
 
 @njit(fastmath=True)
@@ -581,48 +520,7 @@ def vectorized_boris_push_numba_fallback(pos_arr, vel_arr, q, m, B_arr, E_arr, d
 #     contain torch.sum/torch.any, which hit an Inductor bug on this MPS backend under
 #     dynamic=True ("cannot determine truth value of Relational"). Left eager -- still a
 #     large win over CPU/Numba at N=1M.
-#   - compute_cic_charge_density: index_add_ falls back to Inductor's C++ codegen under
-#     compile, whose build command breaks on the space in this project's folder name.
-#     Left eager, where no C++ step is involved.
 # =====================================================================
-
-def compute_cic_charge_density_torch(R_coords, Z_coords, charge, R_min, R_max, Z_min, Z_max, nR, nZ, device, apply_neutral_background=False):
-    rho = torch.zeros((nR, nZ), dtype=torch.float32, device=device)
-    if R_coords.numel() == 0:
-        return rho
-
-    dR = (R_max - R_min) / (nR - 1)
-    dZ = (Z_max - Z_min) / (nZ - 1)
-
-    r_idx = (R_coords - R_min) / dR
-    z_idx = (Z_coords - Z_min) / dZ
-    i = torch.floor(r_idx).long()
-    j = torch.floor(z_idx).long()
-
-    valid = (R_coords >= R_min) & (R_coords <= R_max) & (Z_coords >= Z_min) & (Z_coords <= Z_max) & \
-            (i >= 0) & (i < nR - 1) & (j >= 0) & (j < nZ - 1)
-
-    i = i[valid]
-    j = j[valid]
-    wR = (r_idx[valid] - i.to(torch.float32))
-    wZ = (z_idx[valid] - j.to(torch.float32))
-    q = torch.full((i.numel(),), float(charge), dtype=torch.float32, device=device)
-
-    rho_flat = rho.view(-1)
-    rho_flat.index_add_(0, i * nZ + j, q * (1.0 - wR) * (1.0 - wZ))
-    rho_flat.index_add_(0, (i + 1) * nZ + j, q * wR * (1.0 - wZ))
-    rho_flat.index_add_(0, i * nZ + (j + 1), q * (1.0 - wR) * wZ)
-    rho_flat.index_add_(0, (i + 1) * nZ + (j + 1), q * wR * wZ)
-
-    R_i = R_min + torch.arange(nR, device=device, dtype=torch.float32) * dR
-    cell_volume = torch.where(R_i > 0, 2.0 * float(np.pi) * R_i * dR * dZ, torch.ones_like(R_i))
-    rho = rho / cell_volume.unsqueeze(1)
-
-    if apply_neutral_background:
-        rho = rho - rho.mean()
-
-    return rho
-
 
 def _vectorized_gather_and_B_torch_impl(pos, E_R_grid_t, E_Z_grid_t, B_R_pol_t, B_Z_pol_t,
                                         R_min, R_max, Z_min, Z_max, nR, nZ, B0, R0, t, b_perturb, m_mode, n_mode, gamma):
@@ -1077,6 +975,140 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
         out["beta_profile"] = 2.0 * mu0 * p_tot / B0**2
         out["beta_avg"] = 2.0 * mu0 * float(np.sum(p_tot * V) / np.sum(V)) / B0**2
     return out
+
+
+# =====================================================================
+# QUASI-NEUTRAL RADIAL ELECTRIC FIELD FROM ION FORCE BALANCE
+#
+# Radial force balance for the thermal ions with no rotation,
+#     e n_i E = grad p_i,
+# is a flux function relation. With psi_N as the flux label,
+#     dPhi/dpsi_N = -(1 / (e n_i)) dp_i/dpsi_N,     Phi(edge of support) = 0,
+#     E = -grad Phi = -(dPhi/dpsi_N) grad psi_N.
+# n_i and p_i come from compute_flux_profiles (the weight cancels in p/n).
+# =====================================================================
+
+FIELD_MIN_COUNT = 100       # bins with fewer thermals (>10% Poisson error) carry no field
+
+
+def compute_grad_psiN_grids(eq, dst_R_min, dst_R_max, dst_Z_min, dst_Z_max, dst_nR, dst_nZ):
+    """(psi_N, d psi_N/dR, d psi_N/dZ) on the destination grid nodes.
+
+    The gradient is taken by central differences on the equilibrium's own psi
+    grid and resampled bilinearly, exactly as compute_poloidal_field_grids builds
+    B_pol, so E and B_pol share one discretisation of grad psi.
+    """
+    nR_s, nZ_s = eq.psi_grid.shape
+    dR = (eq.psi_R_max - eq.psi_R_min) / (nR_s - 1)
+    dZ = (eq.psi_Z_max - eq.psi_Z_min) / (nZ_s - 1)
+    dpsi_dR, dpsi_dZ = np.gradient(eq.psi_grid, dR, dZ)
+    scale = -1.0 / (eq.psi_axis - eq.psi_edge)
+    src = (eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max, nR_s, nZ_s)
+    dst = (dst_R_min, dst_R_max, dst_Z_min, dst_Z_max, dst_nR, dst_nZ)
+    gR = scale * resample_grid_to(np.ascontiguousarray(dpsi_dR), *src, *dst)
+    gZ = scale * resample_grid_to(np.ascontiguousarray(dpsi_dZ), *src, *dst)
+    Rd = np.linspace(dst_R_min, dst_R_max, dst_nR)
+    Zd = np.linspace(dst_Z_min, dst_Z_max, dst_nZ)
+    RR, ZZ = np.meshgrid(Rd, Zd, indexing="ij")
+    psiN = compute_psi_normalised(RR, ZZ, eq)
+    return psiN, gR, gZ
+
+
+def smooth_profile(x, y, sigma):
+    """Cubic smoothing spline through (x, y) with 1-sigma errors `sigma`.
+
+    The smoothing factor is the number of points, the standard choice that makes
+    the weighted residual chi^2 equal to its expectation: the curve follows the
+    data down to its counting noise and no further. Returns the spline.
+    """
+    from scipy.interpolate import UnivariateSpline
+    return UnivariateSpline(x, y, w=1.0 / sigma, k=3, s=float(len(x)))
+
+
+def compute_force_balance_potential(prof, species=0, min_count=FIELD_MIN_COUNT, n_fine=2001):
+    """Phi(psi_N) and dPhi/dpsi_N from ion force balance, on a fine psi_N mesh.
+
+    The support is the contiguous run of shells from the axis outward holding at
+    least `min_count` ions of `species`; outside it there is no plasma to balance
+    and dPhi/dpsi_N = 0. n and p are smoothed separately (smooth_profile, errors
+    from counting statistics: sigma_n/n = 1/sqrt(c), sigma_p/p = sqrt(5/(3c)) for a
+    Maxwellian) and dp/dpsi_N is the spline's analytic derivative. The fine mesh
+    runs from 0 to the last supported shell centre; Phi = 0 there and beyond.
+
+    Returns dict(x, Phi, dPhi_dx, x_end) with Phi in volts.
+    """
+    c = prof["count"][species]
+    centers = prof["psiN_centers"]
+    K = 0
+    while K < len(c) and c[K] >= min_count:
+        K += 1
+    x = np.linspace(0.0, 1.0, n_fine)
+    if K < 4:                                      # a cubic needs 4 points
+        return {"x": x, "Phi": np.zeros_like(x), "dPhi_dx": np.zeros_like(x), "x_end": 0.0}
+    xs = centers[:K]
+    n = prof["n"][species, :K]
+    p = prof["p"][species, :K]
+    ck = c[:K].astype(np.float64)
+    n_spl = smooth_profile(xs, n, n / np.sqrt(ck))
+    p_spl = smooth_profile(xs, p, p * np.sqrt(5.0 / (3.0 * ck)))
+    x_end = float(xs[-1])
+    inside = x <= x_end
+    g = np.zeros_like(x)
+    n_fit = n_spl(x[inside])
+    g[inside] = -p_spl.derivative()(x[inside]) / (e_charge * n_fit)
+    # Phi(x) = -int_x^x_end g dx', by trapezoid on the fine mesh
+    seg = 0.5 * (g[1:] + g[:-1]) * np.diff(x)
+    cum = np.concatenate(([0.0], np.cumsum(seg)))
+    Phi = np.where(inside, cum - cum[inside][-1], 0.0)
+    return {"x": x, "Phi": Phi, "dPhi_dx": g, "x_end": x_end}
+
+
+def compute_force_balance_field(prof, eq, R_min, R_max, Z_min, Z_max, nR, nZ,
+                                species=0, min_count=FIELD_MIN_COUNT):
+    """phi, E_R, E_Z on the (nR, nZ) field grid from ion force balance.
+
+    E = -(dPhi/dpsi_N) grad psi_N at each node, with dPhi/dpsi_N interpolated in
+    psi_N from compute_force_balance_potential. Zero outside the last closed flux
+    surface (and outside the ion support, where dPhi/dpsi_N = 0 already).
+    Returns (phi_grid, E_R_grid, E_Z_grid, potential_dict).
+    """
+    pot = compute_force_balance_potential(prof, species, min_count)
+    psiN, gR, gZ = compute_grad_psiN_grids(eq, R_min, R_max, Z_min, Z_max, nR, nZ)
+    inside = psiN <= 1.0
+    dPhi = np.where(inside, np.interp(psiN, pot["x"], pot["dPhi_dx"]), 0.0)
+    phi = np.where(inside, np.interp(psiN, pot["x"], pot["Phi"]), 0.0)
+    E_R = np.ascontiguousarray(-dPhi * gR)
+    E_Z = np.ascontiguousarray(-dPhi * gZ)
+    return np.ascontiguousarray(phi), E_R, E_Z, pot
+
+
+def species_masses(cfg):
+    """(thermal, beam, alpha) masses in the order compute_flux_profiles expects."""
+    return (cfg.m_deuterium, cfg.m_deuterium, cfg.MASS_ALPHA)
+
+
+def update_force_balance_field(cfg, eq, pos, vel, types):
+    """The reactor loops' field update: thermal-ion profiles of the given
+    particles -> (phi_grid, E_R_grid, E_Z_grid, potential_dict). Host arrays."""
+    prof = compute_flux_profiles(pos, vel, types, eq, species_masses(cfg), weight=cfg.MACRO_WEIGHT)
+    return compute_force_balance_field(prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
+                                       cfg.nR, cfg.nZ, species=0)
+
+
+def deposit_ion_charge_density(cfg, pos, types):
+    """Weighted CIC ion charge density (C/m^3) of every live particle.
+
+    Each macroparticle carries MACRO_WEIGHT ions of its species' charge: e for
+    thermal and beam deuterons, CHARGE_ALPHA for alphas.
+    """
+    pos = np.asarray(pos)
+    types = np.asarray(types)
+    live = types >= 0
+    R = np.ascontiguousarray(np.hypot(pos[live, 0], pos[live, 1]), dtype=np.float64)
+    Z = np.ascontiguousarray(pos[live, 2], dtype=np.float64)
+    q = np.where(types[live] == 2, cfg.CHARGE_ALPHA, cfg.e_charge) * cfg.MACRO_WEIGHT
+    return compute_cic_charge_density(R, Z, np.ascontiguousarray(q, dtype=np.float64),
+                                      cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, False)
 
 
 def resample_grid_to(src_grid, src_R_min, src_R_max, src_Z_min, src_Z_max, src_nR, src_nZ,

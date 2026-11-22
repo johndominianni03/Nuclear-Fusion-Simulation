@@ -16,7 +16,7 @@ class SimulationConfiguration:
         # kink-unstable. Lower q -> stronger B_pol -> faster banana-orbit bounce.
         self.Q_SAFETY_TARGET = 2.0
 
-        # --- SPATIAL GRID SETTINGS (CIC & Poisson) ---
+        # --- FIELD GRID (E_r from force balance, end-of-run density map) ---
         self.R_min = 0.5
         self.R_max = 1.5
         self.Z_min = -0.5
@@ -37,6 +37,9 @@ class SimulationConfiguration:
         """
         
         self.initial_thermal_count = 50000
+        # Thermal ions are loaded over the whole last closed flux surface with peaked
+        # profiles n = n0 (1 - psi_N), T = T0 (1 - psi_N); T_thermal_keV is T0, the
+        # on-axis temperature. n0 follows from N_AVG_TARGET below.
         self.T_thermal_keV = 1.0
         self.nbi_energy_keV = 50.0
         self.inject_every_n_steps = 2
@@ -126,12 +129,20 @@ class SimulationConfiguration:
         # stops heating
         self.THERMALIZATION_ENERGY_KEV = 15.0
 
-        # How many real ions each simulated macro-particle stands in for. Read in one
-        # place only: the Lawson triple product's density,
-        #   n_e = confined_macro_particles * MACRO_WEIGHT_REACTOR / PLASMA_VOLUME_M3
-        #       ~ 56,000 * 5e17 / 3.52  ~  8e21 m^-3.
-        # It does not weight the charge deposition or anything the particles feel.
-        self.MACRO_WEIGHT_REACTOR = 5e17
+        # Volume-averaged ion density the macroparticles represent (m^-3). After the
+        # plasma volume is known, initialization sets
+        #     MACRO_WEIGHT = N_AVG_TARGET * PLASMA_VOLUME_M3 / initial_thermal_count
+        # (~7e15 real ions per macroparticle at production size). Thermal, beam and
+        # alpha macroparticles all carry it: the deposited density, the flux-surface
+        # profiles and the Lawson density are physical, in m^-3.
+        self.N_AVG_TARGET = 1.0e20
+        self.MACRO_WEIGHT = None                # set by initialization.initialize_reactor
+
+        # The radial electric field is taken from thermal-ion force balance (quasi-
+        # neutral, no rotation) and rebuilt from the current particles at step 0 and
+        # every FIELD_UPDATE_EVERY steps. The flux-surface profiles change only at the
+        # counting-noise level over 100 steps (measured over a full production run).
+        self.FIELD_UPDATE_EVERY = 100
 
         # Confined plasma volume (m^3). Filled in at runtime by revolving the actual
         # psi = psi_edge flux surface (physics_engine.compute_plasma_volume); the value

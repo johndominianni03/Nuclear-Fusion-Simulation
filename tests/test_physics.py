@@ -254,6 +254,142 @@ def test_flux_profile_temperature_of_maxwellian():
 
 
 # =======================================================
+# PHASE 3 -- physical weight, quasi-neutral field
+# =======================================================
+def test_weighted_cic_deposits_total_charge():
+    """sum(rho * cell_volume) over the grid equals the deposited charge,
+    N_in_domain * w * e (alphas at CHARGE_ALPHA), to 1e-10 relative."""
+    from physics_engine import deposit_ion_charge_density
+    cfg, eq, *_ = _production_fields()
+    rng = np.random.default_rng(21)
+    pos = _positions_in_psiN(eq, 20000, rng, 0.0, 1.0)
+    types = rng.choice([0, 1, 2, -1], size=len(pos), p=[0.8, 0.1, 0.05, 0.05])
+    w = 7.04e15
+    saved = cfg.MACRO_WEIGHT
+    cfg.MACRO_WEIGHT = w
+    try:
+        rho = deposit_ion_charge_density(cfg, pos, types)
+    finally:
+        cfg.MACRO_WEIGHT = saved
+    dR = (cfg.R_max - cfg.R_min) / (cfg.nR - 1)
+    dZ = (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
+    R_nodes = cfg.R_min + np.arange(cfg.nR) * dR
+    cell_volume = 2.0 * np.pi * R_nodes[:, None] * dR * dZ
+    total = float(np.sum(rho * cell_volume))
+    # Every LCFS position lies well inside the grid, so all live ions deposit.
+    expect = w * (cfg.e_charge * np.sum((types == 0) | (types == 1))
+                  + cfg.CHARGE_ALPHA * np.sum(types == 2))
+    assert abs(total / expect - 1.0) < 1e-10, f"{total:.12e} vs {expect:.12e}"
+
+
+def _synthetic_profile(n0, p_of_x, n_bins=25, count=10**6):
+    """A compute_flux_profiles-shaped dict with exact n and p on the bin centres."""
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    x = 0.5 * (edges[:-1] + edges[1:])
+    z = np.zeros((3, n_bins))
+    prof = {"psiN_centers": x, "count": np.zeros((3, n_bins), dtype=np.int64),
+            "n": z.copy(), "p": z.copy()}
+    prof["count"][0] = count
+    prof["n"][0] = n0
+    prof["p"][0] = p_of_x(x)
+    return prof
+
+
+def test_force_balance_potential_exact_profile():
+    """p = p0 (1 - psi_N), n = n0 gives dPhi/dpsi_N = p0 / (e n0), so
+    Phi(x) = (p0 / (e n0)) (x - x_end) with Phi = 0 at the support edge."""
+    from physics_engine import compute_force_balance_potential, e_charge
+    n0, T0_J = 1.0e20, 1.0e3 * e_charge
+    p0 = n0 * T0_J
+    pot = compute_force_balance_potential(_synthetic_profile(n0, lambda x: p0 * (1.0 - x)))
+    x, Phi = pot["x"], pot["Phi"]
+    inside = x <= pot["x_end"]
+    analytic = (p0 / (e_charge * n0)) * (x - pot["x_end"])
+    err = np.max(np.abs(Phi[inside] - analytic[inside])) / abs(analytic[0])
+    assert err < 0.02, f"max |Phi - analytic| = {err:.2%} of |Phi(axis)|"
+    assert np.all(Phi[~inside] == 0.0)
+
+
+def test_force_balance_potential_sampled_particles():
+    """The same analytic Phi, measured end to end from sampled particles:
+    uniform n, local Maxwellian at T = T0 (1 - psi_N), so p = n0 T0 (1 - psi_N)."""
+    from physics_engine import (compute_flux_profiles, compute_force_balance_potential,
+                                compute_psi_normalised, e_charge)
+    cfg, eq, engine, *_ = _production_fields()
+    rng = np.random.default_rng(13)
+    # 600k ions: at 200k the max error over eight seeds reached 1.99%, too close
+    # to the 2% bound for a statistical test.
+    n = 600000
+    # Uniform 3D density: accept a uniform (R, Z) sample with probability R / R_max.
+    pos = _positions_in_psiN(eq, 3 * n, rng, 0.0, 1.0)
+    R = np.hypot(pos[:, 0], pos[:, 1])
+    pos = pos[rng.uniform(size=len(R)) < R / eq.psi_R_max][:n]
+    assert len(pos) == n
+    psiN = compute_psi_normalised(np.hypot(pos[:, 0], pos[:, 1]), pos[:, 2], eq)
+    T0 = 1.0
+    sigma = np.sqrt(T0 * (1.0 - psiN) * 1e3 * e_charge / cfg.m_deuterium)
+    vel = rng.normal(size=(n, 3)) * sigma[:, None]
+    prof = compute_flux_profiles(pos, vel, np.zeros(n, dtype=np.int64), eq,
+                                 _species_masses(cfg), weight=7.0e15)
+    pot = compute_force_balance_potential(prof)
+    x, Phi = pot["x"], pot["Phi"]
+    inside = x <= pot["x_end"]
+    analytic = (T0 * 1e3) * (x - pot["x_end"])         # p0/(e n0) = T0/e, in volts
+    err = np.max(np.abs(Phi[inside] - analytic[inside])) / abs(analytic[0])
+    assert err < 0.02, f"max |Phi - analytic| = {err:.2%} of |Phi(axis)| = {analytic[0]:.0f} V"
+
+
+def test_force_balance_field_zero_outside_lcfs_and_inward():
+    """E vanishes at every grid node outside psi_N = 1, and for a pressure that
+    falls outward it points down the pressure gradient's opposite: inward."""
+    from physics_engine import compute_force_balance_field, compute_grad_psiN_grids, e_charge
+    cfg, eq, *_ = _production_fields()
+    n0 = 1.0e20
+    prof = _synthetic_profile(n0, lambda x: n0 * 1e3 * e_charge * (1.0 - x) ** 2)
+    phi, E_R, E_Z, pot = compute_force_balance_field(
+        prof, eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ)
+    psiN, gR, gZ = compute_grad_psiN_grids(eq, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ)
+    outside = psiN > 1.0
+    assert outside.sum() > 0 and (~outside).sum() > 0
+    assert np.all(E_R[outside] == 0.0) and np.all(E_Z[outside] == 0.0)
+    assert np.all(phi[outside] == 0.0)
+    Emag = np.hypot(E_R, E_Z)
+    on = Emag > 0.0
+    assert on.sum() > 0.5 * (~outside).sum()
+    assert np.all((E_R * gR + E_Z * gZ)[on] < 0.0), "E not inward where p falls outward"
+
+
+def test_initial_loading_profiles_and_weight():
+    """initialize_reactor loads n = n0 (1 - psi_N), T = T0 (1 - psi_N) with
+    <n> = N_AVG_TARGET, and MACRO_WEIGHT = N_AVG_TARGET * V / N."""
+    from config import SimulationConfiguration
+    import initialization
+    from physics_engine import compute_flux_profiles
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = SimulationConfiguration()
+        state = np.random.get_state()
+        np.random.seed(2)
+        eq, engine, p, v, t, *_ = initialization.initialize_reactor(cfg)
+        np.random.set_state(state)
+    N = cfg.initial_thermal_count
+    assert cfg.MACRO_WEIGHT == cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / N
+    pos, vel, typ = p.cpu().numpy(), v.cpu().numpy(), t.cpu().numpy()
+    prof = compute_flux_profiles(pos, vel, typ, eq, _species_masses(cfg), weight=cfg.MACRO_WEIGHT)
+    V = prof["shell_volume"]
+    n_avg = np.sum(prof["n"][0] * V) / V.sum()
+    assert abs(n_avg / cfg.N_AVG_TARGET - 1.0) < 1e-3, f"<n> = {n_avg:.4e}"
+    x = prof["psiN_centers"]
+    core = x < 0.8                                       # >= ~1000 ions per shell
+    # Fit n = n0 (1 - x) and T = T0 (1 - x) by least squares over the core shells.
+    n0 = np.sum(prof["n"][0, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
+    T0 = np.sum(prof["T_keV"][0, core] * (1 - x[core])) / np.sum((1 - x[core]) ** 2)
+    assert abs(T0 / cfg.T_thermal_keV - 1.0) < 0.02, f"fitted T0 = {T0:.4f} keV"
+    resid_n = np.abs(prof["n"][0, core] / (n0 * (1 - x[core])) - 1.0)
+    resid_T = np.abs(prof["T_keV"][0, core] / (T0 * (1 - x[core])) - 1.0)
+    assert resid_n.max() < 0.1 and resid_T.max() < 0.1, (resid_n.max(), resid_T.max())
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":

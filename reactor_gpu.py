@@ -10,8 +10,9 @@ import torch
 
 from physics_engine import (
     compute_radiative_cooling_power,
-    compute_cic_charge_density_torch,       # large-N (>=100K) GPU-resident kernels
-    vectorized_gather_and_B_torch,
+    update_force_balance_field,             # quasi-neutral E_r from thermal-ion force balance (host)
+    deposit_ion_charge_density,             # end-of-run weighted CIC density map (host)
+    vectorized_gather_and_B_torch,          # large-N (>=100K) GPU-resident kernels
     check_confinement_torch,
     apply_vectorized_collisions_torch,
     compute_alpha_heating_power_torch,
@@ -24,7 +25,6 @@ from profiling import (
     _profile_header,
     _log_device_memory,
     _report_peak_rss,
-    _report_sor_histogram,
 )
 from particle_pool import (
     _ParticlePool,
@@ -55,9 +55,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # GPU-resident pipeline, selected only when GPU_PARTICLE_THRESHOLD is set to an int
     # <= cfg.initial_thermal_count. It is None by default, so this loop is opt-in -- see
     # that constant's definition for the numbers and for how to force it. The particle
-    # tensors never leave the device inside the loop, apart from the small (nR x nZ) field
-    # grid the CPU Poisson solver needs and the tracked-particle subset pulled every 20
-    # steps for plotting.
+    # tensors never leave the device inside the loop, apart from the bulk pool copied to
+    # the host every FIELD_UPDATE_EVERY steps for the force-balance field (only the two
+    # nR x nZ E grids go back) and the tracked-particle subset pulled every 20 steps for
+    # plotting.
     #
     # The push uses the DYNAMIC-shape compiled kernel where available, falling back to
     # eager if that compile failed at import. STATIC compile is wrong here: the pool
@@ -171,7 +172,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         elif device.type == "cuda":
             _sync = torch.cuda.synchronize
     prof = StageProfiler(profiling, sync=_sync, label="GPU path")
-    sor_iter_counts = []
     if profiling:
         _profile_header(cfg, f"GPU path ({device.type})", bulk.n_live + alpha.n_live)
         if _sync is None:
@@ -268,35 +268,21 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("alpha injection", _t)
 
-        # --- CHARGE DENSITY MAPPING (GPU, eager) ---
+        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
+        # Twin of the CPU loop's block: E from thermal-ion force balance, rebuilt at
+        # step 0 and every FIELD_UPDATE_EVERY steps. The profile binning runs on the
+        # host, so the bulk pool crosses to the CPU once per update and only the two
+        # small (nR x nZ) E grids go back. No dead rows can be present here -- see
+        # the CPU twin.
         _t = prof.mark()
-        # Bulk pool only, no mask -- see the CPU twin for why no dead rows can be
-        # present at this point in the step.
-        R_coords = torch.sqrt(b_pos[:, 0]**2 + b_pos[:, 1]**2)
-        Z_coords = b_pos[:, 2]
-        rho_grid_t = compute_cic_charge_density_torch(
-            R_coords, Z_coords, cfg.e_charge,
-            cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, device
-        )
-        # Only the small (nR x nZ) grid crosses to the CPU -- the SOR Poisson solve is
-        # inherently serial and stays on Numba/CPU whatever the particle count.
-        rho_grid = rho_grid_t.cpu().numpy().astype(np.float64)
-        prof.add("CIC deposition", _t)
+        if step % cfg.FIELD_UPDATE_EVERY == 0:
+            phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
+                cfg, engine.eq, b_pos.cpu().numpy(), b_vel.cpu().numpy(), b_type.cpu().numpy())
+            E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
+            E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
+        prof.add("E_r force balance", _t)
 
         _t = prof.mark()
-        if step > 0:
-            # Warm-start from last step's converged phi, as in the CPU path
-            phi_grid, E_R_grid, E_Z_grid, _sor_iters = engine.solve_fields(
-                rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
-                phi_init=phi_grid, return_iters=True)
-            if profiling:
-                sor_iter_counts.append(_sor_iters)
-        prof.add("solve_fields (Poisson)", _t)
-
-        _t = prof.mark()
-        E_R_grid_t = torch.tensor(E_R_grid, device=device, dtype=torch.float32)
-        E_Z_grid_t = torch.tensor(E_Z_grid, device=device, dtype=torch.float32)
-
         # --- E-FIELD GATHER + ANALYTIC B-FIELD (GPU, torch.compile'd, dynamic shapes) ---
         # Fed the psi-derived poloidal B grids and cfg.R0_major. That argument slot is R0
         # -- the toroidal 1/R falloff centre and tearing-mode axis -- and passing
@@ -568,10 +554,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined macro-particle count scaled by
-        # MACRO_WEIGHT_REACTOR over the psi_edge volume. Units: m^-3 * keV * s,
-        # matching cfg.lawson_target and the axis label.
-        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT_REACTOR) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the confined macro-particle count times
+        # MACRO_WEIGHT over the psi_edge volume. Units: m^-3 * keV * s, matching
+        # cfg.lawson_target and the axis label.
+        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
@@ -581,8 +567,8 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             _log_device_memory(device, step + 1)
 
         if (step + 1) % 500 == 0:
-            max_rho, max_phi = np.max(rho_grid), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max Rho: {max_rho:.3e} | Max |Phi|: {max_phi:.2e} V")
+            max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V")
 
     if profiling:
         if _sync is not None:
@@ -590,7 +576,6 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         loop_wall = time.perf_counter() - loop_wall_start
         prof.report(wall_total=loop_wall,
                     title=f"STAGE TIMING -- reactor loop (GPU / {device.type})")
-        _report_sor_histogram(sor_iter_counts)
         _log_device_memory(device, cfg.reactor_num_steps, final=True)
         _report_peak_rss("[PROFILE][GPU]")
 
@@ -607,6 +592,9 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pos_np = np.ascontiguousarray(pos_all[legacy_order])
     vel_np = np.ascontiguousarray(vel_all[legacy_order])
     type_np = np.ascontiguousarray(type_all[legacy_order])
+
+    # End-of-run ion density map: weighted CIC of every live ion, computed once.
+    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np)
 
     # Flat-array accumulation -> the dict payload, once. This is the only place
     # the sampled vertices and the device-side last_pos/last_vel cross to the host.

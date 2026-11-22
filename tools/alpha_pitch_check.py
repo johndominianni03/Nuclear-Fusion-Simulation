@@ -100,9 +100,11 @@ def build(seed):
 
 
 def loop_E_grids(cfg_steps=200, n=2000, seed=1):
-    """E_R/E_Z the CPU loop holds at the end of a short run."""
+    """E_R/E_Z of the force-balance field built from the CPU loop's state at the
+    end of a short run (the field the loop would apply after its next update)."""
     import main
     import reactor_cpu
+    from physics_engine import update_force_balance_field
     np.random.seed(seed)
     cfg = SimulationConfiguration()
     cfg.initial_thermal_count = n
@@ -113,11 +115,8 @@ def loop_E_grids(cfg_steps=200, n=2000, seed=1):
         dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min,
         dst_Z_max=cfg.Z_max, dst_nR=cfg.nR, dst_nZ=cfg.nZ)
     out = reactor_cpu._run_reactor_loop_cpu(cfg, engine, p, v, t, rho, phi, ER, EZ, B_R, B_Z)
-    phi_grid = out[-1]
-    dR = (cfg.R_max - cfg.R_min) / (cfg.nR - 1)
-    dZ = (cfg.Z_max - cfg.Z_min) / (cfg.nZ - 1)
-    from physics_engine import compute_electric_field
-    return compute_electric_field(phi_grid, dR, dZ)
+    _, E_R, E_Z, _ = update_force_balance_field(cfg, eq, out[0], out[1], out[2])
+    return E_R, E_Z
 
 
 def gather(cfg, pos, E_R, E_Z, B_R, B_Z, t, b_perturb):

@@ -9,7 +9,8 @@ import torch
 
 from physics_engine import (
     compute_radiative_cooling_power,
-    compute_cic_charge_density,
+    update_force_balance_field,             # quasi-neutral E_r from thermal-ion force balance
+    deposit_ion_charge_density,             # end-of-run weighted CIC density map
     vectorized_boris_push_numba_fallback,
     _vectorized_boris_push_metal_impl,      # eager push; shapes churn every step, so the static-compiled path would recompile constantly
     check_confinement_flux,                 # psi-surface confinement, replaces the circular boundary
@@ -18,7 +19,6 @@ from profiling import (
     StageProfiler,
     _profile_header,
     _report_peak_rss,
-    _report_sor_histogram,
 )
 from kernels import (
     vectorized_gather_and_B_into,
@@ -77,7 +77,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                           B_R_pol_grid, B_Z_pol_grid):
     # The whole per-step pipeline runs on Numpy/Numba. At this particle count (~10k-20k,
     # growing via injection) prange beats MPS outright: dispatching dozens of small
-    # per-step kernels (gather, CIC, collisions, confinement) costs more in Metal
+    # per-step kernels (gather, push, collisions, confinement) costs more in Metal
     # command-buffer overhead than the math itself. Pull the tensors to Numpy once here
     # and never touch torch inside the hot loop.
     pos_init = pos_tensor.cpu().numpy()
@@ -126,9 +126,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # ORDER IS LOAD-BEARING. The single pool was always ascending by pid --
     # injection appends and compaction is an order-preserving forward gather --
     # so a boolean mask over it yielded each species in ascending-pid order. Each
-    # split pool is independently ascending by pid, so both the CIC deposition
-    # over the bulk and the alpha energy accumulation see the SAME sequence of
-    # particles in the SAME order as before. Neither float reduction reassociates.
+    # split pool is independently ascending by pid, so the profile binning over
+    # the bulk and the alpha energy accumulation see each species in ascending-pid
+    # order, and the end-of-run rejoin below restores the single-pool order.
     bulk_capacity, alpha_capacity = _pool_capacity_bounds(cfg, n_init)
     bulk = _ParticlePool(bulk_capacity, device=None)
     alpha = _ParticlePool(alpha_capacity, device=None)
@@ -182,7 +182,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # push: it also pays for the mask, four fancy-index gathers (pos, vel,
     # B, E) and two masked scatters, all over the full particle array.
     push_prof = StageProfiler(profiling, label="deuteron push breakdown")
-    sor_iter_counts = []
     if profiling:
         _profile_header(cfg, "CPU / Numba path", bulk.n_live + alpha.n_live)
     loop_wall_start = time.perf_counter() if profiling else None
@@ -268,29 +267,16 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         prof.add("alpha injection", _t)
 
+        # --- QUASI-NEUTRAL RADIAL ELECTRIC FIELD ---
+        # E from thermal-ion radial force balance (no rotation), rebuilt from the
+        # current bulk pool at step 0 and every FIELD_UPDATE_EVERY steps. The bulk
+        # pool is all-live here (the compaction below removes every -1 each step).
+        # Twin: the same call in reactor_gpu on host copies of the pool.
         _t = prof.mark()
-        # Bulk pool only, and no mask: the bulk pool holds nothing but types 0
-        # and 1. Dead rows cannot be present either -- check_confinement_flux
-        # flags them later in the step and the compaction directly after it
-        # removes every one, so by the time the next step reaches this line the
-        # pool is all-live. Same particles, same ascending-pid order as the old
-        # mask_valid selection, so the float accumulation is unchanged.
-        R_coords = np.sqrt(b_pos[:, 0]**2 + b_pos[:, 1]**2)
-        Z_coords = b_pos[:, 2]
-        charges = np.full(bulk.n_live, cfg.e_charge)
-        rho_grid = compute_cic_charge_density(R_coords, Z_coords, charges, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ, False)
-        prof.add("CIC deposition", _t)
-
-        _t = prof.mark()
-        if step > 0:
-            # Warm-start the Poisson SOR solve from last step's converged phi: same
-            # answer within the same tol, far fewer iterations to reach it.
-            phi_grid, E_R_grid, E_Z_grid, _sor_iters = engine.solve_fields(
-                rho_grid, cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max,
-                phi_init=phi_grid, return_iters=True)
-            if profiling:
-                sor_iter_counts.append(_sor_iters)
-        prof.add("solve_fields (Poisson)", _t)
+        if step % cfg.FIELD_UPDATE_EVERY == 0:
+            phi_grid, E_R_grid, E_Z_grid, _ = update_force_balance_field(
+                cfg, engine.eq, b_pos, b_vel, b_type)
+        prof.add("E_r force balance", _t)
 
         # Bulk gather. The alphas gather inside their sub-step push below.
         _t = prof.mark()
@@ -552,18 +538,18 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
         if lawson_first_measured_step is None and t > 0 and total_lost > 0:
             lawson_first_measured_step = step
-        # The triple product's density is the confined macro-particle count scaled by
-        # MACRO_WEIGHT_REACTOR over the psi_edge volume. Units: m^-3 * keV * s,
-        # matching cfg.lawson_target and the axis label.
-        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT_REACTOR) / cfg.PLASMA_VOLUME_M3
+        # The triple product's density is the confined macro-particle count times
+        # MACRO_WEIGHT over the psi_edge volume. Units: m^-3 * keV * s, matching
+        # cfg.lawson_target and the axis label.
+        n_e_reactor = (current_confined * cfg.MACRO_WEIGHT) / cfg.PLASMA_VOLUME_M3
         lawson_triple_product_history.append(n_e_reactor * T_core * tau_E)
 
         temp_history.append(T_core)
         prof.add("Lawson diagnostics", _t)
 
         if (step + 1) % 500 == 0:
-            max_rho, max_phi = np.max(rho_grid), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max Rho: {max_rho:.3e} | Max |Phi|: {max_phi:.2e} V")
+            max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V")
 
     if profiling:
         loop_wall = time.perf_counter() - loop_wall_start
@@ -571,7 +557,6 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
                     title="STAGE TIMING -- reactor loop (CPU / Numba)")
         push_prof.report(wall_total=prof.totals.get("deuteron Boris push"),
                          title="BREAKDOWN -- deuteron Boris push stage")
-        _report_sor_histogram(sor_iter_counts)
         _report_peak_rss("[PROFILE][CPU]")
 
     # --- REJOIN THE POOLS (once, after the loop) ---
@@ -592,6 +577,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pos_np = np.ascontiguousarray(pos_np[legacy_order])
     vel_np = np.ascontiguousarray(vel_np[legacy_order])
     type_np = np.ascontiguousarray(type_np[legacy_order])
+
+    # End-of-run ion density map: weighted CIC of every live ion, computed once.
+    rho_grid = deposit_ion_charge_density(cfg, pos_np, type_np)
 
     # Tracked-particle metadata is returned as pid-keyed dicts, which removal cannot
     # corrupt -- row indices no longer survive a step now that losses are compacted out.

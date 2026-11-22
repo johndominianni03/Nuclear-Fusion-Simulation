@@ -4,9 +4,9 @@ from mhd_equilibrium import MHDEquilibrium
 from physics_engine import (
     ParticlePusher,
     compute_flux_thresholds,
-    interpolate_psi_array,
     compute_flux_boundary_contour,   # psi_edge wall polygon, shared by physics and plots
     compute_plasma_volume,           # revolved volume of that surface
+    compute_psi_normalised,
 )
 
 def _attach_flux_surfaces(eq, cfg=None, R0=1.0, a_minor=0.3):
@@ -41,33 +41,43 @@ def initialize_reactor(cfg):
     engine = ParticlePusher(equilibrium=eq)
 
     _attach_flux_surfaces(eq, cfg)
-    psi_grid = eq.psi_grid
-    psi_core = eq.psi_core
     psi_R_min, psi_R_max = eq.psi_R_min, eq.psi_R_max
     psi_Z_min, psi_Z_max = eq.psi_Z_min, eq.psi_Z_max
-    psi_nR, psi_nZ = eq.psi_nR, eq.psi_nZ
     print(f"[SYSTEM] Confined plasma volume from psi_edge surface: {eq.plasma_volume_m3:.3f} m^3")
 
-    print(f"[SYSTEM] Initializing thermal background ({cfg.initial_thermal_count:,} particles at {cfg.T_thermal_keV} keV)...")
+    # Real ions per macroparticle, so that the thermal population represents a
+    # volume-averaged density of N_AVG_TARGET. Every species carries this weight.
+    cfg.MACRO_WEIGHT = cfg.N_AVG_TARGET * cfg.PLASMA_VOLUME_M3 / cfg.initial_thermal_count
+    print(f"[SYSTEM] Macroparticle weight: {cfg.MACRO_WEIGHT:.3e} ions per macroparticle "
+          f"(<n> = {cfg.N_AVG_TARGET:.2e} m^-3 over {cfg.PLASMA_VOLUME_M3:.3f} m^3)")
 
-    # 1. Velocities (Numpy)
-    thermal_velocities = engine.initialize_velocities(cfg.initial_thermal_count, T_keV=cfg.T_thermal_keV)
+    print(f"[SYSTEM] Initializing thermal background ({cfg.initial_thermal_count:,} particles, "
+          f"n and T proportional to 1 - psi_N, T = {cfg.T_thermal_keV} keV on axis)...")
 
-    # 2. Positions by rejection sampling against the core flux contour (psi > psi_core),
-    # so births land inside the magnetic surface rather than anywhere in the rectangle.
+    # 1. Positions: peaked density n = n0 (1 - psi_N) over the whole last closed flux
+    # surface. A sample uniform in (R, Z) represents a 3D density proportional to 1/R
+    # (a cell's revolved volume is 2 pi R dR dZ), so each is accepted with probability
+    # R (1 - psi_N) / R_max, which leaves the accepted set with n proportional to (1 - psi_N).
+    N = cfg.initial_thermal_count
     R_accum = np.empty(0, dtype=np.float64)
     Z_accum = np.empty(0, dtype=np.float64)
-    while R_accum.shape[0] < cfg.initial_thermal_count:
-        batch = max(2 * (cfg.initial_thermal_count - R_accum.shape[0]), 1000)
+    while R_accum.shape[0] < N:
+        batch = max(8 * (N - R_accum.shape[0]), 1000)
         R_try = np.random.uniform(psi_R_min, psi_R_max, batch)
         Z_try = np.random.uniform(psi_Z_min, psi_Z_max, batch)
-        psi_try = interpolate_psi_array(R_try, Z_try, psi_grid, psi_R_min, psi_R_max, psi_Z_min, psi_Z_max, psi_nR, psi_nZ)
-        keep = psi_try > psi_core
+        psiN_try = compute_psi_normalised(R_try, Z_try, eq)
+        accept = np.where(psiN_try < 1.0, R_try * (1.0 - psiN_try) / psi_R_max, 0.0)
+        keep = np.random.uniform(0.0, 1.0, batch) < accept
         R_accum = np.concatenate([R_accum, R_try[keep]])
         Z_accum = np.concatenate([Z_accum, Z_try[keep]])
 
-    R = R_accum[:cfg.initial_thermal_count]
-    Z = Z_accum[:cfg.initial_thermal_count]
+    R = R_accum[:N]
+    Z = Z_accum[:N]
+
+    # 2. Velocities: a local Maxwellian at T = T0 (1 - psi_N)
+    T_local_keV = cfg.T_thermal_keV * (1.0 - compute_psi_normalised(R, Z, eq))
+    thermal_velocities = engine.initialize_velocities_profile(T_local_keV)
+
     phi = np.random.uniform(0, 2 * np.pi, cfg.initial_thermal_count)
 
     pos_arr = np.zeros((cfg.initial_thermal_count, 3), dtype=np.float32)
@@ -83,8 +93,8 @@ def initialize_reactor(cfg):
     vel_tensor = torch.tensor(thermal_velocities, device=cfg.HPC_DEVICE, dtype=torch.float32)
     type_tensor = torch.tensor(type_arr, device=cfg.HPC_DEVICE, dtype=torch.int32)
 
-    # 5. Grid arrays stay Numpy -- CIC interpolation runs on Numba/CPU. This is the
-    # Poisson solver's Cartesian (R, Z) mesh; only particle spawning/confinement changed.
+    # 5. Field grids on the Cartesian (R, Z) mesh, Numpy. The reactor loop fills E
+    # and phi from ion force balance at step 0; rho is the end-of-run density map.
     rho_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
     phi_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
     E_R_grid = np.zeros((cfg.nR, cfg.nZ), dtype=np.float64)
