@@ -344,6 +344,122 @@ to `data/fastion_sample.npz`; the totals and profiles above are in `data/fastion
 
 ---
 
+## Fusion cycle animation
+
+![Fusion cycle animation](docs/images/fusion_cycle.gif)
+
+A rendered 3D animation of the fast-ion module's stored results (`viz/`), from birth to
+thermalization or loss, on one clock that runs from 1 µs to 1.2 s:
+
+1. **Birth and first orbits** (t = 0 to 20 µs). Alphas appear at their fusion-rate-weighted birth
+   points with 3.5 MeV. Beam deuterons appear at their stored birth points with 1 MeV. Each
+   tracked alpha's 14.1 MeV partner neutron is drawn at t = 0 as an arrow, opposite the alpha's
+   birth velocity. The 16 tracked markers of each species fly their first orbits, and prompt
+   losses are marked where they cross the boundary.
+2. **Slowing down.** Markers lose energy on the background plasma, and their colour darkens as
+   they do. Thermalized markers dim into the plasma. A lost marker flashes at its stored loss
+   point.
+3. **Final state.** The counters settle and the loss points stay marked.
+
+On screen: the physical time and the clock mapping; fast, thermalized and lost counts of every
+marker; and the share of the birth energy that the markers which have ended gave to electrons and
+to ions. An inset plots the tracked markers' stored energy against time, and a timeline marks every
+marker's stored end time. The last frame closes on the production numbers: 147 thermalized and 3
+lost of 150 alphas, 66% / 30% of the alpha energy to electrons / ions, and 48% / 45% for the beam.
+
+**Clock.** 30 frames hold t = 0 (the births). Then come 252 frames on a log clock,
+t_k = 1 µs × (1.2 s / 1 µs)^(k/251), which is 41 frames per decade. Last, 40 frames hold at 1.2 s
+(the last beam ion ends at 1.13 s). The readout always shows the real physical time. That is
+322 frames, 16.1 s at 20 fps.
+
+### What is simulated and what is only drawn
+
+Every particle mark is a stored array element of `data/fastion_sample.npz`, or of a re-simulation
+written in the same format. A marker is drawn at its **most recent stored sample**, and nothing is
+interpolated:
+
+- **0 to 20 µs:** the first orbit, a collisionless guiding-centre push sampled about every 50 ns.
+- **After 20 µs:** the slowing-down track, recorded every 50,000 steps (140 to 250 µs apart). That
+  is longer than a bounce period, so these samples are drawn as dots and never joined by lines.
+- **At the end:** the end event (`end_RphiZ`, `E_end` at `t`).
+
+Colour is the latest stored energy on a log scale. `tests/test_viz.py` checks this frame by
+frame: every artist in the 3D view is either equilibrium geometry or a mark whose coordinates equal
+a stored element, with a time no later than the frame's.
+
+Three things the npz does not store are re-derived and checked:
+
+- **The birth velocities** (needed for the neutron direction): the deterministic birth samplers
+  are rerun with the production seeds. The loader requires the stored birth positions, weights and
+  energies to come back bit for bit.
+- **The first orbits' time base:** this follows from `save_sample`'s fixed recording schedule. The
+  test re-pushes the re-derived guiding centres and reproduces the stored first orbits bit for bit.
+- **The energy split:** the electron / ion split is stored only as a per-marker total, so it is
+  shown only as a cumulative total over the markers that have ended. There is no time-resolved
+  heating split.
+
+Not simulated, and labelled so on screen:
+
+- **The neutron** is not tracked. It is drawn only at t = 0, along −v_α, which is momentum
+  conservation with the D and T at rest, as the birth sampler assumes.
+- **The time mapping** is a rendering choice.
+- **There is no first wall.** "Lost" means the guiding centre crossed ψ_N = 1, as in the fast-ion
+  module.
+
+### Running it
+
+```bash
+venv/bin/python -m viz.make --out-dir docs/images                    # the stored sample (this GIF)
+venv/bin/python -m viz.make --config viz/scenes/sample_alpha_only.json
+venv/bin/python -m viz.make --set elev=72 --set rotate_deg=0          # any SceneConfig field
+venv/bin/python -m viz.make --config viz/scenes/rerun_B0_8T.json --background
+venv/bin/python -m viz.compare viz/scenes/rerun_baseline.json viz/scenes/rerun_B0_8T.json
+```
+
+- **Frame cache:** frames are cached in `viz_cache/<scene hash>/`. An interrupted render resumes
+  at the first missing frame. Outputs go to `viz_out/` unless `--out-dir` is given.
+- **Sample mode:** rendering the 322 frames takes about 55 s with 4 processes, and encoding takes
+  10 to 15 s.
+  - GIF: 720×540, 128 colours, 9.5 MB.
+  - MP4: H.264 at CRF 20, 960×720, 2.7 MB.
+- **Rerun mode** (`"source": "rerun"`) re-simulates n_alpha + n_beam markers (16 + 16 by default,
+  all of them tracked). It uses `fastion.py`'s own entry points and seeds, starts from
+  `config.py`'s scenario plus physics overrides, and caches the result by hash.
+  - Accepted overrides: `B0`, `Q_SAFETY_TARGET`, `T_thermal_keV`, `N_AVG_TARGET`,
+    `nbi_energy_keV` and `P_NBI_MW`. `P_NBI_MW` sets only the beam weights, so it changes no drawn
+    point.
+  - A 16 + 16 rerun takes 7.5 to 10.5 min on 6 cores, so run it with `--background`.
+
+**Example rerun: B0 = 8 T against the 12 T baseline.** Both runs use the same 16 + 16 births:
+
+| 16 + 16 markers | 12 T | 8 T |
+|---|---|---|
+| alpha first-orbit width, median | 0.107 m | 0.149 m |
+| alpha lost | 0 | 2 (one at 1.6 µs, one at 0.10 s) |
+| alpha slowing-down time, median | 0.48 s | 0.47 s |
+| beam first-orbit width, median | 0.084 m | 0.111 m |
+| beam lost | 0 | 1 (at 0.62 s) |
+| beam slowing-down time, median | 0.63 s | 0.68 s |
+| rerun wall time | 621 s (shared the CPU with renders) | 451 s |
+
+- **Orbits widen** by about 1.3 to 1.4×. A 1/B0 scaling predicts 1.5×.
+- **The slowing-down time does not move** beyond marker noise, because it depends on n and T,
+  not on B.
+
+### Limits
+
+- **16 markers per species is an illustration, not statistics.** A rerun's title says so. The
+  production statistics are in the section above, with 150 + 150 markers and 4,000 + 4,000 for
+  prompt losses.
+- **The log clock** compresses the 0.3 to 1.1 s thermalization into the last half-decade of
+  frames.
+- **No neutron transport.**
+- **No fast-ion feedback on the fixed background**, and none of the module's other limitations
+  are lifted.
+- **Beyond 20 µs** a marker's drawn path is a sequence of stored samples, not a resolved orbit.
+
+---
+
 ## Scope and limitations
 
 - **No electrons.** There is no electron population: no electron pressure, no electron heating
@@ -397,7 +513,7 @@ pip install -r requirements.txt
 python -m venv venv
 venv\Scripts\activate
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-pip install numba numpy pandas matplotlib scipy
+pip install numba numpy pandas matplotlib scipy imageio imageio-ffmpeg
 ```
 
 ---
@@ -437,6 +553,7 @@ python tests/test_maxwellian.py                   # Maxwellian sampling check
 python -m pytest tests/test_physics.py -q         # physics tests against known answers
 python -m pytest tests/test_fastion.py -q         # fast-ion module tests (~30 s)
 python tests/test_fastion.py record-golden        # re-record tests/golden/fastion_regression.npz
+python -m pytest tests/test_viz.py -q             # animation: loader, provenance, determinism, frame cache
 ```
 
 ### Choosing the CPU or GPU path
@@ -484,10 +601,14 @@ the workload to the GPU, whereas a discrete card can. On Apple Silicon, memory b
 | `fields_gc.py` | 381 | bicubic-spline equilibrium fields for guiding-centre motion |
 | `gc_push.py` | 285 | guiding-centre equations, RK4 kernel, invariants |
 | `background.py` | 126 | Maxwellian e, D, T background profiles |
+| `viz/scene.py` | 356 | animation inputs (`SceneConfig`), stored-data scene loader |
+| `viz/render.py` | 536 | one animation frame at physical time t |
+| `viz/make.py` | 249 | animation CLI: cached frames, GIF, MP4 |
+| `viz/rerun.py`, `viz/compare.py` | 144 | re-simulation with physics overrides, run comparison |
 
 Plus `config.py`, `mhd_equilibrium.py` (Grad–Shafranov solve with disk cache),
 `initialization.py`, `diagnostics.py`, `visualizer.py`, `tests/test_regression.py`,
-`tests/test_physics.py`, `tests/test_fastion.py`, and `tools/` (including `gc_vs_full_orbit.py`).
+`tests/test_physics.py`, `tests/test_fastion.py`, `tests/test_viz.py`, and `tools/` (including `gc_vs_full_orbit.py`).
 
 ---
 
