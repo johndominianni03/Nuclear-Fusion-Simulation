@@ -741,7 +741,7 @@ def summary_lines(sim, res, prompt):
     return L
 
 
-def main(n_alpha=160, n_beam=160, n_prompt=4000, n_track=16, outdir=None):
+def main(n_alpha=150, n_beam=150, n_prompt=4000, n_track=16, outdir=None):
     t0 = time.perf_counter()
     sim = FastIonSim()
     outdir = os.path.join(REPO, "docs", "images") if outdir is None else outdir

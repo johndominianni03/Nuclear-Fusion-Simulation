@@ -7,6 +7,10 @@ last closed flux surface, and writes 11 diagnostic plots. The plasma conditions 
 baseline (see *Scenario*). Read *Scope and limitations* before drawing conclusions from the numbers: there are no
 electrons, and some parts are prescribed rather than computed.
 
+A separate fast-ion module follows the alphas and beam ions for their whole ~0.5 s slowing-down
+with a guiding-centre pusher and a Monte Carlo Fokker–Planck collision operator (see *Fast-ion
+slowing-down module*).
+
 Written in Python with Numba JIT and PyTorch backends.
 
 ![3D view of the tokamak plasma](docs/images/tokamak_reactor_3d.png)
@@ -148,6 +152,196 @@ Every optimization was verified numerically inert against a byte-level regressio
 every recorded array, bit-identical, strict `rtol=1e-6`. The 2,437-line main module was subsequently
 split into eight modules across eight commits, each one proven bit-identical.
 
+## Fast-ion slowing-down module
+
+The reactor run lasts 10 µs, while alphas and beam ions take ~0.5 s to slow down. A separate
+module, `fastion.py`, follows them for their whole slowing-down, the way fast-ion codes such as
+ASCOT and LOCUST do: guiding-centre orbits in the equilibrium, plus Monte Carlo Coulomb collisions
+with fixed Maxwellian background electrons, deuterons and tritons. It reuses the reactor's
+equilibrium, scenario and alpha source; it does not change the 10 µs run, whose regression stays
+bit-identical.
+
+```bash
+venv/bin/python fastion.py                      # production, ~70 min: plots, data/fastion_*.npz
+venv/bin/python tools/gc_vs_full_orbit.py       # GC vs full-orbit benchmark, ~1 min
+venv/bin/python -m pytest tests/test_fastion.py -q
+```
+
+**Fields** (`fields_gc.py`). The guiding-centre equations need second derivatives of ψ, which the
+reactor's bilinear field grids do not have. The same ψ — the reactor's 60×60 Grad–Shafranov
+solution times the reactor's own q-rescale factor — is represented by an interpolating bicubic
+spline, giving B_R = −(1/R)∂ψ/∂Z, B_Z = (1/R)∂ψ/∂R, B_φ = B0·R0/R, |B|, ∇|B|, b and ∇×b, and an
+exactly divergence-free field. The electric field is Tier 1's quasi-neutral ion force balance,
+e·n_i·E = ∇p_i, for the background profiles: Φ = −(2T₀/e)(1 − ψ_N), −50 kV on axis. The prescribed
+tearing-mode ripple is left out: it breaks axisymmetry and is ~10⁻⁵ of B0.
+
+**Background** (`background.py`). Electrons, deuterons and tritons with n, T ∝ 1 − ψ_N, 25 keV on
+axis, n_D = n_T, n_e = n_D + n_T, and n₀ = 2.03×10²⁰ m⁻³ (the reactor's, volume average 10²⁰ m⁻³).
+T_e = T_i is assumed; ITER Q = 10 modelling has T_e(0) ≈ 27 keV against T_i(0) ≈ 25 keV
+([arXiv:2306.08442](https://arxiv.org/abs/2306.08442)).
+
+**Guiding-centre pusher** (`gc_push.py`). The non-relativistic B* equations (Littlejohn 1983;
+Cary & Brizard 2009) with E from Φ, integrated by fixed-step RK4 in a Numba `prange` kernel. The
+step is 1/200 of the marker's toroidal transit time at its current speed: 2.79 ns for a 3.5 MeV
+alpha, 3.70 ns for a 1 MeV deuteron, longer as it slows. A marker is lost when its guiding centre
+crosses ψ_N = 1. Energy W = ½mv∥² + μB + qΦ and canonical momentum P_φ = m·v∥·b_φ·R + qψ are
+invariants (this code's ψ sign convention gives +qψ).
+
+**Collisions** (`collisions_fp.py`). The Monte Carlo operator of Boozer & Kuo-Petravic (1981): a
+Lorentz pitch-angle step and a drag-plus-energy-diffusion speed step per background species, with
+the NRL Plasma Formulary's Chandrasekhar-function coefficients. One Coulomb logarithm per species
+pair, set by the local plasma (NRL electron–ion form; NRL counterstreaming-ion form at the test
+species' critical speed), so the background Maxwellian stays the operator's equilibrium. The energy
+each step gives to electrons and to ions is accounted exactly.
+
+**Following a marker** (`fastion.py`). Alphas are born from the thermal D–T reaction rate of the
+background profiles (the Tier 2 alpha source), isotropic at 3.5 MeV; beam ions from the reactor's
+injector at 1 MeV. Each marker carries a birth-rate weight (alphas: the fusion rate / N; beams:
+P_NBI/E_beam / N). Every step: fields at the guiding centre, one collision step, one RK4 step. A
+marker ends when it thermalizes, at E < 2 × (3/2)·T_i local, or crosses the last closed flux
+surface. Time-integrating the weighted histories gives the steady state: fast-ion density and
+pressure, heating power to electrons and to ions per flux surface, loss fractions and the wall
+heat load. Prompt (first-orbit, < 100 µs) losses come from a separate run of 4,000 markers per
+species for 1 ms, since they are too rare to count well in the full runs.
+
+### Validation
+
+Every component was tested against an analytic or independent result before the production run
+(`tests/test_fastion.py`, 17 tests, ~30 s):
+
+| test | known answer | measured | bound |
+|---|---|---|---|
+| spline ψ at the 60×60 nodes | the reactor's q-rescaled ψ | 4×10⁻¹⁴ | 10⁻⁶ |
+| spline B at the reactor's 50×50 field-grid nodes | the reactor's bilinear B | 4.2×10⁻⁴ of \|B\| (the reactor's finite-difference error: falls 3.98×, 4.02× per halving of h) | 10⁻³ |
+| ∇·B (central differences) | 0 | 1.3×10⁻⁷ B_pol/a (reactor grids: 6×10⁻³) | 10⁻⁶ |
+| ∇×b, ∇\|B\| | finite differences | 1.7×10⁻¹⁰, 1.4×10⁻¹⁰ | 10⁻⁵ |
+| background ∫n_i dV | N_AVG × volume | +0.15% | 0.5% |
+| GC energy, 10⁵ steps, trapped and passing alphas | conserved | 2.4×10⁻⁸ | 10⁻⁶ |
+| GC P_φ, same orbits | conserved | 1.3×10⁻⁷ | 10⁻⁶ |
+| trapped/passing boundary, ψ_N = 0.2, 0.5, 0.8 | √(1 − B_min/B_max) on the surface | −0.60%, −0.36%, −0.28% | 5% |
+| GC vs full orbit, 50 alphas + 50 beam ions, 1 ms | the reactor's Boris pusher | see below | few % |
+| Spitzer slowing-down time, 3.5 MeV alpha on electrons | τ_s = 0.692 s | +1.8% | 3% |
+| time from 3.5 to 0.35 MeV, full plasma | (τ_s/3)·ln[(1 + x₀^1.5)/(1 + x₁^1.5)] | +1.5% | 3% |
+| steady-state distribution, 0.1–0.95 E₀ | f ∝ 1/(v³ + v_c³) | χ² p = 0.75 (27,807 samples) | p > 0.01 |
+| alpha energy fraction to ions | Stix: (1/x)∫₀ˣ dy/(1 + y^1.5), x = 3.52 | 0.3904 vs 0.3949 (−1.1%) | 2% |
+| pitch-angle relaxation of ⟨ξ⟩ | exp(−ν_D t), ν_D = 0.142 s⁻¹ | +0.53% | 3% |
+| thermalization | background Maxwellian | KS p = 0.026, ⟨E⟩/T = 1.486 | p > 0.01 |
+| energy balance of a seeded run (lost, thermalized and running markers) | closes | \|residual\| ≤ 1.2×10⁻⁶ of birth power | 1% |
+| seeded small run | `tests/golden/fastion_regression.npz` | bit-identical (any thread count) | exact |
+
+The critical energy in the Stix test is the operator's own, E_c = 995 keV on axis. Stix's
+14.8·A·T_e formula gives 821 keV because it assumes equal ion and electron Coulomb logarithms;
+here ln Λ_i/ln Λ_e = 23.5/17.7.
+
+**Guiding centre vs full orbit.** 50 alphas and 50 beam ions were followed for 1 ms by the
+reactor's own Boris pusher (0.1 ns sub-steps, field re-gathered every sub-step, the reactor's
+bilinear fields) and by the guiding-centre pusher from the same starting points
+(`tools/gc_vs_full_orbit.py`):
+
+| | alphas | beam D |
+|---|---|---|
+| trapped/passing classification | 50/50 agree | 48/48 agree, 2 within 1% of v of the separatrix |
+| losses (GC criterion) | 0 / 0 | 0 / 0 |
+| bounce/transit period, median / 90th pct / max (invariant-sensitive excluded) | 0.49% / 1.5% / 2.9% | 0.80% / 1.7% / 4.3% |
+| banana width (trapped, invariant-sensitive excluded), median / max | 1.9% / 5.8% (n = 5) | 0.06% / 1.4% (n = 7) |
+| orbits excluded as invariant-sensitive | 1 (−12.7%) | 4 (−4.6% to +21%) |
+| wall time, full orbit / GC | 22.7 s / 1.3 s | 22.1 s / 1.0 s |
+
+"Invariant-sensitive" orbits are those whose GC period moves by more than 3% when P_φ changes by
+10⁻³|P_φ| (the full orbit's own P_φ fluctuation in the bilinear field) or μ by 1% (the accuracy of
+first-order guiding-centre theory). They are separatrix orbits and near-axis orbits where streaming
+and drift nearly cancel. For them no two models can be expected to agree; refining the full orbit's
+field to 400×400 spline samples does not close the gap either.
+
+<p align="center">
+  <img src="docs/images/gc_vs_full_orbit.png" width="95%">
+</p>
+
+### Production results
+
+150 alpha and 150 beam markers were followed to thermalization or loss (`venv/bin/python
+fastion.py`: 1,828 s for the alphas, 2,102 s for the beams, 162 s + 134 s for the two 4,000-marker
+prompt-loss runs; 70.5 min in all, 3.4×10¹⁰ guiding-centre steps; the log is
+`data/fastion_production_log.txt`). The ± values are 1σ statistical errors from the spread of
+the per-marker contributions, relative (rel) or in percentage points of the birth power or
+marker count (abs). Percentages are of the birth power unless stated.
+
+| | alphas (3.5 MeV) | beam D (1 MeV) |
+|---|---|---|
+| birth power (from the source rate, not sampled) | 2.57 MW (4.58×10¹⁸ s⁻¹, the thermal D–T rate) | 33.0 MW (2.06×10²⁰ s⁻¹) |
+| heating of electrons | 1.70 MW, 66.3% ± 1.4% rel | 15.9 MW, 48.2% ± 1.8% rel |
+| heating of ions | 0.77 MW, 30.0% ± 2.1% rel | 14.9 MW, 45.2% ± 1.9% rel |
+| electrons + ions | 96.3% ± 1.2% rel | 93.4% ± 0.04% rel |
+| kept by thermalized markers (E < 3 T_i) | 1.62% ± 0.04% abs | 6.46% ± 0.06% abs |
+| q ΔΦ (potential energy change) | 0.18% | 0.16% |
+| lost to the wall, markers | 2.34% ± 0.70% abs | 0 of 150 (95% upper limit 2.0%) |
+| of which prompt (< 100 µs, 4,000-marker run) | 1.68% ± 0.20% abs | 0 of 4,000 (95% upper limit 0.075%) |
+| of which later (full run) | 0.67% ± 0.67% abs (1 marker) | 0 |
+| lost to the wall, power | 2.28% ± 0.66% abs | 0 |
+| energy balance residual | 1.7×10⁻⁷ | 2.8×10⁻⁷ |
+| slowing-down time, mean ± error (10–90% range) | 0.491 ± 0.005 s (0.42–0.55 s) | 0.645 ± 0.012 s (0.49–0.85 s) |
+| steady-state inventory | 2.2×10¹⁸ alphas ± 1.5% rel | 1.33×10²⁰ deuterons ± 1.9% rel |
+| β (volume average, B0 = 12 T) | 0.174% ± 1.6% rel | 3.64% ± 2.0% rel |
+
+**Statistical precision.** 150 markers per species bring most totals to the ~2% (1σ, relative)
+target, but not all of them. Alpha ion heating (2.1%) is just above it, beam β (1.95%) just below,
+and the loss fractions are far from it: the alpha loss is 3 markers in the full run plus 67 in the
+4,000-marker prompt run, so it is known only to ±30% (relative); the prompt part alone to ±12% and
+the later part to ±100%. The beam ions lost none, so only an upper limit can be given. The
+slowing-down-time errors are standard errors of the mean over the thermalized markers.
+
+For comparison the thermal e + D + T plasma has β = 0.93%. Every alpha that is lost leaves through
+the upper half of the plasma (poloidal angles 40° to 170°), the direction of the ion vertical drift
+in this field; the peak load on the last closed flux surface is ~50 kW/m². The alpha energy
+spectrum follows the classical slowing-down distribution of each marker's birth surface to within
+the counting noise between 0.1 and 0.97 of the birth energy, and extends a little above 3.5 MeV
+from energy diffusion and the potential energy alphas gain moving inward.
+
+**The beam result needs care.** With ITER's 33 MW injected into a 3.5 m³ plasma (ITER's is
+~830 m³) and a 0.65 s slowing-down time, the steady-state beam population holds 1.3×10²⁰ deuterons —
+about a third of the thermal ion inventory — and a fast-ion pressure four times the thermal one.
+A plasma like this would be dominated by its beam ions; the fixed-background model used here
+(below) cannot describe that, so the beam numbers are the slowing-down of 1 MeV deuterons in the
+stated background, not a self-consistent prediction for this device.
+
+<p align="center">
+  <img src="docs/images/fast_ion_heating_profiles.png" width="95%">
+</p>
+<p align="center">
+  <img src="docs/images/alpha_slowing_down_distribution.png" width="95%">
+</p>
+<p align="center">
+  <img src="docs/images/fast_ion_pressure_profiles.png" width="60%">
+</p>
+<p align="center">
+  <img src="docs/images/fast_ion_wall_load.png" width="95%">
+</p>
+
+A downsampled set of marker trajectories (16 per species: position, energy and time over the whole
+slowing-down, plus a finely sampled first orbit) and every marker's birth and end events are saved
+to `data/fastion_sample.npz`; the totals and profiles above are in `data/fastion_results.npz`.
+
+### Fast-ion module: scope and limitations
+
+- **The backgrounds are fixed Maxwellians.** Fast-ion heating does not feed back on the
+  background temperature or density, and the fast ions do not change the potential. For the beams
+  in this scenario that is a strong approximation (see above).
+- **T_e = T_i** is assumed (ITER modelling has T_e(0) ≈ 27 keV against T_i(0) ≈ 25 keV); the
+  electron drag scales as T_e^(−3/2).
+- **No ripple:** the field is axisymmetric; the tearing-mode perturbation of the full-orbit run is
+  omitted.
+- **Fast ions do not collide with each other** and contribute no fusion reactions.
+- **The thermalized sink is not deposited:** a marker that falls below 3 T_i keeps its remaining
+  energy (1.6% of the alpha and 6.5% of the beam power); it is reported, not given to the
+  background.
+- **No fast-ion transport beyond collisions and orbits:** no Alfvén-eigenmode or other MHD
+  redistribution, no anomalous diffusion.
+- **The wall is the last closed flux surface:** a marker is lost when its guiding centre crosses
+  it. Finite-Larmor-radius losses (the particle crosses while the guiding centre does not) are not
+  counted; the full-orbit benchmark found none in 100 orbits.
+- **The 10 µs full-orbit reactor run is unchanged:** it still has no electrons, no transport
+  model and its own fixed-rate collision model.
+
 ---
 
 ## Scope and limitations
@@ -162,8 +356,8 @@ split into eight modules across eight commits, each one proven bit-identical.
   velocity direction, evaluated once at the central density and temperature, not pitch-angle
   scattering or drag from a Coulomb operator. Beam ions use the thermal-deuteron rate and
   never slow down.
-- **Alpha slowing-down uses a fixed time constant** (`ALPHA_SLOWING_TIME`), not a
-  Fokker–Planck operator.
+- **Alpha slowing-down in the 10 µs run uses a fixed time constant** (`ALPHA_SLOWING_TIME`), not a
+  Fokker–Planck operator. The separate fast-ion module does the full slowing-down properly.
 - **The run is 10 µs long**, far shorter than beam and alpha slowing-down times and the energy
   confinement time (milliseconds to seconds), so heating by either source is not expected to
   be visible.
@@ -241,6 +435,8 @@ python tests/test_regression.py compare --loose   # rtol 1e-3
 python tests/test_regression.py compare-plots     # renders to a temp dir, diffs the manifest
 python tests/test_maxwellian.py                   # Maxwellian sampling check
 python -m pytest tests/test_physics.py -q         # physics tests against known answers
+python -m pytest tests/test_fastion.py -q         # fast-ion module tests (~30 s)
+python tests/test_fastion.py record-golden        # re-record tests/golden/fastion_regression.npz
 ```
 
 ### Choosing the CPU or GPU path
@@ -282,11 +478,16 @@ the workload to the GPU, whereas a discrete card can. On Apple Silicon, memory b
 | `particle_pool.py` | 245 | capacity-backed particle pools (optional per-particle weight), compaction |
 | `kernels.py` | 242 | field gather, collisions |
 | `benchmarks.py` | 75 | hardware scaling sweep |
-| `constants.py` | 23 | CODATA 2022 physical constants (the only place masses and charges are written) |
+| `constants.py` | 25 | CODATA 2022 physical constants (the only place masses and charges are written) |
+| `fastion.py` | 774 | fast-ion slowing-down runs: markers, kernel, steady state, plots |
+| `collisions_fp.py` | 336 | Monte Carlo Fokker–Planck operator, Coulomb logarithms |
+| `fields_gc.py` | 381 | bicubic-spline equilibrium fields for guiding-centre motion |
+| `gc_push.py` | 285 | guiding-centre equations, RK4 kernel, invariants |
+| `background.py` | 126 | Maxwellian e, D, T background profiles |
 
 Plus `config.py`, `mhd_equilibrium.py` (Grad–Shafranov solve with disk cache),
 `initialization.py`, `diagnostics.py`, `visualizer.py`, `tests/test_regression.py`,
-`tests/test_physics.py`, and `tools/`.
+`tests/test_physics.py`, `tests/test_fastion.py`, and `tools/` (including `gc_vs_full_orbit.py`).
 
 ---
 
