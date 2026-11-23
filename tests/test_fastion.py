@@ -531,8 +531,8 @@ def test_fp_pitch_angle_scattering_rate():
 def test_fp_thermalizes_to_background_maxwellian():
     """20,000 alphas started isotropic at 10 T in a uniform 25 keV e/D/T plasma,
     followed for 30 energy-relaxation times at v_t (0.20 s): their energies follow
-    the Maxwellian Gamma(3/2, T) distribution (KS p > 0.01; measured p = 0.22,
-    <E>/T = 1.489)."""
+    the Maxwellian Gamma(3/2, T) distribution (KS p > 0.01; measured p = 0.026,
+    <E>/T = 1.486)."""
     import math
     from scipy import stats
     from collisions_fp import seed_rng
@@ -554,9 +554,122 @@ def test_fp_thermalizes_to_background_maxwellian():
 
 
 # =======================================================
+# PHASE 4 -- SLOWING-DOWN RUNS
+# =======================================================
+FASTION_GOLDEN = os.path.join(HERE, "golden", "fastion_regression.npz")
+
+
+@functools.lru_cache(maxsize=None)
+def _fastion_sim():
+    import fastion
+    return fastion.FastIonSim()
+
+
+def _low_energy_births(sim, species, n, E_keV, seed):
+    """n isotropic particles of `species` at E_keV, at positions from that
+    species' own birth distribution (a test input: 100 keV is just above the
+    3 T_i = 75 keV on-axis thermalization threshold, so they thermalize in ms)."""
+    from constants import KEV_J
+    import fastion
+    birth = sim.birth_alphas if species == "alpha" else sim.birth_beams
+    pos, _, w, _ = birth(n, seed)
+    q, m = fastion.SPECIES[species]
+    u = np.random.default_rng(seed).normal(size=(n, 3))
+    vel = np.sqrt(2.0 * E_keV * KEV_J / m) * u / np.linalg.norm(u, axis=1)[:, None]
+    return pos, vel, w
+
+
+def _edge_alphas(sim, n, seed):
+    """n isotropic 3.5 MeV alphas at the outboard midplane of psi_N = 0.85 (a
+    test input: wide orbits from there reach the LCFS, so some are lost)."""
+    from constants import MEV_J
+    import fastion
+    R = sim.field.flux_surface_midplane(0.85)[1]
+    q, m = fastion.SPECIES["alpha"]
+    rs = np.random.default_rng(seed)
+    phi = rs.uniform(0.0, 2.0 * np.pi, n)
+    pos = np.stack([R * np.cos(phi), R * np.sin(phi), np.full(n, sim.field.Z_axis)], axis=1)
+    u = rs.normal(size=(n, 3))
+    vel = np.sqrt(2.0 * 3.5 * MEV_J / m) * u / np.linalg.norm(u, axis=1)[:, None]
+    return pos, vel, np.ones(n)
+
+
+def _fastion_regression_run():
+    """The seeded small run behind the golden: 8 alphas + 8 beam ions at birth
+    energy for 2 ms (no thermalization), 8 alphas launched at psi_N = 0.85 for
+    2 ms (some lost), and 8 alphas + 8 deuterons at 100 keV followed to the end
+    (thermalization). Returns a dict of arrays."""
+    import fastion
+    sim = _fastion_sim()
+    out = {}
+    runs = []
+    pa, va, wa, _ = sim.birth_alphas(8, 101)
+    runs.append(("alpha_birth", "alpha", pa, va, wa, 102, 2.0e-3))
+    pb, vb, wb, _ = sim.birth_beams(8, 103)
+    runs.append(("beam_birth", "beam", pb, vb, wb, 104, 2.0e-3))
+    pe, ve, we = _edge_alphas(sim, 8, 109)
+    runs.append(("alpha_edge", "alpha", pe, ve, we, 110, 2.0e-3))
+    pa, va, wa = _low_energy_births(sim, "alpha", 8, 100.0, 105)
+    runs.append(("alpha_100keV", "alpha", pa, va, wa, 106, fastion.T_MAX))
+    pb, vb, wb = _low_energy_births(sim, "beam", 8, 100.0, 107)
+    runs.append(("beam_100keV", "beam", pb, vb, wb, 108, fastion.T_MAX))
+    for label, sp, pos, vel, w, seed, t_max in runs:
+        r = sim.follow(sp, pos, vel, w, seed, t_max=t_max, progress=False)
+        for k in ("state", "mu", "t", "status", "steps", "E_end", "dE_e", "dE_i", "dep_e", "dep_i",
+                  "dwell", "ppar", "pperp", "dwellE"):
+            out[f"{label}_{k}"] = np.asarray(r[k])
+        bal = fastion.energy_balance(r)
+        for k, v in bal.items():
+            out[f"{label}_balance_{k}"] = np.float64(v)
+    return out
+
+
+def test_fastion_energy_balance_closes():
+    """Weighted energy balance of every marker set in the seeded small run:
+    birth power = electron heating + ion heating + lost + thermalized + running
+    + q dPhi, to < 1% of the birth power (measured |residual| <= 1.2e-6, the
+    psi_N = 0.85 edge set; 2e-8 to 5e-8 for the others: the RK4 integration
+    error; the collision accounting is exact). The 100 keV sets thermalize
+    completely, the edge set loses 6 of 8 markers and the birth-energy sets are
+    still running at 2 ms, so the lost, thermalized and running sinks are all
+    exercised."""
+    out = _fastion_regression_run()
+    seen = set()
+    for label in ("alpha_birth", "beam_birth", "alpha_edge", "alpha_100keV", "beam_100keV"):
+        b = {k: float(out[f"{label}_balance_{k}"]) for k in
+             ("birth", "electrons", "ions", "lost", "thermalized", "running", "q_dPhi", "residual")}
+        assert abs(b["residual"]) < 0.01 * b["birth"], f"{label}: residual {b['residual'] / b['birth']:.2e}"
+        assert abs(b["residual"]) < 1e-5 * b["birth"], f"{label}: residual {b['residual'] / b['birth']:.2e}"
+        for k in ("lost", "thermalized", "running"):
+            if b[k] > 0:
+                seen.add(k)
+        if label.endswith("100keV"):
+            assert np.all(out[f"{label}_status"] == 1), f"{label}: not all thermalized"
+    assert seen == {"lost", "thermalized", "running"}, f"sinks exercised: {seen}"
+
+
+def test_fastion_regression_golden():
+    """The seeded small run reproduces tests/golden/fastion_regression.npz
+    exactly (per-marker random-number counters and per-marker accumulators make
+    it independent of the thread count). Record with
+    `venv/bin/python tests/test_fastion.py record-golden`."""
+    golden = np.load(FASTION_GOLDEN)
+    out = _fastion_regression_run()
+    assert set(golden.files) == set(out), "golden keys differ"
+    bad = [k for k in golden.files if not np.array_equal(golden[k], out[k])]
+    assert not bad, f"{len(bad)} arrays differ from the golden, e.g. {bad[:5]}"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "record-golden":
+        res = _fastion_regression_run()
+        os.makedirs(os.path.dirname(FASTION_GOLDEN), exist_ok=True)
+        np.savez_compressed(FASTION_GOLDEN, **res)
+        print(f"wrote {FASTION_GOLDEN} ({len(res)} arrays)")
+        sys.exit(0)
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0
     for name, fn in tests:

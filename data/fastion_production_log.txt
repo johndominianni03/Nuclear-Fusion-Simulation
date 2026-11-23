@@ -1,0 +1,92 @@
+[fastion] following 150 alpha markers to thermalization or loss ...
+  [alpha]      63 s: 2/150 done (thermalized 0, lost 2), 0.59e9 steps
+  [alpha]     125 s: 3/150 done (thermalized 0, lost 3), 1.18e9 steps
+  [alpha]     186 s: 3/150 done (thermalized 0, lost 3), 1.74e9 steps
+  [alpha]     248 s: 3/150 done (thermalized 0, lost 3), 2.33e9 steps
+  [alpha]     309 s: 3/150 done (thermalized 0, lost 3), 2.86e9 steps
+  [alpha]     371 s: 3/150 done (thermalized 0, lost 3), 3.42e9 steps
+  [alpha]     432 s: 3/150 done (thermalized 0, lost 3), 3.97e9 steps
+  [alpha]     494 s: 3/150 done (thermalized 0, lost 3), 4.53e9 steps
+  [alpha]     556 s: 3/150 done (thermalized 0, lost 3), 5.09e9 steps
+  [alpha]     618 s: 3/150 done (thermalized 0, lost 3), 5.62e9 steps
+  [alpha]     680 s: 3/150 done (thermalized 0, lost 3), 6.15e9 steps
+  [alpha]     742 s: 3/150 done (thermalized 0, lost 3), 6.68e9 steps
+  [alpha]     803 s: 3/150 done (thermalized 0, lost 3), 7.21e9 steps
+  [alpha]     864 s: 3/150 done (thermalized 0, lost 3), 7.74e9 steps
+  [alpha]     925 s: 3/150 done (thermalized 0, lost 3), 8.30e9 steps
+  [alpha]     986 s: 3/150 done (thermalized 0, lost 3), 8.86e9 steps
+  [alpha]    1048 s: 3/150 done (thermalized 0, lost 3), 9.38e9 steps
+  [alpha]    1111 s: 3/150 done (thermalized 0, lost 3), 9.88e9 steps
+  [alpha]    1171 s: 3/150 done (thermalized 0, lost 3), 10.38e9 steps
+  [alpha]    1233 s: 3/150 done (thermalized 0, lost 3), 10.91e9 steps
+  [alpha]    1294 s: 4/150 done (thermalized 1, lost 3), 11.44e9 steps
+  [alpha]    1355 s: 5/150 done (thermalized 2, lost 3), 11.97e9 steps
+  [alpha]    1416 s: 7/150 done (thermalized 4, lost 3), 12.49e9 steps
+  [alpha]    1476 s: 10/150 done (thermalized 7, lost 3), 12.94e9 steps
+  [alpha]    1538 s: 17/150 done (thermalized 14, lost 3), 13.44e9 steps
+  [alpha]    1600 s: 25/150 done (thermalized 22, lost 3), 13.96e9 steps
+  [alpha]    1661 s: 45/150 done (thermalized 42, lost 3), 14.48e9 steps
+  [alpha]    1721 s: 72/150 done (thermalized 69, lost 3), 15.01e9 steps
+  [alpha]    1782 s: 117/150 done (thermalized 114, lost 3), 15.51e9 steps
+[fastion] alpha: 1828 s
+[fastion] following 150 beam markers to thermalization or loss ...
+  [beam]      63 s: 0/150 done (thermalized 0, lost 0), 0.54e9 steps
+  [beam]     123 s: 0/150 done (thermalized 0, lost 0), 1.08e9 steps
+  [beam]     183 s: 0/150 done (thermalized 0, lost 0), 1.62e9 steps
+  [beam]     244 s: 0/150 done (thermalized 0, lost 0), 2.16e9 steps
+  [beam]     305 s: 0/150 done (thermalized 0, lost 0), 2.70e9 steps
+  [beam]     366 s: 0/150 done (thermalized 0, lost 0), 3.24e9 steps
+  [beam]     426 s: 0/150 done (thermalized 0, lost 0), 3.78e9 steps
+  [beam]     487 s: 0/150 done (thermalized 0, lost 0), 4.32e9 steps
+  [beam]     548 s: 0/150 done (thermalized 0, lost 0), 4.86e9 steps
+  [beam]     609 s: 0/150 done (thermalized 0, lost 0), 5.40e9 steps
+  [beam]     670 s: 0/150 done (thermalized 0, lost 0), 5.94e9 steps
+  [beam]     732 s: 0/150 done (thermalized 0, lost 0), 6.45e9 steps
+  [beam]     792 s: 0/150 done (thermalized 0, lost 0), 6.90e9 steps
+  [beam]     855 s: 0/150 done (thermalized 0, lost 0), 7.38e9 steps
+  [beam]     918 s: 0/150 done (thermalized 0, lost 0), 7.92e9 steps
+  [beam]     981 s: 0/150 done (thermalized 0, lost 0), 8.46e9 steps
+  [beam]    1044 s: 0/150 done (thermalized 0, lost 0), 9.00e9 steps
+  [beam]    1106 s: 0/150 done (thermalized 0, lost 0), 9.54e9 steps
+  [beam]    1167 s: 2/150 done (thermalized 2, lost 0), 10.08e9 steps
+  [beam]    1230 s: 3/150 done (thermalized 3, lost 0), 10.64e9 steps
+  [beam]    1292 s: 5/150 done (thermalized 5, lost 0), 11.19e9 steps
+  [beam]    1352 s: 7/150 done (thermalized 7, lost 0), 11.74e9 steps
+  [beam]    1413 s: 8/150 done (thermalized 8, lost 0), 12.28e9 steps
+  [beam]    1473 s: 12/150 done (thermalized 12, lost 0), 12.81e9 steps
+  [beam]    1535 s: 17/150 done (thermalized 17, lost 0), 13.35e9 steps
+  [beam]    1595 s: 24/150 done (thermalized 24, lost 0), 13.90e9 steps
+  [beam]    1657 s: 35/150 done (thermalized 35, lost 0), 14.46e9 steps
+  [beam]    1717 s: 43/150 done (thermalized 43, lost 0), 15.01e9 steps
+  [beam]    1778 s: 53/150 done (thermalized 53, lost 0), 15.55e9 steps
+  [beam]    1839 s: 70/150 done (thermalized 70, lost 0), 16.11e9 steps
+  [beam]    1900 s: 84/150 done (thermalized 84, lost 0), 16.66e9 steps
+  [beam]    1961 s: 103/150 done (thermalized 103, lost 0), 17.16e9 steps
+  [beam]    2021 s: 126/150 done (thermalized 126, lost 0), 17.65e9 steps
+  [beam]    2081 s: 147/150 done (thermalized 147, lost 0), 18.07e9 steps
+[fastion] beam: 2102 s
+[fastion] first-orbit loss run: 4000 alpha markers x 1 ms ...
+[fastion] first-orbit loss run: 4000 beam markers x 1 ms ...
+[alpha] 150 markers, wall 1828 s, 15.85e9 GC steps
+  birth power 2.569 MW (source 4.582e+18 /s)
+  to electrons 1.702 MW (66.25% +- 1.4% rel)
+  to ions      0.771 MW (30.01% +- 2.1% rel)
+  lost         0.0499 MW (1.94% +- 1.11% abs of birth power); markers lost 3 (2.00% +- 1.14% abs), prompt 2
+  thermalized sink 0.0417 MW, q dPhi +0.0046 MW, balance residual 1.68e-07
+  beta 1.735e-03 (+- 1.6% rel), N_fast 2.203e+18 (+- 1.5%)
+  slowing-down time mean 0.491 s, median 0.486 s (10-90%: 0.422-0.554 s); timeouts 0
+  prompt-loss run: 4000 markers x 1 ms, wall 162 s: prompt (< 100 us) 1.675% +- 0.203% of markers, 1.650% of birth power; lost within 1 ms 1.775%
+  combined: lost 2.342% of markers (prompt 1.675% +- 0.203%, later 0.667% +- 0.667%), 2.280% of birth power
+[beam] 150 markers, wall 2102 s, 18.13e9 GC steps
+  birth power 33.000 MW (source 2.060e+20 /s)
+  to electrons 15.907 MW (48.20% +- 1.8% rel)
+  to ions      14.909 MW (45.18% +- 1.9% rel)
+  lost         0.0000 MW (0.00% +- 0.00% abs of birth power); markers lost 0 (0.00% +- 0.00% abs), prompt 0
+  thermalized sink 2.1323 MW, q dPhi +0.0519 MW, balance residual 2.76e-07
+  beta 3.641e-02 (+- 2.0% rel), N_fast 1.329e+20 (+- 1.9%)
+  slowing-down time mean 0.645 s, median 0.627 s (10-90%: 0.486-0.851 s); timeouts 0
+  prompt-loss run: 4000 markers x 1 ms, wall 134 s: prompt (< 100 us) 0.000% +- 0.000% of markers, 0.000% of birth power; lost within 1 ms 0.000%
+  combined: lost 0.000% of markers (prompt 0.000% +- 0.000%, later 0.000% +- 0.667%), 0.000% of birth power
+[fastion] plots: docs/images/alpha_slowing_down_distribution.png, docs/images/fast_ion_heating_profiles.png, docs/images/fast_ion_pressure_profiles.png, docs/images/fast_ion_wall_load.png
+[fastion] total wall 4230 s
+process wall 4230.411185026169

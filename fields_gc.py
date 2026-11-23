@@ -209,7 +209,7 @@ class GCField:
 # =======================================================
 # NJIT FIELD EVALUATION
 # =======================================================
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def gc_psi_derivs(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
     """psi, psi_R, psi_Z, psi_RR, psi_RZ, psi_ZZ of the bicubic spline at (R, Z).
     Points outside the spline box are clamped into the edge cell (the GC loss
@@ -250,7 +250,7 @@ def gc_psi_derivs(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
     return (p, pt / dR, pu / dZ, ptt / (dR * dR), ptu / (dR * dZ), puu / (dZ * dZ))
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def gc_psi_value(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
     """psi alone (no derivatives) of the bicubic spline at (R, Z)."""
     tx = (R - R_min) / dR
@@ -276,7 +276,7 @@ def gc_psi_value(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
     return p
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def gc_phi(psiN, phi_x0, phi_dx, phi_val, phi_der):
     """Phi(psi_N) and dPhi/dpsi_N by cubic Hermite interpolation of the table;
     0 outside the last closed flux surface (psi_N > 1), as in Tier 1."""
@@ -301,7 +301,7 @@ def gc_phi(psiN, phi_x0, phi_dx, phi_val, phi_der):
     return val, der
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True)
 def gc_fields(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ, F,
               psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
     """Every field quantity the GC equations need at (R, Z), axisymmetric,

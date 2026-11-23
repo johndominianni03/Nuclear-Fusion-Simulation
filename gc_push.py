@@ -43,14 +43,10 @@ def dt_transit_fraction(field, v, fraction=DEFAULT_TRANSIT_FRACTION):
 # =======================================================
 # EQUATIONS OF MOTION
 # =======================================================
-@njit(cache=True, fastmath=True, inline="always")
-def gc_rhs(R, Z, vpar, mu, q, m,
-           coef, R_min, Z_min, dR, dZ, nR, nZ, F,
-           psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
-    """(dR/dt, dphi/dt, dZ/dt, dv_par/dt, psi_N) at one guiding-centre state."""
-    BR, Bp, BZ, B, gR, gZ, cR, cp, cZ, psi, psiN, Phi, ER, EZ = gc_fields(
-        R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ, F,
-        psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der)
+@njit(cache=True, inline="always")
+def gc_rhs_from_fields(BR, Bp, BZ, B, gR, gZ, cR, cp, cZ, ER, EZ, R, vpar, mu, q, m):
+    """(dR/dt, dphi/dt, dZ/dt, dv_par/dt) from field values already evaluated
+    at the guiding centre."""
     iB = 1.0 / B
     bR = BR * iB
     bp = Bp * iB
@@ -68,10 +64,22 @@ def gc_rhs(R, Z, vpar, mu, q, m,
     Vp = (vpar * Bsp + EsZ * bR - EsR * bZ) * iBs
     VZ = (vpar * BsZ + EsR * bp) * iBs
     dv = (q / m) * (BsR * EsR + BsZ * EsZ) * iBs
-    return VR, Vp / R, VZ, dv, psiN
+    return VR, Vp / R, VZ, dv
 
 
-@njit(cache=True, fastmath=True, inline="always")
+@njit(cache=True, inline="always")
+def gc_rhs(R, Z, vpar, mu, q, m,
+           coef, R_min, Z_min, dR, dZ, nR, nZ, F,
+           psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
+    """(dR/dt, dphi/dt, dZ/dt, dv_par/dt, psi_N) at one guiding-centre state."""
+    BR, Bp, BZ, B, gR, gZ, cR, cp, cZ, psi, psiN, Phi, ER, EZ = gc_fields(
+        R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ, F,
+        psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der)
+    VR, Vphi, VZ, dv = gc_rhs_from_fields(BR, Bp, BZ, B, gR, gZ, cR, cp, cZ, ER, EZ, R, vpar, mu, q, m)
+    return VR, Vphi, VZ, dv, psiN
+
+
+@njit(cache=True, inline="always")
 def gc_rk4_step(R, ph, Z, vp, mu, q, m, dt,
                 coef, R_min, Z_min, dR, dZ, nR, nZ, F,
                 psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
@@ -98,7 +106,7 @@ def gc_rk4_step(R, ph, Z, vp, mu, q, m, dt,
 # =======================================================
 # KERNELS
 # =======================================================
-@njit(parallel=True, cache=True, fastmath=True)
+@njit(parallel=True, cache=True)
 def gc_push(state, mu, q, m, dt, n_steps, alive, lost_step,
             coef, R_min, Z_min, dR, dZ, nR, nZ, F,
             psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
@@ -126,7 +134,7 @@ def gc_push(state, mu, q, m, dt, n_steps, alive, lost_step,
         state[i, 0] = R; state[i, 1] = ph; state[i, 2] = Z; state[i, 3] = vp
 
 
-@njit(parallel=True, cache=True, fastmath=True)
+@njit(parallel=True, cache=True)
 def gc_push_record(state, mu, q, m, dt, n_steps, rec_every, out, alive, lost_step,
                    coef, R_min, Z_min, dR, dZ, nR, nZ, F,
                    psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):

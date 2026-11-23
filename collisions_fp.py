@@ -87,12 +87,20 @@ def seed_rng(n, seed):
 # COEFFICIENTS
 # =======================================================
 @njit(cache=True, inline="always")
-def chandrasekhar_G(x):
-    """G(x) = [erf(x) - x erf'(x)] / (2 x^2); series below x = 1e-2."""
+def chandrasekhar_G_erf(x):
+    """(G(x), erf(x)) with G(x) = [erf(x) - x erf'(x)] / (2 x^2); series for G
+    below x = 1e-2 (where the difference cancels)."""
+    e = math.erf(x)
     if x < 1e-2:
         x2 = x * x
-        return (2.0 * x / (3.0 * SQRT_PI)) * (1.0 - 0.6 * x2 + 3.0 * x2 * x2 / 14.0)
-    return (math.erf(x) - x * (2.0 / SQRT_PI) * math.exp(-x * x)) / (2.0 * x * x)
+        return (2.0 * x / (3.0 * SQRT_PI)) * (1.0 - 0.6 * x2 + 3.0 * x2 * x2 / 14.0), e
+    return (e - x * (2.0 / SQRT_PI) * math.exp(-x * x)) / (2.0 * x * x), e
+
+
+@njit(cache=True, inline="always")
+def chandrasekhar_G(x):
+    """G(x) = [erf(x) - x erf'(x)] / (2 x^2)."""
+    return chandrasekhar_G_erf(x)[0]
 
 
 def gamma_prefactor(Za, ma):
@@ -111,10 +119,10 @@ def fp_coefficients(v, ma, gam, n, T, lnL, mass, charge, A, nuD, D):
             continue
         vt2 = 2.0 * T[b] / mass[b]
         x = v / math.sqrt(vt2)
-        G = chandrasekhar_G(x)
+        G, erfx = chandrasekhar_G_erf(x)
         Gb = gam * charge[b] * charge[b] * lnL[b] * n[b]
         A[b] = (1.0 + ma / mass[b]) * 2.0 * Gb * G / vt2
-        nuD[b] = Gb * (math.erf(x) - G) / (v * v * v)
+        nuD[b] = Gb * (erfx - G) / (v * v * v)
         D[b] = 2.0 * Gb * G / v
 
 
