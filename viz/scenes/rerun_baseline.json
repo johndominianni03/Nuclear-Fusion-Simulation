@@ -3,5 +3,5 @@
   "n_alpha": 16,
   "n_beam": 16,
   "output": "fusion_cycle_rerun_baseline",
-  "title": "Rerun at baseline B0 = 12 T - illustrative sample: 16 + 16 markers"
+  "title": "Baseline B0 = 12 T · illustrative sample: 16 + 16 markers"
 }

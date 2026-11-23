@@ -1,0 +1,5 @@
+{
+  "species": ["alpha"],
+  "show_neutrons": true,
+  "output": "fusion_cycle_alpha_only"
+}

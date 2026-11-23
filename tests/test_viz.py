@@ -151,6 +151,197 @@ def test_tracks_stay_inside_the_wall_except_at_loss_events():
         assert field.psi_N(sd.end_RphiZ[conf, 0], sd.end_RphiZ[conf, 2]).max() <= 1.0, sp
 
 
+# =======================================================
+# PHASE 4: RENDERING
+# =======================================================
+SMALL = dict(n_frames=16, birth_frames=1, hold_frames=1, width=320, height=240, n_show=4)
+
+
+def _prepared(**kw):
+    """Prepared scene for a config differing from the default only in drawing
+    inputs (the loaded data is shared)."""
+    import dataclasses
+    from viz.scene import SceneConfig
+    from viz.render import Prepared
+    return Prepared(dataclasses.replace(_scene(), config=SceneConfig(**kw)))
+
+
+def _pixel_hash(path):
+    import hashlib
+    from PIL import Image
+    with Image.open(path) as im:
+        return hashlib.sha256(im.convert("RGBA").tobytes()).hexdigest()
+
+
+def test_a_fixed_scene_renders_identical_pixels_twice():
+    import tempfile
+    from viz.render import save_frame
+    prep = _prepared(**SMALL)
+    with tempfile.TemporaryDirectory() as tmp:
+        for i in (0, 6, 17):
+            a, b = os.path.join(tmp, f"a{i}.png"), os.path.join(tmp, f"b{i}.png")
+            save_frame(prep, i, a)
+            save_frame(prep, i, b)
+            assert _pixel_hash(a) == _pixel_hash(b), i
+
+
+def _stored_xyz(d, name, idx, n_show):
+    """Cartesian position of the stored element `idx` of array `name`, computed
+    on the same array slice the renderer converts (identical arithmetic)."""
+    sp, kind = name.split("_", 1)
+    if kind in ("track", "first_orbit"):
+        a = d[name][:n_show]
+        X = np.stack([a[..., 0] * np.cos(a[..., 1]), a[..., 0] * np.sin(a[..., 1]), a[..., 2]], axis=-1)
+        return X[idx[0], idx[1]]
+    if kind == "end_RphiZ":
+        e = d[name]
+        X = np.stack([e[:, 0] * np.cos(e[:, 1]), e[:, 0] * np.sin(e[:, 1]), e[:, 2]], axis=-1)
+        return X[idx[0]]
+    if kind == "birth_pos":
+        return d[name][idx[0]]
+    raise KeyError(name)
+
+
+def test_every_drawn_point_maps_to_a_stored_array_element():
+    """On frames from all three acts: every artist in the 3D view is either
+    equilibrium geometry or a data mark; each data mark's drawn coordinates
+    equal the frame state's, each state point equals the stored array element
+    it names, and that element's time is <= the frame's time."""
+    from matplotlib import pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Path3DCollection
+    from constants import MEV_J
+    from viz.render import draw_frame
+    from viz.scene import SceneConfig
+    d = _npz()
+    cfg = SceneConfig()
+    prep = _prepared()
+    n_show = cfg.n_show
+    B = cfg.birth_frames
+    t_end = {sp: d[f"{sp}_t"] for sp in ("alpha", "beam")}
+    fo_t = {sp: prep.sp[sp]["fo_t"] for sp in ("alpha", "beam")}
+    frames = [0, B + 10, B + 40, B + 120, B + 230, cfg.total_frames() - 1]
+    # the frame at which the first prompt loss flashes
+    frames.append(int(prep.sp["alpha"]["end_frame"][np.argmin(np.where(d["alpha_status"] == 2, d["alpha_t"], 9))]))
+    n_checked = 0
+    for i in frames:
+        fig, st = draw_frame(prep, i)
+        t = st["t"]
+        ax = fig.viz_ax3d
+        heads = {(h["species"], h["marker"]): h for h in st["heads"]}
+        tails = {(x["species"], x["marker"]): x for x in st["tails"]}
+        fos = {(x["species"], x["marker"]): x for x in st["fo_lines"]}
+
+        def check_src(xyz, src):
+            name, idx = src
+            sp = name.split("_", 1)[0]
+            assert np.array_equal(np.asarray(xyz, dtype=np.float64), _stored_xyz(d, name, idx, n_show)), (i, src)
+            if name.endswith("_track"):
+                assert d[name][idx[0], idx[1], 4] <= t
+            elif name.endswith("_first_orbit"):
+                assert fo_t[sp][idx[0], idx[1]] <= t
+            elif name.endswith("_end_RphiZ"):
+                assert t_end[sp][idx[0]] <= t
+            # birth positions are t = 0 samples
+
+        for art in list(ax.collections) + list(ax.lines):
+            gid = art.get_gid()
+            assert gid, f"frame {i}: unlabelled artist {art}"
+            kind, *rest = gid.split(":")
+            if kind == "geometry":              # equilibrium surfaces, not particle data
+                assert not isinstance(art, Path3DCollection), gid
+                continue
+            if isinstance(art, Path3DCollection):
+                pts = np.column_stack([np.asarray(c, dtype=np.float64) for c in art._offsets3d])
+            if kind == "head":
+                h = heads[(rest[0], int(rest[1]))]
+                assert np.array_equal(pts[0], h["xyz"])
+                check_src(h["xyz"], h["src"])
+                E_name, E_idx = h["E_src"]
+                stored_E = d[E_name][E_idx] / MEV_J
+                assert h["E_MeV"] == stored_E
+            elif kind == "tail":
+                tl = tails[(rest[0], int(rest[1]))]
+                assert np.array_equal(pts, tl["xyz"])
+                for p, s in zip(tl["xyz"], tl["src"]):
+                    check_src(p, s)
+            elif kind in ("births", "ends"):
+                group = [g for g in st[kind] if g["species"] == rest[0]][0]
+                assert np.array_equal(pts, group["xyz"])
+                for p, s in zip(group["xyz"], group["src"]):
+                    check_src(p, s)
+            elif kind in ("lost", "flash"):
+                sp, m = rest[0], int(rest[1])
+                assert d[f"{sp}_status"][m] == 2
+                check_src(pts[0], (f"{sp}_end_RphiZ", (m,)))
+            elif kind == "fo":
+                f = fos[(rest[0], int(rest[1]))]
+                assert isinstance(art, Line3DCollection)
+                rows = {tuple(r) for r in f["xyz"]}
+                for seg in art._segments3d:
+                    for p in np.asarray(seg):
+                        assert tuple(p) in rows
+                n_fo = f["src"][1][1].stop
+                for k in range(n_fo):
+                    check_src(f["xyz"][k], (f"{rest[0]}_first_orbit", (int(rest[1]), k)))
+            elif kind in ("neutron", "neutron_head"):
+                # not simulated: drawn only at t = 0, from the stored alpha birth point
+                assert t == 0.0
+                j = int(rest[0])
+                if kind == "neutron":
+                    x, y, z = art.get_data_3d()
+                    assert np.array_equal([x[0], y[0], z[0]], d["alpha_birth_pos"][j])
+            else:
+                raise AssertionError(f"frame {i}: unknown artist kind {gid}")
+            n_checked += 1
+        # the counters are the stored statuses and end times
+        for sp in ("alpha", "beam"):
+            done = d[f"{sp}_t"] <= t
+            c = st["counts"][sp]
+            assert c["thermalized"] == int(np.sum(done & (d[f"{sp}_status"] == 1)))
+            assert c["lost"] == int(np.sum(done & (d[f"{sp}_status"] == 2)))
+            assert c["fast"] == int(np.sum(~done))
+        plt.close(fig)
+    assert n_checked > 200
+
+
+def test_frame_cache_resumes_at_the_missing_frames():
+    import tempfile
+    import viz.make as M
+    from viz.scene import SceneConfig
+    cfg = SceneConfig(**SMALL)
+    keep = M.CACHE_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        M.CACHE_DIR = tmp
+        try:
+            drawn, reused, _ = M.render_frames(cfg, jobs=1, log=lambda m: None)
+            n = cfg.total_frames()
+            assert (drawn, reused) == (n, 0)
+            before = {i: _pixel_hash(M.frame_path(cfg, i)) for i in range(n)}
+            for i in range(n - 10, n):
+                os.remove(M.frame_path(cfg, i))
+            drawn, reused, _ = M.render_frames(cfg, jobs=1, log=lambda m: None)
+            assert (drawn, reused) == (10, n - 10)
+            assert all(_pixel_hash(M.frame_path(cfg, i)) == before[i] for i in range(n))
+            drawn, reused, _ = M.render_frames(cfg, jobs=1, log=lambda m: None)
+            assert (drawn, reused) == (0, n)
+        finally:
+            M.CACHE_DIR = keep
+
+
+def test_cli_sets_fields_and_rejects_physics_on_the_sample():
+    from viz.make import parse_config
+    c = parse_config(["--set", "species=alpha", "--set", "azim=10", "--set", "rotate_deg=0"])
+    assert c.species == ("alpha",) and c.azim == 10.0 and c.rotate_deg == 0.0
+    r = parse_config(["--set", "source=rerun", "--set", "overrides.B0=8"])
+    assert r.overrides == (("B0", 8.0),)
+    try:
+        parse_config(["--set", "overrides.B0=8"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("physics override accepted on the stored sample")
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

@@ -73,7 +73,7 @@ ALLOWED_OVERRIDES = {
 ENCODE_ONLY = ("output", "fps", "gif_width", "gif_colors", "gif_max_mb")
 
 # Bump when the drawing code changes, so stale cached frames are not reused.
-RENDER_VERSION = 1
+RENDER_VERSION = 3
 
 
 @dataclass(frozen=True)

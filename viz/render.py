@@ -378,9 +378,13 @@ def draw_frame(prep, i, state=None):
     cax.tick_params(colors=TEXT2, labelsize=fs(8.5), length=2)
     cax.set_title("marker energy (MeV, log scale)", color=TEXT2, fontsize=fs(9), loc="left", pad=4)
     lx, ly = 0.385, 0.236
-    items = [("●", TEXT, "alpha, 3.5 MeV at birth"), ("◆", TEXT, "beam D, 1 MeV at birth"),
-             ("✖", CRITICAL, "lost: guiding centre crossed ψ_N = 1")]
-    if cfg.show_neutrons:
+    items = []
+    if "alpha" in cfg.species:
+        items.append(("●", TEXT, "alpha, 3.5 MeV at birth"))
+    if "beam" in cfg.species:
+        items.append(("◆", TEXT, "beam D, 1 MeV at birth"))
+    items.append(("✖", CRITICAL, "lost: guiding centre crossed ψ_N = 1"))
+    if cfg.show_neutrons and "alpha" in cfg.species:
         items.append(("⇢", TEXT, f"neutron, {scene.neutron_energy_MeV:.1f} MeV (not tracked, t = 0 only)"))
     for k, (sym, col, txt) in enumerate(items):
         yy = ly - 0.024 * k
@@ -410,14 +414,33 @@ def subtitle(scene):
         n = {k: v.n_markers for k, v in scene.species.items()}
         return (f"Stored production sample: {' + '.join(str(n[s]) for s in c.species)} markers, "
                 f"{c.n_show} trajectories per species drawn")
-    ov = ", ".join(f"{k} = {v:g}" for k, v in c.overrides) or "baseline scenario inputs"
-    return f"Re-simulated ({ov}) · illustrative sample: {c.n_alpha} + {c.n_beam} markers"
+    ov = override_text(c)
+    return (f"Re-simulated by fastion.py with {ov}, all other inputs from config.py "
+            f"· every marker tracked" if ov else
+            "Re-simulated by fastion.py with the config.py scenario · every marker tracked")
+
+
+OVERRIDE_LABEL = {"B0": ("B0", "T"), "Q_SAFETY_TARGET": ("q(a)", ""), "T_thermal_keV": ("T0", "keV"),
+                  "N_AVG_TARGET": ("<n>", "m⁻³"), "nbi_energy_keV": ("E_NBI", "keV"),
+                  "P_NBI_MW": ("P_NBI", "MW")}
+
+
+def override_text(c):
+    out = []
+    for k, v in c.overrides:
+        name, unit = OVERRIDE_LABEL[k]
+        out.append(f"{name} = {v:g} {unit}".rstrip())
+    return ", ".join(out)
 
 
 def default_title(scene):
+    c = scene.config
     names = {"alpha": "fusion alphas", "beam": "beam ions"}
-    who = " and ".join(names[s] for s in scene.config.species)
-    return f"{who[0].upper() + who[1:]}: birth to thermalization"
+    who = " and ".join(names[s] for s in c.species)
+    title = f"{who[0].upper() + who[1:]}: birth to thermalization"
+    if c.source == "rerun":
+        title += f" · illustrative sample: {c.n_alpha} + {c.n_beam} markers"
+    return title
 
 
 def footer_text(scene):
@@ -456,8 +479,10 @@ def _energy_inset(fig, prep, st, rect, fs):
     ax.minorticks_off()
     ax.grid(True, color=GRID, lw=0.5)
     ax.set_title("tracked markers: stored energy (MeV)", color=TEXT2, fontsize=fs(8.5), loc="left", pad=3)
-    ax.text(1.5e-6, 2.3, "alpha", color=TEXT2, fontsize=fs(7.5))
-    ax.text(1.5e-6, 0.62, "beam D", color=MUTED, fontsize=fs(7.5))
+    if "alpha" in cfg.species:
+        ax.text(1.5e-6, 2.3, "alpha", color=TEXT2, fontsize=fs(7.5))
+    if "beam" in cfg.species:
+        ax.text(1.5e-6, 0.62, "beam D", color=MUTED, fontsize=fs(7.5))
 
 
 def _timeline(fig, prep, st, rect, fs):
