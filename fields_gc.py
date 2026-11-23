@@ -209,7 +209,7 @@ class GCField:
 # =======================================================
 # NJIT FIELD EVALUATION
 # =======================================================
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def gc_psi_derivs(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
     """psi, psi_R, psi_Z, psi_RR, psi_RZ, psi_ZZ of the bicubic spline at (R, Z).
     Points outside the spline box are clamped into the edge cell (the GC loss
@@ -228,31 +228,55 @@ def gc_psi_derivs(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
         j = nZ - 2
     t = tx - i
     u = ty - j
-    # Powers and their derivatives in t and u
-    t2 = t * t
-    t3 = t2 * t
-    u2 = u * u
-    u3 = u2 * u
-    p = 0.0; pt = 0.0; pu = 0.0; ptt = 0.0; ptu = 0.0; puu = 0.0
-    for a in range(4):
-        ta = 1.0 if a == 0 else (t if a == 1 else (t2 if a == 2 else t3))
-        dta = 0.0 if a == 0 else (1.0 if a == 1 else (2.0 * t if a == 2 else 3.0 * t2))
-        d2ta = 0.0 if a < 2 else (2.0 if a == 2 else 6.0 * t)
-        # Inner polynomial in u for this a
-        c0 = coef[i, j, a, 0]; c1 = coef[i, j, a, 1]; c2 = coef[i, j, a, 2]; c3 = coef[i, j, a, 3]
-        q = c0 + c1 * u + c2 * u2 + c3 * u3
-        qu = c1 + 2.0 * c2 * u + 3.0 * c3 * u2
-        quu = 2.0 * c2 + 6.0 * c3 * u
-        p += ta * q
-        pt += dta * q
-        pu += ta * qu
-        ptt += d2ta * q
-        ptu += dta * qu
-        puu += ta * quu
+    # Inner cubics in u for each power of t: q_a(u), q_a'(u), q_a''(u)
+    q0 = coef[i, j, 0, 0] + u * (coef[i, j, 0, 1] + u * (coef[i, j, 0, 2] + u * coef[i, j, 0, 3]))
+    q1 = coef[i, j, 1, 0] + u * (coef[i, j, 1, 1] + u * (coef[i, j, 1, 2] + u * coef[i, j, 1, 3]))
+    q2 = coef[i, j, 2, 0] + u * (coef[i, j, 2, 1] + u * (coef[i, j, 2, 2] + u * coef[i, j, 2, 3]))
+    q3 = coef[i, j, 3, 0] + u * (coef[i, j, 3, 1] + u * (coef[i, j, 3, 2] + u * coef[i, j, 3, 3]))
+    r0 = coef[i, j, 0, 1] + u * (2.0 * coef[i, j, 0, 2] + u * 3.0 * coef[i, j, 0, 3])
+    r1 = coef[i, j, 1, 1] + u * (2.0 * coef[i, j, 1, 2] + u * 3.0 * coef[i, j, 1, 3])
+    r2 = coef[i, j, 2, 1] + u * (2.0 * coef[i, j, 2, 2] + u * 3.0 * coef[i, j, 2, 3])
+    r3 = coef[i, j, 3, 1] + u * (2.0 * coef[i, j, 3, 2] + u * 3.0 * coef[i, j, 3, 3])
+    s0 = 2.0 * coef[i, j, 0, 2] + 6.0 * u * coef[i, j, 0, 3]
+    s1 = 2.0 * coef[i, j, 1, 2] + 6.0 * u * coef[i, j, 1, 3]
+    s2 = 2.0 * coef[i, j, 2, 2] + 6.0 * u * coef[i, j, 2, 3]
+    s3 = 2.0 * coef[i, j, 3, 2] + 6.0 * u * coef[i, j, 3, 3]
+    p = q0 + t * (q1 + t * (q2 + t * q3))
+    pt = q1 + t * (2.0 * q2 + t * 3.0 * q3)
+    ptt = 2.0 * q2 + 6.0 * t * q3
+    pu = r0 + t * (r1 + t * (r2 + t * r3))
+    ptu = r1 + t * (2.0 * r2 + t * 3.0 * r3)
+    puu = s0 + t * (s1 + t * (s2 + t * s3))
     return (p, pt / dR, pu / dZ, ptt / (dR * dR), ptu / (dR * dZ), puu / (dZ * dZ))
 
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
+def gc_psi_value(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ):
+    """psi alone (no derivatives) of the bicubic spline at (R, Z)."""
+    tx = (R - R_min) / dR
+    ty = (Z - Z_min) / dZ
+    i = int(np.floor(tx))
+    j = int(np.floor(ty))
+    if i < 0:
+        i = 0
+    elif i > nR - 2:
+        i = nR - 2
+    if j < 0:
+        j = 0
+    elif j > nZ - 2:
+        j = nZ - 2
+    t = tx - i
+    u = ty - j
+    p = 0.0
+    ta = 1.0
+    for a in range(4):
+        q = coef[i, j, a, 0] + u * (coef[i, j, a, 1] + u * (coef[i, j, a, 2] + u * coef[i, j, a, 3]))
+        p += ta * q
+        ta *= t
+    return p
+
+
+@njit(cache=True, fastmath=True)
 def gc_phi(psiN, phi_x0, phi_dx, phi_val, phi_der):
     """Phi(psi_N) and dPhi/dpsi_N by cubic Hermite interpolation of the table;
     0 outside the last closed flux surface (psi_N > 1), as in Tier 1."""
@@ -277,7 +301,7 @@ def gc_phi(psiN, phi_x0, phi_dx, phi_val, phi_der):
     return val, der
 
 
-@njit(cache=True)
+@njit(cache=True, fastmath=True)
 def gc_fields(R, Z, coef, R_min, Z_min, dR, dZ, nR, nZ, F,
               psi_axis, psi_edge, phi_x0, phi_dx, phi_val, phi_der):
     """Every field quantity the GC equations need at (R, Z), axisymmetric,

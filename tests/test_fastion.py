@@ -261,6 +261,131 @@ def test_gc_potential_is_tier1_force_balance():
 
 
 # =======================================================
+# PHASE 2 -- GUIDING-CENTRE PUSHER
+# =======================================================
+def test_gc_conserves_energy_and_canonical_momentum():
+    """3.5 MeV alphas launched at the outboard midplane of psi_N = 0.2 and 0.5
+    with pitches +0.1 ... -0.9 (trapped and co-/counter-passing), 1e5 RK4 steps
+    at dt = 1/200 of the toroidal transit (2.79 ns, 0.28 ms in all). For every
+    confined orbit
+        |W - W0| / W0 < 1e-6            (measured max 2.4e-8)
+        |P_phi - P0| / |P0| < 1e-6      (measured max 1.3e-7)
+    with W = m v_par^2/2 + mu B + q Phi (Phi = -50 kV on axis) and
+    P_phi = m v_par b_phi R + q psi. The other sign, m v_par b_phi R - q psi,
+    is not an invariant in this code's convention: it varies by > 5%.
+    The sample holds both trapped and passing orbits."""
+    import gc_push as G
+    from constants import M_ALPHA, E_CHARGE, MEV_J
+    field, _ = _gc()
+    q, m = 2.0 * E_CHARGE, M_ALPHA
+    R, xi = [], []
+    for x in (0.2, 0.5):
+        R_out = field.flux_surface_midplane(x)[1]
+        for p in (0.1, 0.3, 0.7, 0.95, -0.4, -0.9):
+            R.append(R_out)
+            xi.append(p)
+    state, mu, v = G.gc_state_from_energy_pitch(field, np.array(R), field.Z_axis, 3.5 * MEV_J,
+                                                np.array(xi), m)
+    dt = G.dt_transit_fraction(field, v)
+    out, alive, _ = G.push_record(field, state, mu, q, m, dt, 100000, 100)
+    n = out.shape[1]
+    W, P = G.invariants(field, out.reshape(-1, 4), np.repeat(mu, n), q, m)
+    W, P = W.reshape(-1, n), P.reshape(-1, n)
+    f = field.fields(out[:, :, 0].ravel(), out[:, :, 2].ravel())
+    P_wrong = (m * out[:, :, 3].ravel() * f["Bphi"] / f["Bmag"] * out[:, :, 0].ravel()
+               - q * f["psi"]).reshape(-1, n)
+    trapped = np.any(np.sign(out[:, 1:, 3]) != np.sign(out[:, :-1, 3]), axis=1)
+    ok = alive == 1
+    assert ok.sum() >= 10
+    assert np.any(trapped & ok) and np.any(~trapped & ok)
+    dW = np.max(np.abs(W[ok] / W[ok, :1] - 1.0))
+    dP = np.max(np.abs(P[ok] - P[ok, :1]) / np.abs(P[ok, :1]))
+    assert dW < 1e-6, f"energy error {dW:.2e}"
+    assert dP < 1e-6, f"P_phi error {dP:.2e}"
+    assert np.min(np.ptp(P_wrong[ok], axis=1) / np.abs(P_wrong[ok, 0])) > 0.05
+
+
+def _trapped_passing_boundary(field, psiN, E_J, q, m):
+    """xi_c at the |B| minimum of the psi_N surface by bisection on GC orbits
+    (64 pitches per round, 3 rounds: resolution 4e-6). Returns
+    (xi_c, sqrt(1 - Bmin/Bmax), midplane-eps formula value)."""
+    import gc_push as G
+    Rc, Zc = field.flux_surface_contour(psiN, 1441)
+    B = field.fields(Rc, Zc)["Bmag"]
+    k = int(np.argmin(B))
+    xi_exact = np.sqrt(1.0 - B.min() / B.max())
+    R_in, R_out = field.flux_surface_midplane(psiN)
+    eps = (R_out - R_in) / (R_out + R_in)
+    v = np.sqrt(2.0 * E_J / m)
+    dt = float(G.dt_transit_fraction(field, v))
+    lo, hi = 0.0, 1.0
+    for _ in range(3):
+        xis = np.linspace(lo, hi, 64)
+        st, mu, _ = G.gc_state_from_energy_pitch(field, np.full(64, Rc[k]), np.full(64, Zc[k]),
+                                                 E_J, xis, m)
+        out, alive, _ = G.push_record(field, st, mu, q, m, dt, 12 * 200, 1)   # 12 toroidal transits
+        assert np.all(alive == 1)
+        vp = out[:, :, 3]
+        trapped = np.any(np.sign(vp[:, 1:]) != np.sign(vp[:, :-1]), axis=1)
+        j = int(np.nonzero(~trapped)[0][0])
+        assert np.all(trapped[:j]) and np.all(~trapped[j:]), "classification not monotone in xi"
+        lo, hi = xis[j - 1], xis[j]
+    return 0.5 * (lo + hi), xi_exact, np.sqrt(2.0 * eps / (1.0 + eps))
+
+
+def test_trapped_passing_boundary_matches_mirror_ratio():
+    """The GC trapped/passing boundary at three surfaces against the exact
+    magnetic-mirror boundary xi_c = sqrt(1 - Bmin/Bmax), Bmin and Bmax the
+    extremes of the spline |B| on the surface, for 1 keV deuterons launched at
+    the Bmin point with E off (Phi = 0) and a ~3 mm banana width: within 5%
+    (measured -0.60%, -0.36%, -0.28% at psi_N = 0.2, 0.5, 0.8 -- finite orbit
+    width). The large-aspect-ratio sqrt(2 eps/(1+eps)) with
+    eps = (R_out - R_in)/(R_out + R_in) from the midplane extent gives 0.4895,
+    0.6058, 0.6775 against exact 0.4850, 0.5940, 0.6629 (+0.9% to +2.2%)."""
+    from fields_gc import GCField
+    from constants import M_DEUTERON, E_CHARGE, KEV_J
+    f0, _ = _gc()
+    field = GCField(f0.cfg, f0.eq, f0.scale)        # no potential
+    for x in (0.2, 0.5, 0.8):
+        xi_c, xi_exact, xi_eps = _trapped_passing_boundary(field, x, KEV_J, E_CHARGE, M_DEUTERON)
+        rel = xi_c / xi_exact - 1.0
+        assert abs(rel) < 0.05, f"psi_N={x}: xi_c {xi_c:.4f} vs {xi_exact:.4f} ({rel:+.2%})"
+        assert abs(rel) < 0.01, f"psi_N={x}: {rel:+.2%} (finite-orbit-width bias expected < 1%)"
+
+
+def test_gc_matches_full_orbit_reduced_benchmark():
+    """Reduced form of tools/gc_vs_full_orbit.py (whose 1 ms, 50 + 50 run is
+    the full benchmark): 10 alphas and 10 beam ions for 0.2 ms through the
+    reactor's full-orbit Boris pusher and the GC pusher, the GC given the full
+    orbit's time-averaged energy and P_phi.
+
+    Every orbit outside the 1% separatrix dead band gets the same trapped/passing
+    label and the same loss outcome. Orbits whose GC period moves by > 3% when
+    P_phi shifts by 1e-3 |P_phi| (the full orbit's own P_phi fluctuation) or mu by
+    1% (first-order theory) are invariant-sensitive -- separatrix orbits and
+    near-axis streaming/drift cancellations -- and are counted, not compared; at
+    most 30% of the sample (measured 1 alpha, 2 beam). Over the rest:
+        period  median < 1.5%, max < 4%  (measured 0.56% / 1.31% alpha, 0.43% / 1.16% beam)
+        width   median < 1.5%, max < 7%  (measured 0.46% / 4.18% alpha, 0.27% / 0.96% beam)
+    The full 1 ms benchmark measures period median 0.49% / 0.81% and max 2.85% /
+    4.26% (alpha / beam), widths max 5.8% (a 5 cm near-axis alpha orbit)."""
+    sys.path.insert(0, os.path.join(REPO, "tools"))
+    import gc_vs_full_orbit as B
+    env = B.setup()
+    res = B.compare(env, 10, 10, 2.0e-4, verbose=False)
+    for name in ("alpha", "beam"):
+        s = B.summarize(res[name])
+        assert s["class_agree"] == s["n_decided"], f"{name}: {s['class_agree']}/{s['n_decided']}"
+        assert s["lost_agree"] == s["n"], f"{name}: loss outcomes differ"
+        assert s["n_sensitive"] <= 0.3 * s["n"], f"{name}: {s['n_sensitive']} sensitive orbits"
+        assert s["n_period"] - s["n_sensitive"] >= 6
+        assert s["period_ins_med"] < 0.015, f"{name}: period median {s['period_ins_med']:.2%}"
+        assert s["period_ins_max"] < 0.04, f"{name}: period max {s['period_ins_max']:.2%}"
+        assert s["width_ins_med"] < 0.015, f"{name}: width median {s['width_ins_med']:.2%}"
+        assert s["width_ins_max"] < 0.07, f"{name}: width max {s['width_ins_max']:.2%}"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":
