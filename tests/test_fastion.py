@@ -386,6 +386,174 @@ def test_gc_matches_full_orbit_reduced_benchmark():
 
 
 # =======================================================
+# PHASE 3 -- MONTE CARLO FOKKER-PLANCK OPERATOR (uniform plasma)
+# =======================================================
+def _axis_plasma(Za=2.0, ma=None):
+    """Uniform e/D/T Maxwellian at the scenario's on-axis density and temperature
+    (n_e = n0 = 2.03e20, n_D = n_T = n0 / 2, T = 25 keV for all three)."""
+    from collisions_fp import UniformPlasma
+    from constants import M_ALPHA, KEV_J
+    _, bg = _gc()
+    return UniformPlasma(bg.n0 * np.array([1.0, 0.5, 0.5]), np.full(3, bg.T0_keV * KEV_J),
+                         Za, M_ALPHA if ma is None else ma)
+
+
+def test_fp_spitzer_slowing_down_time():
+    """3.5 MeV alphas, uniform 25 keV plasma at the on-axis density.
+    (a) Electrons alone: the mean speed decays as exp(-t / tau_s) with the
+        Spitzer tau_s = 3 (2 pi)^(3/2) eps0^2 m_a T_e^(3/2) / (Z^2 e^4 n_e
+        m_e^(1/2) ln Lambda_e) = 0.692 s, within 3% (measured +1.8%: the
+        finite-T_e (1 - T_e/E) drift and O(x_e^2) Chandrasekhar terms), fitted
+        over 0.4 s (energy 3.5 -> 1.1 MeV), 4,000 alphas, dt = 1e-4 s.
+    (b) Full e + D + T: the mean time from 3.5 MeV to 0.35 MeV equals
+        (tau_s/3) ln[(1 + x0^1.5) / (1 + x1^1.5)], x = E / E_c, E_c = 995 keV
+        the operator's critical energy, within 3% (measured +1.5%)."""
+    import math
+    from collisions_fp import UniformPlasma, seed_rng
+    from constants import M_ALPHA, MEV_J
+    up = _axis_plasma()
+    tau = up.spitzer_tau_s()
+    E0 = 3.5 * MEV_J
+    v0 = math.sqrt(2.0 * E0 / M_ALPHA)
+    ue = UniformPlasma(up.n * np.array([1.0, 0.0, 0.0]), up.T, 2.0, M_ALPHA, lnL=up.lnL)
+    N, dt = 4000, 1.0e-4
+    v = np.full(N, v0)
+    xi = np.random.default_rng(1).uniform(-1.0, 1.0, N)
+    rng = seed_rng(N, 1)
+    t, mv = [0.0], [v0]
+    for k in range(40):
+        ue.run(v, xi, dt, 100, rng)
+        t.append((k + 1) * 100 * dt)
+        mv.append(v.mean())
+    tau_fit = -1.0 / np.polyfit(np.array(t), np.log(np.array(mv)), 1)[0]
+    assert abs(tau_fit / tau - 1.0) < 0.03, f"tau_fit / tau_s = {tau_fit / tau:.4f}"
+
+    vc = up.critical_speed()
+    x0 = E0 / (0.5 * M_ALPHA * vc**2)
+    v = np.full(N, v0)
+    xi = np.random.default_rng(2).uniform(-1.0, 1.0, N)
+    alive, _, t_stop = up.run(v, xi, dt, 20000, seed_rng(N, 2), E_stop=0.1 * E0)
+    assert not alive.any()
+    t_an = tau / 3.0 * math.log((1.0 + x0**1.5) / (1.0 + (0.1 * x0) ** 1.5))
+    assert abs(t_stop.mean() / t_an - 1.0) < 0.03, f"t_sd {t_stop.mean():.4f} vs {t_an:.4f}"
+
+
+def test_fp_steady_state_slowing_down_distribution():
+    """Constant 3.5 MeV isotropic source, sink at 0.02 E0: the steady-state speed
+    distribution 4 pi v^2 f(v) with f ~ 1 / (v^3 + v_c^3), v_c from the operator's
+    critical energy (995 keV), between 0.1 and 0.95 E0. Each of 40,000 alphas is
+    sampled once, at a time uniform in [0, 0.6 s] (longer than every lifetime;
+    a marker already absorbed contributes nothing), so the ~28,000 samples are
+    independent and distributed as the steady state. Chi-square over 20 equal
+    speed bins: p > 0.01 (measured p = 0.75, chi2 = 14.5 for 19 dof). (The
+    operator's exact 1D steady state differs from the classical shape by at
+    most 0.16% over this range.)"""
+    import math
+    from scipy import stats
+    from collisions_fp import seed_rng
+    from constants import M_ALPHA, MEV_J
+    up = _axis_plasma()
+    E0 = 3.5 * MEV_J
+    v0 = math.sqrt(2.0 * E0 / M_ALPHA)
+    vc = up.critical_speed()
+    N, dt = 40000, 2.0e-4
+    rs = np.random.default_rng(4)
+    steps = np.floor(rs.uniform(0.0, 0.6, N) / dt).astype(np.int64)
+    v = np.full(N, v0)
+    xi = rs.uniform(-1.0, 1.0, N)
+    alive, _, _ = up.run(v, xi, dt, steps, seed_rng(N, 4), E_stop=0.02 * E0)
+    lo, hi = math.sqrt(0.1) * v0, math.sqrt(0.95) * v0
+    vs = v[alive == 1]
+    vs = vs[(vs >= lo) & (vs <= hi)]
+    edges = np.linspace(lo, hi, 21)
+    cnt, _ = np.histogram(vs, edges)
+    F = np.log(edges**3 + vc**3) / 3.0          # int v^2 / (v^3 + v_c^3) dv
+    expect = np.diff(F) / (F[-1] - F[0]) * cnt.sum()
+    chi2 = float(np.sum((cnt - expect) ** 2 / expect))
+    p = stats.chi2.sf(chi2, len(cnt) - 1)
+    assert cnt.sum() > 20000
+    assert p > 0.01, f"chi2 = {chi2:.1f}, p = {p:.3g}"
+
+
+def test_fp_ion_heating_fraction_matches_stix():
+    """Fraction of a 3.5 MeV alpha's energy given to the ions (D + T) down to full
+    thermalization (E < 3/2 T), from the per-step species accounting, against
+    Stix's (1/x) int_0^x dy / (1 + y^1.5), x = E0 / E_c = 3.52: within 2%
+    (measured 0.3904 vs 0.3949, -1.1%). The accounting closes exactly: the
+    energy given to e + D + T equals the alphas' energy loss to rounding."""
+    import math
+    from scipy.integrate import quad
+    from collisions_fp import seed_rng
+    from constants import M_ALPHA, MEV_J
+    up = _axis_plasma()
+    E0 = 3.5 * MEV_J
+    v0 = math.sqrt(2.0 * E0 / M_ALPHA)
+    x0 = E0 / (0.5 * M_ALPHA * up.critical_speed() ** 2)
+    N = 4000
+    v = np.full(N, v0)
+    xi = np.random.default_rng(3).uniform(-1.0, 1.0, N)
+    alive, dE, _ = up.run(v, xi, 2.0e-4, 20000, seed_rng(N, 3), E_stop=1.5 * up.T[1])
+    assert not alive.any()
+    lost = N * E0 - float(np.sum(0.5 * M_ALPHA * v**2))
+    assert abs(dE.sum() / lost - 1.0) < 1e-12
+    f_ion = dE[:, 1:].sum() / dE.sum()
+    G = quad(lambda y: 1.0 / (1.0 + y**1.5), 0.0, x0)[0] / x0
+    assert abs(f_ion / G - 1.0) < 0.02, f"ion fraction {f_ion:.4f} vs Stix {G:.4f}"
+
+
+def test_fp_pitch_angle_scattering_rate():
+    """At fixed energy (speed update off) <xi> of 20,000 3.5 MeV alphas started at
+    xi = 1 decays as exp(-nu_D t), nu_D = sum_b nu_D,b = 0.142 /s from the
+    Chandrasekhar coefficients: fitted rate within 3% (measured +0.53%) over two
+    e-folds, nu_D dt = 1e-3."""
+    import math
+    from collisions_fp import seed_rng
+    from constants import M_ALPHA, MEV_J
+    up = _axis_plasma()
+    v0 = math.sqrt(2.0 * 3.5 * MEV_J / M_ALPHA)
+    _, nuD, _ = up.coefficients(v0)
+    nu = nuD.sum()
+    N = 20000
+    v = np.full(N, v0)
+    xi = np.ones(N)
+    rng = seed_rng(N, 5)
+    dt = 1e-3 / nu
+    t, mx = [0.0], [1.0]
+    for k in range(20):
+        up.run(v, xi, dt, 100, rng, pitch_only=True)
+        t.append((k + 1) * 100 * dt)
+        mx.append(xi.mean())
+    assert np.all(v == v0)
+    fit = -np.polyfit(np.array(t), np.log(np.array(mx)), 1)[0]
+    assert abs(fit / nu - 1.0) < 0.03, f"fitted {fit:.4f} vs nu_D {nu:.4f}"
+
+
+def test_fp_thermalizes_to_background_maxwellian():
+    """20,000 alphas started isotropic at 10 T in a uniform 25 keV e/D/T plasma,
+    followed for 30 energy-relaxation times at v_t (0.20 s): their energies follow
+    the Maxwellian Gamma(3/2, T) distribution (KS p > 0.01; measured p = 0.22,
+    <E>/T = 1.489)."""
+    import math
+    from scipy import stats
+    from collisions_fp import seed_rng
+    from constants import M_ALPHA
+    up = _axis_plasma()
+    T = up.T[1]
+    N = 20000
+    rs = np.random.default_rng(6)
+    v = np.full(N, math.sqrt(2.0 * 10.0 * T / M_ALPHA))
+    xi = rs.uniform(-1.0, 1.0, N)
+    vt = math.sqrt(2.0 * T / M_ALPHA)
+    A, _, _ = up.coefficients(vt)
+    tE = vt / A.sum()
+    dt = 0.02 * tE
+    up.run(v, xi, dt, int(30 * tE / dt), seed_rng(N, 6))
+    E = 0.5 * M_ALPHA * v**2 / T
+    ks = stats.kstest(E, stats.gamma(1.5).cdf)
+    assert ks.pvalue > 0.01, f"KS p = {ks.pvalue:.3g}, <E>/T = {E.mean():.4f}"
+
+
+# =======================================================
 # PLAIN-PYTHON RUNNER
 # =======================================================
 if __name__ == "__main__":
