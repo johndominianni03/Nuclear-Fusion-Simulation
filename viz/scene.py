@@ -91,7 +91,7 @@ class SceneConfig:
     birth_frames: int = 14
     hold_frames: int = 34
     # drawing
-    tail_frames: float = 3.0               # stored samples younger than this many frames
+    tail_frames: float = 6.0               # stored samples younger than this many frames
     tail_max: int = 48                     # ... capped at this many per marker
     show_untracked: bool = True            # birth / loss events of untracked markers
     show_neutrons: bool = True
