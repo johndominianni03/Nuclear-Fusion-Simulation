@@ -1,0 +1,8 @@
+{
+  "source": "rerun",
+  "n_alpha": 16,
+  "n_beam": 16,
+  "overrides": {"B0": 8.0},
+  "output": "fusion_cycle_B0_8T",
+  "title": "Rerun at B0 = 8 T (baseline 12 T) - illustrative sample: 16 + 16 markers"
+}
