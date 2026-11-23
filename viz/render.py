@@ -235,18 +235,20 @@ def _torus(ax, scene, cut=(0.0, 1.5 * np.pi)):
     X = R[:, None] * np.cos(ph)[None, :]
     Y = R[:, None] * np.sin(ph)[None, :]
     ZZ = np.repeat(Z[:, None], ph.size, axis=1)
-    ax.plot_surface(X, Y, ZZ, color=TEXT2, alpha=0.045, linewidth=0, antialiased=False, shade=False)
+    ax.plot_surface(X, Y, ZZ, color=TEXT2, alpha=0.045, linewidth=0, antialiased=False, shade=False,
+                    gid="geometry:lcfs_surface")
     for c in cut:
         ax.plot(scene.wall_R * np.cos(c), scene.wall_R * np.sin(c), scene.wall_Z,
-                color=TEXT2, lw=1.0, alpha=0.75)
+                color=TEXT2, lw=1.0, alpha=0.75, gid="geometry:lcfs_section")
         for x, Rs, Zs in scene.surfaces:
-            ax.plot(Rs * np.cos(c), Rs * np.sin(c), Zs, color=MUTED, lw=0.6, alpha=0.55)
+            ax.plot(Rs * np.cos(c), Rs * np.sin(c), Zs, color=MUTED, lw=0.6, alpha=0.55,
+                    gid="geometry:flux_surface_section")
     ring = np.linspace(cut[0], cut[1], 160)
     for k in np.linspace(0, scene.wall_R.size - 1, 9)[:-1].astype(int):
         ax.plot(scene.wall_R[k] * np.cos(ring), scene.wall_R[k] * np.sin(ring), np.full(ring.size, scene.wall_Z[k]),
-                color=TEXT2, lw=0.5, alpha=0.22)
+                color=TEXT2, lw=0.5, alpha=0.22, gid="geometry:lcfs_ring")
     ax.plot(scene.R_axis * np.cos(ring), scene.R_axis * np.sin(ring), np.full(ring.size, scene.Z_axis),
-            color=MUTED, lw=0.6, alpha=0.4, ls=(0, (2, 3)))
+            color=MUTED, lw=0.6, alpha=0.4, ls=(0, (2, 3)), gid="geometry:magnetic_axis")
 
 
 def _colors(E_MeV, alpha):
@@ -261,12 +263,14 @@ def draw_frame(prep, i, state=None):
     st = frame_state(prep, i) if state is None else state
     W, H, dpi = cfg.width, cfg.height, 100
     fig = plt.figure(figsize=(W / dpi, H / dpi), dpi=dpi, facecolor=SURFACE)
+    fig.viz_ax3d = None
     s = min(W / 960.0, H / 720.0)                 # font / marker scale
     fs = lambda x: x * s                          # noqa: E731
 
     # ---- 3D view ------------------------------------------------------------
     ax = fig.add_axes([-0.05, 0.2, 0.76, 0.68], projection="3d", facecolor=SURFACE)
     ax.set_axis_off()
+    fig.viz_ax3d = ax
     lim = 1.48 / cfg.zoom
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
@@ -312,15 +316,16 @@ def draw_frame(prep, i, state=None):
         if 0 <= age < FLASH_FRAMES:
             k = 1.0 - age / FLASH_FRAMES
             ax.scatter([x], [y], [z], s=fs(60 + 900 * k), c=[CRITICAL], alpha=0.25 + 0.35 * k, marker="o",
-                       linewidths=0, depthshade=False)
+                       linewidths=0, depthshade=False, gid=f"flash:{l['species']}:{l['marker']}")
         ax.scatter([x], [y], [z], s=fs(70), c=[CRITICAL], marker="X", edgecolors=SURFACE, linewidths=fs(0.6),
                    depthshade=False, gid=f"lost:{l['species']}:{l['marker']}")
     for n in st["neutrons"]:
         a, d = n["from"], n["dir"]
         b = a + NEUTRON_ARROW_M * d
-        ax.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]], color=TEXT, lw=fs(1.0), alpha=0.8, ls=(0, (3, 2)))
+        ax.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]], color=TEXT, lw=fs(1.0), alpha=0.8, ls=(0, (3, 2)),
+                gid=f"neutron:{n['marker']}")
         ax.scatter([b[0]], [b[1]], [b[2]], s=fs(16), c=[TEXT], marker=">", alpha=0.8, linewidths=0,
-                   depthshade=False)
+                   depthshade=False, gid=f"neutron_head:{n['marker']}")
 
     # ---- header -------------------------------------------------------------
     title = cfg.title or default_title(scene)

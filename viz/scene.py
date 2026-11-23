@@ -70,6 +70,8 @@ ALLOWED_OVERRIDES = {
     "P_NBI_MW": "neutral-beam power [MW] (beam weights only)",
 }
 
+ENCODE_ONLY = ("output", "fps", "gif_width", "gif_colors", "gif_max_mb")
+
 # Bump when the drawing code changes, so stale cached frames are not reused.
 RENDER_VERSION = 1
 
@@ -88,8 +90,8 @@ class SceneConfig:
     t_max: float = 1.2                     # s (the last beam marker ends at 1.13 s)
     time_mapping: str = "log"              # "log" | "linear"
     n_frames: int = 252
-    birth_frames: int = 14
-    hold_frames: int = 34
+    birth_frames: int = 30
+    hold_frames: int = 40
     # drawing
     tail_frames: float = 6.0               # stored samples younger than this many frames
     tail_max: int = 48                     # ... capped at this many per marker
@@ -103,8 +105,12 @@ class SceneConfig:
     fps: int = 20
     width: int = 960                       # px
     height: int = 720                      # px
-    output: str = "fusion_cycle"
     title: Optional[str] = None
+    # encoding only (not part of the frame-cache key)
+    output: str = "fusion_cycle"
+    gif_width: int = 720                   # px; the GIF is downscaled to keep it small
+    gif_colors: int = 128                  # global GIF palette size
+    gif_max_mb: float = 15.0               # frames are dropped (fps halved) until the GIF fits
 
     def __post_init__(self):
         sp = self.species
@@ -172,9 +178,10 @@ class SceneConfig:
         return _hash(self.physics_key())
 
     def scene_hash(self):
-        """Frame-cache key: every input plus the render-code version."""
-        return _hash({"scene": self.to_dict(), "physics": self.physics_key(),
-                      "render_version": RENDER_VERSION})
+        """Frame-cache key: every input that changes a frame's pixels, plus the
+        render-code version (encoding-only fields are left out)."""
+        d = {k: v for k, v in self.to_dict().items() if k not in ENCODE_ONLY}
+        return _hash({"scene": d, "physics": self.physics_key(), "render_version": RENDER_VERSION})
 
     # ---- clock ------------------------------------------------------------
     def total_frames(self):
