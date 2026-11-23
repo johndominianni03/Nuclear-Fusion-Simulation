@@ -37,6 +37,7 @@ class PlasmaVisualizer:
         r0: float = 0.3,
         classifications: list = None,  # Optional species codes: 0 thermal D, 1 beam D, 2 alpha, 3 thermal T, -1 lost
         wall_contour=None,             # Optional (R, Z) polygon of the psi_edge surface
+        beam_label: str = "NBI Fast Ions",  # legend text for the beam (diagnostics passes the energy)
     ):
         fig = plt.figure(figsize=(10, 8))
         ax = fig.add_subplot(111, projection="3d")
@@ -134,7 +135,7 @@ class PlasmaVisualizer:
         # --- Legend ---
         from matplotlib.lines import Line2D
         legend_elements = [
-            Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions'),
+            Line2D([0], [0], color='gold', lw=2, label=beam_label),
             Line2D([0], [0], color='dodgerblue', lw=2, label='Thermal Deuterium'),
             Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
             Line2D([0], [0], color='magenta', lw=2, label='3.5 MeV Alphas (Banana Orbits)'),

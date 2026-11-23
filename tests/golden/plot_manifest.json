@@ -1,86 +1,86 @@
 {
   "expected_count": 11,
-  "generated": "2026-11-22T04:39:22Z",
+  "generated": "2026-11-23T02:31:58Z",
   "missing": [],
   "plots": {
     "alpha_orbits.png": {
-      "bytes": 898559,
+      "bytes": 1022989,
       "height": 2400,
       "path": "alpha_orbits.png",
-      "sha256": "bf6e05cb6c13dfa5d824470359b2b8ca01904b4f81ad8cfc64612852589c9a3b",
+      "sha256": "c783eb1005809b5421c1937bdbd74a6c2e8fa1429ecce53d85465713b91a93a8",
       "width": 2400
     },
     "benchmark_scaling.png": {
-      "bytes": 240281,
+      "bytes": 219615,
       "height": 1800,
       "path": "benchmark_scaling.png",
-      "sha256": "0534965ad7e5c43b05320a5500b35bef3789ecce3382b60bd01474ed4af7b851",
+      "sha256": "eec998918982904e334ed4df8dc5e11a10a3e79901b5941a9feb58c1f4b7e0ec",
       "width": 2700
     },
     "fusion_power_density.png": {
-      "bytes": 274770,
+      "bytes": 298162,
       "height": 1800,
       "path": "fusion_power_density.png",
-      "sha256": "012f4f749b91839b86ab9d1d8a1cf373f5914127e7d0b71fa8cec21cacee8add",
+      "sha256": "8c36c78435563eee2d4ee04489722b9a948bfb7a248d465763d14f39e1377bc0",
       "width": 2100
     },
     "ion_density_map.png": {
-      "bytes": 400593,
+      "bytes": 437079,
       "height": 1800,
       "path": "ion_density_map.png",
-      "sha256": "75301c716e19c189a2f0c25a6c8dcce0fd79a797aea6c2cab30dc45ccae4f873",
+      "sha256": "3f03cd636ad57234e0b2896addab6364eb83feb8e25401aba3a8cb5f26b4eb33",
       "width": 2100
     },
     "lawson_triple_product.png": {
-      "bytes": 116373,
+      "bytes": 137928,
       "height": 1500,
       "path": "lawson_triple_product.png",
-      "sha256": "d416b25f966f9c7f87ed068e40722c537594b6ab736e73de9b6bb1b0dcd46a3e",
+      "sha256": "66947d3d5c97d149ecd7e71b692d04603e667dcae60d592beacf269a2fe1fbc7",
       "width": 2700
     },
     "phase_space_map.png": {
-      "bytes": 510047,
+      "bytes": 596654,
       "height": 1800,
       "path": "phase_space_map.png",
-      "sha256": "e4648f24e5693ea5938e165886b48043728361f66812a9bb371d8e2d4d8bd5b0",
-      "width": 3900
+      "sha256": "9d6403e806d020046fa293f81188e53142cb2759539c8edb4f843d879e91931f",
+      "width": 5400
     },
     "plasma_stored_energy_time.png": {
-      "bytes": 102562,
+      "bytes": 106013,
       "height": 1350,
       "path": "plasma_stored_energy_time.png",
-      "sha256": "9e1b39f7d6bd4e2fc81d56592e3c813bec1afe47e1509e65f434f79889704d40",
+      "sha256": "b8d19674aa8fb6e4a4a17312c8fd97a8102cd6df7f14314901a1ba362001c60c",
       "width": 2400
     },
     "potential_field_map.png": {
-      "bytes": 258551,
+      "bytes": 258725,
       "height": 1800,
       "path": "potential_field_map.png",
-      "sha256": "ace61183d90d028ab0deec7f816da17b831bfe0c931c5d282d6d4fcabe4414bf",
+      "sha256": "1ce246844d36954668d96ab27dcfc8776cb0c66baa8a597e8078b9c356c91da0",
       "width": 2100
     },
     "radial_profiles.png": {
-      "bytes": 312629,
+      "bytes": 364070,
       "height": 3000,
       "path": "radial_profiles.png",
-      "sha256": "baf773cb3a805e7dc49dc98c2cce20bb76272fa18e38b7c79d77d44f7451cc05",
+      "sha256": "d28d1729a2e626de86901d8ddf48a8e8558dd1be6da7a5c7d5a100a92baf644a",
       "width": 2400
     },
     "tokamak_reactor_2d.png": {
-      "bytes": 898785,
+      "bytes": 1194407,
       "height": 2400,
       "path": "tokamak_reactor_2d.png",
-      "sha256": "2b08e7769f8c3537adb701404fa46e014ddb616610f1ca1adb72d4e89f2566e7",
+      "sha256": "9a75d18abde3b04062aae2a1611b0cb54ceb76a21427b8118233cc5fd89d0764",
       "width": 2400
     },
     "tokamak_reactor_3d.png": {
-      "bytes": 935467,
+      "bytes": 1099295,
       "height": 2400,
       "path": "tokamak_reactor_3d.png",
-      "sha256": "f4b24e7efe2f61a289eba525ca925917a2d874e94637f79d9c072f9d3844fe49",
+      "sha256": "d1e941e95acf4bdbedc3b5ebe326ebe1f53ff28e66a7d2ae6d90c83f0845a721",
       "width": 3000
     }
   },
-  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_hxafl2tl",
+  "root": "/var/folders/9g/_zdhc_0d58b7y84s7489t33r0000gn/T/fusion_plots_yhlnu786",
   "version": 1
 }

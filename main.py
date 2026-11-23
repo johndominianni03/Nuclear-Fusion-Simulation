@@ -284,6 +284,7 @@ def run_reactor_steady_state(save_plots=None):
             flux_profiles=packaged["flux_profiles"],
             total_fusion_power_watts=packaged["total_fusion_power_watts"],
             species_phase=packaged["species_phase"],
+            run_log=run_log,
         )
 
 

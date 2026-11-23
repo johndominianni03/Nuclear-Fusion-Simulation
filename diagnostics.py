@@ -25,6 +25,12 @@ from constants import MU_0
 SPECIES_COLOR = {0: "tab:blue", 1: "tab:orange", 2: "tab:pink", 3: "tab:green"}
 
 
+def _beam_energy_label(cfg):
+    """The beam injection energy as a label: '1 MeV', '50 keV'."""
+    E = float(cfg.nbi_energy_keV)
+    return f"{E / 1000:g} MeV" if E >= 1000 else f"{E:g} keV"
+
+
 def _show():
     """plt.show(), or a no-op under FUSION_HEADLESS so runs never block."""
     if FUSION_HEADLESS:
@@ -93,7 +99,8 @@ def plot_hpc_benchmark(particle_counts, cpu_times, gpu_times):
 # STEADY STATE DIAGNOSTICS (LIVE MATH RENDERING)
 # =======================================================
 def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, active_particles, total_injected, total_lost, inventory_history, R_phase=None, v_parallel_phase=None, P_fusion_grid=None, alpha_particles=None, lawson_history=None, lawson_first_measured_step=None,
-                                 n_ion_grid=None, flux_profiles=None, total_fusion_power_watts=None, species_phase=None):
+                                 n_ion_grid=None, flux_profiles=None, total_fusion_power_watts=None, species_phase=None,
+                                 run_log=None):
     
     rho_grid = _scrub_grid(rho_grid)
     phi_grid = _scrub_grid(phi_grid)
@@ -105,16 +112,28 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     active_particles = _scrub_particles(active_particles)
     alpha_particles = _scrub_particles(alpha_particles)
     
-    avg_inventory = np.mean(inventory_history) if len(inventory_history) > 0 else 0
-    loss_rate = total_lost / (cfg.reactor_num_steps * cfg.reactor_dt) if (cfg.reactor_num_steps * cfg.reactor_dt) > 0 else 0
-    tau_p = (avg_inventory / loss_rate) if loss_rate > 0 else float('inf')
+    beam_label = _beam_energy_label(cfg)
 
     print("==================================================")
     print("         REACTOR PERFORMANCE DIAGNOSTIC     ")
     print("==================================================")
     print(f"Total Particles Sourced       : {total_injected}")
     print(f"Total Particles Lost (Sink)   : {total_lost}")
-    print(f"Estimated Confinement Time (τ): {tau_p:.2e} seconds")
+    if run_log is not None:
+        # Macroparticles [real ions] lost through the LCFS, per species.
+        lm, lr = run_log["lost_macro"], run_log["lost_real"]
+        print("Lost per species              : " + ", ".join(
+            f"{name} {int(lm[s])} [{lr[s]:.2e} ions]"
+            for s, name in ((0, "thermal D"), (3, "thermal T"), (1, "beam D"), (2, "alpha"))))
+        # Ion energy confinement from orbit losses only (no electrons, no transport).
+        tau = np.asarray(run_log["tau_E"], dtype=float)
+        fin = np.isfinite(tau)
+        if np.any(fin):
+            print(f"Ion tau_E (orbit losses only) : median {np.median(tau[fin]):.2e} s over the "
+                  f"{int(fin.sum())} steps whose window holds a thermal-ion loss")
+        else:
+            print("Ion tau_E (orbit losses only) : not measured (no thermal ion lost)")
+        print(f"Tearing-mode amplitude / B0   : {run_log['tearing_amp_over_B0']:.2e} at end of run")
     print(f"Peak Ion Charge Density       : {np.max(rho_grid):.3e} C/m^3")
     if n_ion_grid is not None:
         print(f"Peak Ion Density              : {np.max(n_ion_grid):.3e} m^-3")
@@ -217,8 +236,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     # --- STORED ENERGY WAVEFORM ---
     # stored_energy_J has one row per step and one weighted column per species
     # (physics_engine.STORED_ENERGY_SPECIES: thermal D, thermal T, beam D, alpha),
-    # real joules. One trace per species on a log axis: the thermal ions hold
-    # ~1e4 J, the 33 MW beam ~1e2 J after 10 us, the fusion alphas ~1e-4 J.
+    # real joules. One trace per species on a log axis: in the 25 keV scenario the
+    # thermal ions hold ~7e5 J each species, the 33 MW beam ~3e2 J after 10 us, the
+    # fusion alphas ~2e1 J.
     plt.figure(figsize=(8, 4.5))
     _t_us = np.arange(stored_energy_J.shape[0]) * cfg.reactor_dt * 1e6
     for _col, (_code, _label) in enumerate(STORED_ENERGY_SPECIES):
@@ -259,15 +279,33 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     # and classifications[i] still pairs with cartesian_dfs[i].
     _ordered_particles = sorted(active_particles, key=lambda p: 0 if p["status"] == "lost" else 1)
 
+    # Confined beam tracks are DRAWN AS A SAMPLE, like the alphas below. Since
+    # Tier 2.5 a beam deuteron is a 1 MeV fast ion sampled on the fast-ion
+    # cadence (~5,000 vertices, ~2 cm gyro-loops), and all ~1,000 of them painted
+    # the whole cross-section solid gold over the thermal traces, in 2D and 3D.
+    # Strided, not truncated, so the sample spans the whole run; the 3D copy is
+    # clipped to two bounces (~1.25 us each, as for the alphas). Display only:
+    # every track is still recorded, and lost beam ions are all drawn.
+    BEAM_TRACK_SAMPLE = 25
+    _n_beam = sum(1 for p in active_particles if p["type"] == 1 and p["status"] != "lost")
+    _beam_stride = max(1, _n_beam // BEAM_TRACK_SAMPLE)
+    _beam_max_pts = max(2, (2 * int(1.25e-6 / cfg.reactor_dt)) // cfg.ALPHA_HISTORY_EVERY)
+    _beam_seen = 0
+
     for p in _ordered_particles:
         traj = p["history"]
         if len(traj) < 2: continue
+        if p["type"] == 1 and p["status"] != "lost":
+            _beam_seen += 1
+            if (_beam_seen - 1) % _beam_stride != 0:
+                continue
 
         # Colour by FATE first, species second. Keying off p["type"] alone (which only
         # holds the species) left the crimson arm unreachable, so no wall strike was ever
         # drawn in red.
         lost = (p["status"] == "lost")
-        cartesian_dfs.append(pd.DataFrame(traj, columns=["x", "y", "z"]))
+        _traj_3d = traj[:_beam_max_pts] if (p["type"] == 1 and p["status"] != "lost") else traj
+        cartesian_dfs.append(pd.DataFrame(_traj_3d, columns=["x", "y", "z"]))
         # -1 is the visualizer's "lost to wall" class; species only matters if it survived
         classifications.append(-1 if lost else p["type"])
 
@@ -278,7 +316,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
             ax.plot(R_path, Z_path, color='crimson', alpha=0.30, linewidth=0.7, zorder=1)
             ax.plot(R_path[-1], Z_path[-1], marker='x', color='crimson', markersize=5, alpha=0.8, zorder=2)
         elif p["type"] == 1:
-            ax.plot(R_path, Z_path, color='gold', alpha=0.7, linewidth=1.2, zorder=4)
+            ax.plot(R_path, Z_path, color='gold', alpha=0.6, linewidth=0.8, zorder=2)
         elif p["type"] == 3:
             ax.plot(R_path, Z_path, color='limegreen', alpha=0.2, linewidth=0.8, zorder=3)
         else:
@@ -295,7 +333,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     ax.set_ylabel("Height Z (m)")
 
     custom_lines = [
-        Line2D([0], [0], color='gold', lw=2, label='50 keV NBI Fast Ions (Injected)'),
+        Line2D([0], [0], color='gold', lw=2, label=f'{beam_label} NBI Beam Deuterons (Injected)'),
         Line2D([0], [0], color='dodgerblue', lw=2, label='Thermal Deuterium'),
         Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
         Line2D([0], [0], color='crimson', lw=2, label='Lost past last closed flux surface'),
@@ -322,7 +360,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     if flux_profiles is not None:
         rho_c = flux_profiles["rho_centers"]
         species = ((0, "Thermal D", SPECIES_COLOR[0]), (3, "Thermal T", SPECIES_COLOR[3]),
-                   (1, "Beam D (50 keV NBI)", SPECIES_COLOR[1]),
+                   (1, f"Beam D ({beam_label} NBI)", SPECIES_COLOR[1]),
                    (2, "Alpha (3.5 MeV birth)", SPECIES_COLOR[2]))
         fig, axes = plt.subplots(3, 1, figsize=(8, 10), sharex=True)
         for s_idx, s_label, s_color in species:
@@ -360,18 +398,19 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         plt.close()
 
     # --- PHASE-SPACE DISTRIBUTION ---
-    # Thermal/beam ions and alphas on separate panels, each scaled to its own largest
-    # |v_par|: alpha speeds (~1.3e7 m/s) are ~40x the thermal ones, so one shared axis
-    # either crushes the ions onto v_par = 0 or clips the fastest alphas.
+    # Thermal ions, beam ions and alphas on separate panels -- one per pool -- each
+    # scaled to its own largest |v_par|: 1 MeV beam deuterons (~1e7 m/s) and 3.5 MeV
+    # alphas (~1.3e7 m/s) are ~7x the 25 keV thermal speed, so a shared axis would
+    # crush the thermal ions onto v_par = 0.
     if R_phase is not None and v_parallel_phase is not None and len(R_phase) > 0:
         R_ph = _scrub_1d(R_phase)
         v_ph = _scrub_1d(v_parallel_phase)
         sp = np.asarray(species_phase, dtype=int) if species_phase is not None and len(species_phase) == len(R_ph) \
             else np.zeros(len(R_ph), dtype=int)
-        groups = [("Thermal D and T, beam D", ((0, 'darkviolet', 'Thermal D'), (3, 'seagreen', 'Thermal T'),
-                                               (1, 'darkorange', 'Beam D'))),
-                  ("Alphas", ((2, '#FF66CC', 'Alpha'),))]
-        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+        groups = [("Thermal D and T", ((0, 'darkviolet', 'Thermal D'), (3, 'seagreen', 'Thermal T'))),
+                  (f"Beam D ({beam_label} NBI)", ((1, 'darkorange', 'Beam D'),)),
+                  ("Alphas (3.5 MeV birth)", ((2, '#FF66CC', 'Alpha'),))]
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         for ax_ph, (g_title, members) in zip(axes, groups):
             g_mask = np.isin(sp, [m[0] for m in members])
             for code, color, label in members:
@@ -441,8 +480,10 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
                 elif p.get("type") == 3 and trit_count < 50:
                     ax.plot(R_path, traj[:, 2], color='limegreen', alpha=0.4, linewidth=1.0, zorder=1)
                     trit_count += 1
-                elif p.get("type") == 1 and nbi_count < 50:
-                    ax.plot(R_path, traj[:, 2], color='orange', alpha=0.4, linewidth=1.0, zorder=2)
+                # 12 beam tracks, not 50: on the fast-ion cadence each is a dense
+                # gyrating banana and 50 buried the thermal background.
+                elif p.get("type") == 1 and nbi_count < 12:
+                    ax.plot(R_path, traj[:, 2], color='orange', alpha=0.4, linewidth=0.8, zorder=2)
                     nbi_count += 1
                 
         # 2. Alphas on top (zorder 3).
@@ -497,7 +538,7 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
             Line2D([0], [0], color='#FF66CC', lw=2, label='3.5 MeV Helium-4 (Alpha)'),
             Line2D([0], [0], color='cyan', lw=2, label='Thermal Deuterium'),
             Line2D([0], [0], color='limegreen', lw=2, label='Thermal Tritium'),
-            Line2D([0], [0], color='orange', lw=2, label='50 keV NBI Fast Ion')
+            Line2D([0], [0], color='orange', lw=2, label=f'{beam_label} NBI Beam Deuteron')
         ]
         _leg_a = ax.legend(handles=custom_lines, loc='upper right', framealpha=0.95)
         _leg_a.set_zorder(20)
@@ -517,7 +558,8 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         # so the vessel it draws is the boundary particles are actually flagged against.
         _wall = (WALL_R, WALL_Z) if (WALL_R is not None and WALL_Z is not None) else None
         viz.plot_3d_trajectory(output_file="tokamak_reactor_3d.png",
-                               classifications=classifications, wall_contour=_wall)
+                               classifications=classifications, wall_contour=_wall,
+                               beam_label=f"{beam_label} NBI Beam Deuterons")
     except Exception as e:
         print(f"[WARNING] Skipping 3D visualization due to missing dependency or window issue: {e}")
 
