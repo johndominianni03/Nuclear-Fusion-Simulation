@@ -164,8 +164,8 @@ class _ParticlePool:
         return m
 
 
-def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
-    """Per-pool row ceilings for the split bulk-D / alpha / tritium pools.
+def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init, n_beam_init=0):
+    """Per-pool row ceilings for the split thermal-D / alpha / tritium / beam pools.
 
     Step 8 sized ONE pool from _pid_capacity_bound, so the alpha rows and the
     bulk rows shared a single allocation and either could borrow the other's
@@ -176,9 +176,11 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
     Both are derived from the same injection schedule _pid_capacity_bound counts,
     just attributed to the pool that actually receives the particles:
 
-      bulk  -- n_bulk_init thermal deuterons, plus the NBI source: one batch per
-               step of int(rate) plus at most one more from the stochastic
-               remainder, rate = cfg.NBI_MACRO_PER_STEP (constant).
+      bulk  -- n_bulk_init thermal deuterons; nothing is ever injected into it
+               (since Tier 2.5 the beam has its own pool).
+      beam  -- n_beam_init beam deuterons present at load (normally 0), plus the
+               NBI source: one batch per step of int(rate) plus at most one more
+               from the stochastic remainder, rate = cfg.NBI_MACRO_PER_STEP.
       alpha -- the fusion-driven alpha source: one batch per step of int(rate)
                plus at most one more from the stochastic remainder,
                rate = cfg.ALPHA_MACRO_PER_STEP (constant; the weight carries
@@ -194,10 +196,11 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
     steps = int(cfg.reactor_num_steps)
     nbi_max = int(cfg.NBI_MACRO_PER_STEP) + 1
     alpha_max = int(cfg.ALPHA_MACRO_PER_STEP) + 1
-    bulk_cap = int(n_bulk_init + steps * nbi_max) + 1024
+    bulk_cap = int(n_bulk_init) + 1024
     alpha_cap = int(steps * alpha_max) + 1024
     trit_cap = int(n_trit_init) + 1024
-    return bulk_cap, alpha_cap, trit_cap
+    beam_cap = int(n_beam_init + steps * nbi_max) + 1024
+    return bulk_cap, alpha_cap, trit_cap, beam_cap
 
 
 def _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,

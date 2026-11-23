@@ -107,11 +107,14 @@ class ParticlePusher:
         
         return alpha_R, alpha_Z, alpha_vR, alpha_vphi, alpha_vZ
 
-    def compute_alpha_heating_power(self, alpha_energies_kev, dt, cfg, rel_weights=None):
+    def compute_alpha_heating_power(self, alpha_energies_kev, dt, cfg, rel_weights=None, *, floor_keV):
         # Drains energy from fast alphas via Coulomb drag and returns
         # (new alpha energies, total keV given up this step). The total is
         # sum(rel_w * dE) when rel_weights (per-alpha weight / thermal-D weight)
         # is given, i.e. real energy expressed in thermal-D macroparticle units.
+        # floor_keV: the thermalization energy below which an alpha is helium ash
+        # and deposits nothing -- one value, or one per alpha. The loops pass
+        # (3/2) T_i at each alpha's flux surface (alpha_thermalization_floor_keV).
 
         if len(alpha_energies_kev) == 0:
             return alpha_energies_kev, 0.0
@@ -127,7 +130,7 @@ class ParticlePusher:
 
         # 2. Energy given up this step. Capped by the headroom above the thermalization
         #    floor -- a cooled alpha is Helium ash and deposits nothing further.
-        headroom = np.maximum(E - cfg.THERMALIZATION_ENERGY_KEV, 0.0)
+        headroom = np.maximum(E - np.asarray(floor_keV, dtype=np.float64), 0.0)
         deposited_kev = np.minimum(E * energy_loss_fraction, headroom)
 
         # 3. Drain it from the alphas
@@ -623,7 +626,7 @@ def apply_vectorized_collisions_torch(vel_tensor, type_tensor, nu_c, dt):
     return torch.where(collide_mask.unsqueeze(1), new_vel, vel_tensor)
 
 
-def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg, rel_weights=None):
+def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg, rel_weights=None, *, floor_keV):
     # Eager only -- the torch.sum reduction hits the dynamic-shape Inductor bug.
     if alpha_energies_kev.numel() == 0:
         return alpha_energies_kev, 0.0
@@ -635,7 +638,8 @@ def compute_alpha_heating_power_torch(alpha_energies_kev, dt, cfg, rel_weights=N
     E = alpha_energies_kev
     energy_loss_fraction = min(2.0 * cfg.NU_S * dt, 0.99)
 
-    headroom = torch.clamp(E - cfg.THERMALIZATION_ENERGY_KEV, min=0.0)
+    # floor_keV: per-alpha thermalization floor (tensor) or one value (twin of numpy).
+    headroom = torch.clamp(E - floor_keV, min=0.0)
     deposited_kev = torch.minimum(E * energy_loss_fraction, headroom)
 
     new_alpha_energies = E - deposited_kev
@@ -1312,18 +1316,138 @@ def weighted_kinetic_energy_kev(vels64, rel_w, mass):
     return float(np.sum(rel_w * (0.5 * mass * np.sum(vels64**2, axis=1)))) / KEV_J
 
 
-def drain_alpha_energy(engine, cfg, alpha_vels, rel_w, dt):
+def drain_alpha_energy(engine, cfg, alpha_vels, rel_w, dt, floor_keV):
     """Slow the alphas by the fixed drag (compute_alpha_heating_power) and return
     the real energy given up, sum(rel_w * dE) in keV (thermal-D macroparticle units).
-    alpha_vels is float64 and is rescaled in place (speed only)."""
+    alpha_vels is float64 and is rescaled in place (speed only). floor_keV is the
+    thermalization floor, one per alpha or one value: an alpha at or below it
+    deposits nothing."""
     v_mags = np.linalg.norm(alpha_vels, axis=1)
     alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / KEV_J
     new_energies_kev, deposited_kev = engine.compute_alpha_heating_power(
-        alpha_energies_kev, dt, cfg, rel_weights=rel_w)
+        alpha_energies_kev, dt, cfg, rel_weights=rel_w, floor_keV=floor_keV)
     new_v_mags = np.sqrt(2.0 * (new_energies_kev * KEV_J) / cfg.MASS_ALPHA)
-    scale_factors = new_v_mags / np.where(v_mags == 0, 1e-10, v_mags)
+    # Only alphas that gave up energy are rescaled: for one at (or below) its floor
+    # new_v / v is 1 +- 1e-16 from the |v| -> E -> |v| round trip, and "deposits
+    # nothing" should leave it exactly as it was.
+    scale_factors = np.where(new_energies_kev < alpha_energies_kev,
+                             new_v_mags / np.where(v_mags == 0, 1e-10, v_mags), 1.0)
     alpha_vels *= scale_factors[:, np.newaxis]
     return deposited_kev
+
+
+def alpha_floor_lut_keV(prof):
+    """Alpha thermalization floor per psi_N shell, (3/2) T_i [keV], with T_i the
+    thermal-ion temperature of the shell (thermal_ion_temperature_keV: the
+    density-weighted D + T temperature). An alpha slowed to (3/2) T_i carries the
+    mean thermal energy of the plasma around it and stops heating. Shells without
+    a thermal temperature get 0."""
+    return 1.5 * thermal_ion_temperature_keV(prof)
+
+
+def alpha_thermalization_floor_keV(pos, eq, floor_lut):
+    """Per-alpha thermalization floor [keV]: floor_lut (one value per psi_N shell,
+    alpha_floor_lut_keV of the latest profiles) at each alpha's flux surface.
+    pos (N, 3) Cartesian; psi_N from the same bilinear lookup as the confinement
+    test, binned exactly as compute_flux_profiles bins (clipped to the shells)."""
+    p = np.asarray(pos, dtype=np.float64)
+    if p.shape[0] == 0:
+        return np.zeros(0)
+    x = compute_psi_normalised(np.hypot(p[:, 0], p[:, 1]), p[:, 2], eq)
+    nb = len(floor_lut)
+    k = np.minimum((np.clip(x, 0.0, None) * nb).astype(np.int64), nb - 1)
+    return np.asarray(floor_lut, dtype=np.float64)[k]
+
+
+def alpha_thermalization_floor_keV_torch(pos, psi_tensor, eq, floor_lut_t):
+    """Torch twin of alpha_thermalization_floor_keV (device tensors in and out;
+    psi bilinear lookup as check_confinement_torch, float32)."""
+    if pos.shape[0] == 0:
+        return torch.zeros(0, device=pos.device, dtype=torch.float32)
+    x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+    r = torch.sqrt(x ** 2 + y ** 2)
+    nR, nZ = eq.psi_nR, eq.psi_nZ
+    dR = (eq.psi_R_max - eq.psi_R_min) / (nR - 1)
+    dZ = (eq.psi_Z_max - eq.psi_Z_min) / (nZ - 1)
+    r_idx = (r - eq.psi_R_min) / dR
+    z_idx = (z - eq.psi_Z_min) / dZ
+    i = torch.floor(r_idx).long()
+    j = torch.floor(z_idx).long()
+    valid = (i >= 0) & (i < nR - 1) & (j >= 0) & (j < nZ - 1)
+    i_c = torch.clamp(i, 0, nR - 2)
+    j_c = torch.clamp(j, 0, nZ - 2)
+    wR = r_idx - i_c.to(torch.float32)
+    wZ = z_idx - j_c.to(torch.float32)
+    psi = (psi_tensor[i_c, j_c] * (1 - wR) * (1 - wZ) + psi_tensor[i_c + 1, j_c] * wR * (1 - wZ)
+           + psi_tensor[i_c, j_c + 1] * (1 - wR) * wZ + psi_tensor[i_c + 1, j_c + 1] * wR * wZ)
+    psi = torch.where(valid, psi, torch.zeros_like(psi))
+    xN = (eq.psi_axis - psi) / (eq.psi_axis - eq.psi_edge)
+    nb = floor_lut_t.shape[0]
+    k = torch.clamp((torch.clamp(xN, min=0.0) * nb).long(), max=nb - 1)
+    return floor_lut_t[k]
+
+
+# =====================================================================
+# ION-ION COLLISION FREQUENCY (NRL Plasma Formulary)
+#
+#   nu_i = 4.80e-8 Z^4 mu^(-1/2) n_i T_i^(-3/2) ln(Lambda)   [s^-1]
+#
+# with n_i in cm^-3, T_i in eV and mu = m_i / m_p (NRL Plasma Formulary, 2019,
+# "Collision rates", ion collision rate), and the mixed ion-ion Coulomb logarithm
+#
+#   ln(Lambda_ii') = 23 - ln[ Z Z' (mu + mu') / (mu T_i' + mu' T_i)
+#                             * (n_i Z^2 / T_i + n_i' Z'^2 / T_i')^(1/2) ]
+#
+# (NRL Plasma Formulary, "Coulomb logarithm", mixed ion-ion collisions).
+# =====================================================================
+
+def nrl_ion_collision_frequency(n_i_m3, T_i_keV, mu, coulomb_log, Z=1):
+    """NRL ion collision rate nu_i [s^-1] for ions of mass mu m_p and charge Z e
+    in an ion density n_i [m^-3] at temperature T_i [keV]."""
+    n_cm3 = n_i_m3 * 1.0e-6
+    T_eV = T_i_keV * 1.0e3
+    return 4.80e-8 * Z ** 4 * mu ** -0.5 * n_cm3 * T_eV ** -1.5 * coulomb_log
+
+
+def coulomb_log_ion_ion(n1_m3, n2_m3, T1_keV, T2_keV, mu1, mu2, Z1=1, Z2=1):
+    """NRL mixed ion-ion Coulomb logarithm ln(Lambda_ii') (densities in m^-3,
+    temperatures in keV, masses in proton masses)."""
+    import math
+    n1, n2 = n1_m3 * 1.0e-6, n2_m3 * 1.0e-6
+    T1, T2 = T1_keV * 1.0e3, T2_keV * 1.0e3
+    arg = (Z1 * Z2 * (mu1 + mu2) / (mu1 * T2 + mu2 * T1)
+           * math.sqrt(n1 * Z1 ** 2 / T1 + n2 * Z2 ** 2 / T2))
+    return 23.0 - math.log(arg)
+
+
+def loaded_central_density(eq, n_avg, n_mesh=800):
+    """On-axis total thermal-ion density n0 [m^-3] of the initial load, whose
+    profile is n = n0 (1 - psi_N) with volume average n_avg over the plasma:
+    n0 = n_avg / <1 - psi_N>_V, the volume average taken on an n_mesh x n_mesh
+    (R, Z) mesh with dV = 2 pi R dR dZ (the same revolved volume element the
+    loader's rejection sampling uses)."""
+    Rc = eq.psi_R_min + (np.arange(n_mesh) + 0.5) * (eq.psi_R_max - eq.psi_R_min) / n_mesh
+    Zc = eq.psi_Z_min + (np.arange(n_mesh) + 0.5) * (eq.psi_Z_max - eq.psi_Z_min) / n_mesh
+    RR, ZZ = np.meshgrid(Rc, Zc, indexing="ij")
+    x = compute_psi_normalised(RR, ZZ, eq)
+    inside = x <= 1.0
+    return float(n_avg * np.sum(RR[inside]) / np.sum(RR[inside] * (1.0 - x[inside])))
+
+
+def thermal_collision_frequencies(cfg, eq):
+    """Isotropic re-randomisation rates per type code, from the NRL ion collision
+    rate at the loaded central density and temperature of the D-T plasma:
+    n_D = n_T = n0 / 2, field-ion density n_i = n0, T_i = cfg.T_thermal_keV,
+    one mixed D-T Coulomb logarithm, mu = m / m_p per test species. Beam
+    deuterons (type 1) use the deuteron rate. Returns ({type: nu [1/s]}, info)."""
+    from constants import M_PROTON
+    n0 = loaded_central_density(eq, cfg.N_AVG_TARGET)
+    T0 = cfg.T_thermal_keV
+    mu_D, mu_T = cfg.m_deuterium / M_PROTON, cfg.m_tritium / M_PROTON
+    lnL = coulomb_log_ion_ion(0.5 * n0, 0.5 * n0, T0, T0, mu_D, mu_T)
+    nu_D = nrl_ion_collision_frequency(n0, T0, mu_D, lnL)
+    nu_T = nrl_ion_collision_frequency(n0, T0, mu_T, lnL)
+    return {0: nu_D, 1: nu_D, 3: nu_T}, {"n0": n0, "T0_keV": T0, "coulomb_log": lnL}
 
 
 def bulk_boost_factor(deposited_kev, bulk_energy_kev):

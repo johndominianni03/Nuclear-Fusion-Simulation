@@ -218,14 +218,17 @@ class _TrackStore:
 
     # -- slot selection ----------------------------------------------------
     def slots_due(self, sample_thermal, sample_alpha):
-        """Slot indices due to be sampled this step, by species cadence."""
+        """Slot indices due to be sampled this step, by species cadence:
+        sample_thermal for thermal D and T, sample_alpha for the fast ions."""
         n = self.n_slots
         if n == 0:
             return np.empty(0, dtype=np.int64)
         if sample_thermal and sample_alpha:
             return np.arange(n, dtype=np.int64)
-        is_alpha = self.species[:n] == 2
-        return np.nonzero(is_alpha if sample_alpha else ~is_alpha)[0]
+        # Fast ions -- beam D (1) and alphas (2) -- on the fine cadence: a 1 MeV
+        # deuteron's orbit is ~2 cm across, like an alpha's.
+        is_fast = (self.species[:n] == 1) | (self.species[:n] == 2)
+        return np.nonzero(is_fast if sample_alpha else ~is_fast)[0]
 
     # -- teardown ----------------------------------------------------------
     def to_dicts(self):

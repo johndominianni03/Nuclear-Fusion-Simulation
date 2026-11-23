@@ -162,8 +162,9 @@ def test_alpha_energy_drain_preserves_direction():
     vm = np.linalg.norm(v64, axis=1)
     from constants import KEV_J
     ek = (0.5 * cfg.MASS_ALPHA * vm**2) / KEV_J
-    # Same lines as the loop, with a large dt so the drain is visible.
-    new_ek, _ = engine.compute_alpha_heating_power(ek, 1e-2, cfg)
+    # Same lines as the loop, with a large dt so the drain is visible (and the
+    # 15 keV floor this test was written against).
+    new_ek, _ = engine.compute_alpha_heating_power(ek, 1e-2, cfg, floor_keV=15.0)
     new_vm = np.sqrt(2.0 * (new_ek * KEV_J) / cfg.MASS_ALPHA)
     out = (v64 * (new_vm / vm)[:, None]).astype(np.float32).astype(np.float64)
     cosang = np.sum(out * v64, axis=1) / (np.linalg.norm(out, axis=1) * vm)
@@ -503,7 +504,7 @@ def _alpha_to_bulk_transfer(cfg, engine, a_vel, a_w, groups, dt):
     from physics_engine import drain_alpha_energy, weighted_kinetic_energy_kev, bulk_boost_factor
     w_ref = 7.04e15
     a = a_vel.astype(np.float64)
-    dep = drain_alpha_energy(engine, cfg, a, a_w / w_ref, dt)
+    dep = drain_alpha_energy(engine, cfg, a, a_w / w_ref, dt, 15.0)   # every alpha far above it
     out = [g[0].astype(np.float64) for g in groups]
     E_bulk = sum(weighted_kinetic_energy_kev(v, w / w_ref, m) for v, (_, w, m) in zip(out, groups))
     boost = bulk_boost_factor(dep, E_bulk)
@@ -744,7 +745,7 @@ def test_T_core_of_fresh_plasma_is_loaded_density_weighted_temperature():
 
 
 def test_beam_ions_do_not_change_T_core():
-    """Adding 5,000 beam ions (50 keV, ~100x the thermal energy each) to the same
+    """Adding 5,000 beam ions (cfg.nbi_energy_keV each, far above thermal) to the same
     load leaves T_core unchanged, and the per-species stored energy columns are
     the weighted kinetic energies of each species. Collisions run in the loop
     (prange thread chunking moves with the beam rows and re-randomised velocities
@@ -766,7 +767,12 @@ def test_beam_ions_do_not_change_T_core():
             assert got == 0.0, (label, got)
         else:
             assert abs(got / expect - 1.0) < 1e-12, (label, got, expect)
-    assert stored[0, 2] > stored[0, 0] * 1e-3            # the beam column is populated
+    # The beam column is populated, with the energy the 5,000 beam ions were
+    # injected with: n_beam * w_beam * E_beam to 1% (one 1 ns step; the electric
+    # field does a negligible amount of work on them). (This replaced a ratio test,
+    # stored[beam] > 1e-3 stored[thermal D], tuned to 50 keV beams in a 1 keV plasma.)
+    E_beam_J = cfg1.nbi_energy_keV * 1e3 * cfg1.e_charge
+    assert abs(stored[0, 2] / (5000 * cfg1.WEIGHT[1] * E_beam_J) - 1.0) < 1e-2, stored[0, 2]
 
 
 # =======================================================
@@ -1169,6 +1175,208 @@ def test_lost_energy_closes_the_energy_balance():
     ok = P > 0
     assert np.all(np.isfinite(tau[k0:][ok[k0:]]))
     assert np.allclose(tau[ok], E_th[ok] / P[ok], rtol=1e-14, atol=0.0)
+
+
+# =======================================================
+# TIER 2.5 PHASE 3 -- ITER-referenced scenario
+# =======================================================
+def _thermal_mu_ratio(push, mass, T_keV, n=256, steps=1500, seed=17):
+    """mu(end)/mu(start) for n ions loaded as a T_keV Maxwellian at 0.05 < psi_N
+    < 0.6, pushed `steps` global steps by the loop's push function `push(cfg, pos,
+    vel, B, E)` with the equilibrium field gathered every step, as the loop does
+    (E = 0, no tearing mode: mu is the equilibrium invariant)."""
+    from kernels import vectorized_gather_and_B_into
+    cfg, eq, engine, B_R, B_Z = _production_fields()
+    rng = np.random.default_rng(seed)
+    pos = _positions_in_psiN(eq, n, rng, 0.05, 0.6).astype(np.float32)
+    state = np.random.get_state()
+    np.random.seed(seed)
+    vel = engine.initialize_velocities_profile(np.full(n, T_keV), mass=mass).astype(np.float32)
+    np.random.set_state(state)
+    pos, vel = np.ascontiguousarray(pos), np.ascontiguousarray(vel)
+    _, mu0 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, mass)
+    zero = np.zeros((cfg.nR, cfg.nZ))
+    E = np.empty((n, 3), dtype=np.float32)
+    B = np.empty((n, 3), dtype=np.float32)
+    for _ in range(steps):
+        vectorized_gather_and_B_into(pos, E, B, zero, zero, B_R, B_Z,
+                                     cfg.R_min, cfg.R_max, cfg.Z_min, cfg.Z_max, cfg.nR, cfg.nZ,
+                                     cfg.B0, cfg.R0_major, 0.0, 0.0, cfg.m_mode, cfg.n_mode, 0.0)
+        push(cfg, pos, vel, B, E)
+    _, mu1 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, mass)
+    ok = mu0 > 1e-3 * np.median(mu0)          # drop near-parallel ions (mu ~ 0)
+    return (mu1 / mu0)[ok]
+
+
+def test_thermal_push_conserves_magnetic_moment_at_25_keV():
+    """At the scenario's 25 keV on-axis temperature the thermal Larmor radius is
+    ~3 mm (5x the 1 keV value), and the global 1 ns step (omega_c dt = 0.575 rad
+    for D, 0.384 rad for T at B0) must still conserve mu: the same bounds as
+    test_tritium_push_conserves_magnetic_moment (median within 1%, 90th percentile
+    of |mu1/mu0 - 1| below 5%), for thermal D and thermal T, through the loop's
+    own push functions."""
+    import reactor_cpu
+    cfg, *_ = _production_fields()
+    for name, push, mass in (("D", reactor_cpu._push_thermal_deuterium, cfg.m_deuterium),
+                             ("T", reactor_cpu._push_thermal_tritium, cfg.m_tritium)):
+        ratio = _thermal_mu_ratio(push, mass, 25.0)
+        med = float(np.median(ratio))
+        assert 0.99 < med < 1.01, f"thermal {name}: median mu(end)/mu(start) = {med:.5f}"
+        p90 = float(np.percentile(np.abs(ratio - 1.0), 90))
+        assert p90 < 0.05, f"thermal {name}: 90th percentile |mu1/mu0 - 1| = {p90:.4f}"
+
+
+def _isotropic_beam(cfg, n, rng, E_keV):
+    """n isotropic deuterons at E_keV around R = 1.1 m (the alpha test's load)."""
+    from constants import KEV_J
+    v0 = np.sqrt(2.0 * E_keV * KEV_J / cfg.m_deuterium)
+    R = rng.normal(1.10, 0.03, n)
+    Z = rng.normal(0.0, 0.03, n)
+    phi = rng.uniform(0, 2 * np.pi, n)
+    pos = np.stack([R * np.cos(phi), R * np.sin(phi), Z], axis=1).astype(np.float32)
+    u = rng.normal(size=(n, 3))
+    vel = (v0 * u / np.linalg.norm(u, axis=1)[:, None]).astype(np.float32)
+    return np.ascontiguousarray(pos), np.ascontiguousarray(vel)
+
+
+def test_beam_push_conserves_magnetic_moment_at_1_MeV():
+    """1 MeV beam deuterons (Larmor radius ~1.7 cm, ~1 cm of travel per global
+    step) pushed by reactor_cpu._push_beam -- cfg.NBI_SUBSTEPS sub-steps with the
+    field re-gathered every sub-step -- conserve mu by the alpha test's bounds
+    (median mu ratio within 10% after 1.5 us, >= 80% still confined, no pitch
+    collapse to xi = -1). The sub-step count comes from the alphas' criterion."""
+    import reactor_cpu
+    from physics_engine import interpolate_psi_array
+    cfg, eq, engine, B_R, B_Z = _production_fields()
+    assert cfg.NBI_SUBSTEPS == 10
+    rng = np.random.default_rng(7)
+    pos, vel = _isotropic_beam(cfg, ALPHA_TEST_COUNT, rng, 1000.0)
+    xi0, mu0 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, cfg.m_deuterium)
+    E_zero = np.zeros((cfg.nR, cfg.nZ))
+    for step in range(ALPHA_TEST_STEPS):
+        reactor_cpu._push_beam(cfg, pos, vel, E_zero, E_zero, B_R, B_Z, step * cfg.reactor_dt)
+    xi1, mu1 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, cfg.m_deuterium)
+    R = np.hypot(pos[:, 0], pos[:, 1]).astype(np.float64)
+    psi = interpolate_psi_array(R, pos[:, 2].astype(np.float64), eq.psi_grid,
+                                eq.psi_R_min, eq.psi_R_max, eq.psi_Z_min, eq.psi_Z_max,
+                                eq.psi_nR, eq.psi_nZ)
+    inside = psi > eq.psi_edge
+    assert inside.sum() >= 0.8 * len(inside), f"only {inside.sum()} beam ions still confined"
+    med = float(np.median(mu1[inside] / mu0[inside]))
+    assert 0.9 < med < 1.1, f"median mu(end)/mu(start) = {med:.4f}"
+    assert float(np.mean(xi1[inside] < -0.95)) < float(np.mean(xi0 < -0.95)) + 0.1
+
+
+def test_beam_push_conserves_magnetic_moment_at_1_MeV_gpu_twin():
+    """Same invariant through reactor_gpu._push_beam_torch on cfg.HPC_DEVICE
+    (shorter run, as for the alpha GPU twin)."""
+    import torch
+    import reactor_gpu
+    cfg, eq, engine, B_R, B_Z = _production_fields()
+    rng = np.random.default_rng(7)
+    pos, vel = _isotropic_beam(cfg, ALPHA_TEST_COUNT, rng, 1000.0)
+    _, mu0 = _pitch_and_mu(cfg, pos, vel, B_R, B_Z, cfg.m_deuterium)
+    f32 = dict(device=cfg.HPC_DEVICE, dtype=torch.float32)
+    pos_t, vel_t = torch.tensor(pos, **f32), torch.tensor(vel, **f32)
+    E0 = torch.zeros((cfg.nR, cfg.nZ), **f32)
+    BR_t, BZ_t = torch.tensor(B_R, **f32), torch.tensor(B_Z, **f32)
+    for step in range(600):
+        reactor_gpu._push_beam_torch(cfg, pos_t, vel_t, E0, E0, BR_t, BZ_t, step * cfg.reactor_dt)
+    _, mu1 = _pitch_and_mu(cfg, pos_t.cpu().numpy(), vel_t.cpu().numpy(), B_R, B_Z, cfg.m_deuterium)
+    med = float(np.median(mu1 / mu0))
+    assert 0.9 < med < 1.1, f"median mu(end)/mu(start) = {med:.4f}"
+
+
+def test_nrl_collision_frequency_hand_computed():
+    """NRL Plasma Formulary ion collision rate, nu_i = 4.80e-8 Z^4 mu^-1/2 n_i
+    [cm^-3] T_i[eV]^-3/2 ln(Lambda), against a value worked by hand: n_i = 1e20
+    m^-3 = 1e14 cm^-3, T_i = 10 keV, mu = 2, Z = 1, ln(Lambda) = 20:
+        4.80e-8 * 0.70711 * 1e14 * 1e-6 * 20 = 67.882 s^-1.
+    The mixed ion-ion Coulomb log for D-T at n_D = n_T = 5e19 m^-3 and T = 10 keV
+    (equal temperatures, so (mu+mu')/(mu T' + mu' T) = 1/T = 1e-4 eV^-1, and
+    sqrt(n_D/T + n_T/T) = sqrt(1e14 / 1e4) = 1e5): 23 - ln(10) = 20.6974.
+    The loop's rates (cfg.NU_C, set by initialize_reactor) are this formula at
+    the loaded central density and temperature, and that density is the on-axis
+    value of the (1 - psi_N) load: n0 = <n> V / sum_k (1 - x_k) V_k to 0.5%."""
+    from physics_engine import (nrl_ion_collision_frequency, coulomb_log_ion_ion,
+                                loaded_central_density, compute_flux_shell_volumes)
+    from constants import M_PROTON
+    nu = nrl_ion_collision_frequency(1.0e20, 10.0, 2.0, 20.0)
+    assert abs(nu / 67.882 - 1.0) < 1e-4, nu
+    lnL = coulomb_log_ion_ion(5.0e19, 5.0e19, 10.0, 10.0, 2.0136, 3.0155)
+    assert abs(lnL - 20.6974) < 1e-4, lnL
+    cfg, eq, *_ = _production_fields()
+    n0 = loaded_central_density(eq, cfg.N_AVG_TARGET)
+    V = compute_flux_shell_volumes(eq, n_bins=200, n_mesh=800)
+    x = (np.arange(200) + 0.5) / 200
+    assert abs(n0 / (cfg.N_AVG_TARGET * V.sum() / np.sum((1 - x) * V)) - 1.0) < 5e-3
+    T0 = cfg.T_thermal_keV
+    mu_D, mu_T = cfg.m_deuterium / M_PROTON, cfg.m_tritium / M_PROTON
+    L = coulomb_log_ion_ion(n0 / 2, n0 / 2, T0, T0, mu_D, mu_T)
+    assert cfg.NU_C[0] == nrl_ion_collision_frequency(n0, T0, mu_D, L)
+    assert cfg.NU_C[1] == cfg.NU_C[0]
+    assert cfg.NU_C[3] == nrl_ion_collision_frequency(n0, T0, mu_T, L)
+
+
+def test_alpha_at_thermalization_floor_deposits_nothing():
+    """The thermalization floor is (3/2) T_i on each alpha's own flux surface
+    (alpha_floor_lut_keV of the latest profiles, looked up by
+    alpha_thermalization_floor_keV). An alpha exactly at its floor deposits
+    nothing and keeps its velocity; one a little above it (with a drag step far
+    larger than the gap) deposits exactly the gap and lands on the floor; the
+    torch lookup the GPU loop uses agrees with the numpy one."""
+    import torch
+    from physics_engine import (alpha_floor_lut_keV, alpha_thermalization_floor_keV,
+                                alpha_thermalization_floor_keV_torch, drain_alpha_energy,
+                                compute_flux_shell_volumes)
+    from constants import KEV_J
+    cfg, eq, engine, *_ = _production_fields()
+    nb = len(compute_flux_shell_volumes(eq))
+    x_c = (np.arange(nb) + 0.5) / nb
+    prof = {"n": np.zeros((4, nb)), "T_keV": np.full((4, nb), np.nan)}
+    prof["n"][0] = prof["n"][3] = 1e20 * (1 - x_c)
+    prof["T_keV"][0] = 25.0 * (1 - x_c)
+    prof["T_keV"][3] = 20.0 * (1 - x_c)
+    lut = alpha_floor_lut_keV(prof)
+    assert np.allclose(lut, 1.5 * 22.5 * (1 - x_c), rtol=1e-12)      # density-weighted T_i
+    rng = np.random.default_rng(51)
+    pos = np.concatenate([_positions_in_psiN(eq, 20, rng, (k + 0.2) / nb, (k + 0.8) / nb)
+                          for k in range(0, nb - 1, 3)]).astype(np.float32)
+    floor = alpha_thermalization_floor_keV(pos, eq, lut)
+    assert np.all(floor > 0.0)
+    u = rng.normal(size=pos.shape)
+    u /= np.linalg.norm(u, axis=1)[:, None]
+
+    def vel_at(E_keV):
+        return u * np.sqrt(2.0 * E_keV * KEV_J / cfg.MASS_ALPHA)[:, None]
+
+    rel_w = np.full(len(pos), 1e-6)
+    # Just below the looked-up floor (1e-12 relative, far above float64 rounding):
+    # nothing deposited, velocities untouched.
+    v_at = vel_at(floor * (1.0 - 1e-12))
+    v_drained = v_at.copy()
+    dep = drain_alpha_energy(engine, cfg, v_drained, rel_w, 1.0, floor)
+    assert dep == 0.0, dep
+    assert np.array_equal(v_drained, v_at), "an alpha below its floor was slowed"
+    # Exactly at the floor, with the energy computed from the velocity the way the
+    # drain computes it (a round trip through |v| moves E by ~1e-16).
+    E_exact = 0.5 * cfg.MASS_ALPHA * np.linalg.norm(v_at, axis=1) ** 2 / KEV_J
+    v_drained = v_at.copy()
+    assert drain_alpha_energy(engine, cfg, v_drained, rel_w, 1.0, E_exact) == 0.0
+    assert np.array_equal(v_drained, v_at), "an alpha at its floor was slowed"
+
+    gap = 1e-3 * floor
+    v_above = vel_at(floor + gap)
+    dep = drain_alpha_energy(engine, cfg, v_above, rel_w, 1.0, floor)   # drag fraction 0.99 >> gap
+    E_after = 0.5 * cfg.MASS_ALPHA * np.sum(v_above ** 2, axis=1) / KEV_J
+    assert np.allclose(E_after, floor, rtol=1e-9)
+    assert abs(dep / float(np.sum(rel_w * gap)) - 1.0) < 1e-6
+
+    psi_t = torch.tensor(eq.psi_grid, device=cfg.HPC_DEVICE, dtype=torch.float32)
+    f_t = alpha_thermalization_floor_keV_torch(
+        torch.tensor(pos, device=cfg.HPC_DEVICE), psi_t, eq,
+        torch.tensor(lut, device=cfg.HPC_DEVICE, dtype=torch.float32)).cpu().numpy()
+    assert np.allclose(f_t, floor, rtol=1e-6), "torch floor lookup disagrees with numpy"
 
 
 # =======================================================

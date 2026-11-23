@@ -7,6 +7,7 @@ from physics_engine import (
     compute_flux_boundary_contour,   # psi_edge wall polygon, shared by physics and plots
     compute_plasma_volume,           # revolved volume of that surface
     compute_psi_normalised,
+    thermal_collision_frequencies,   # NRL ion-ion rate at the loaded central n, T
 )
 
 def _attach_flux_surfaces(eq, cfg=None, R0=1.0, a_minor=0.3):
@@ -66,6 +67,13 @@ def initialize_reactor(cfg):
           f"(P_NBI = {cfg.P_NBI_MW:.1f} MW at {cfg.nbi_energy_keV:.0f} keV, "
           f"{cfg.NBI_MACRO_PER_STEP:g} macroparticles/step"
           + (f"; {w_thermal / w_beam:,.0f}x lighter than a thermal macroparticle)" if w_beam > 0 else ")"))
+
+    # Collision rates: the NRL ion collision rate at the loaded central density and
+    # temperature (isotropic re-randomisation at that fixed rate in the loops).
+    cfg.NU_C, _nu_info = thermal_collision_frequencies(cfg, eq)
+    print(f"[SYSTEM] Collisions (NRL ion-ion rate at n0 = {_nu_info['n0']:.3e} m^-3, "
+          f"T0 = {_nu_info['T0_keV']:g} keV, ln Lambda = {_nu_info['coulomb_log']:.2f}): "
+          f"nu_D = {cfg.NU_C[0]:.2f} /s, nu_T = {cfg.NU_C[3]:.2f} /s")
 
     # Thermal D and thermal T, half each (D gets the odd one out of an odd count).
     N = cfg.initial_thermal_count

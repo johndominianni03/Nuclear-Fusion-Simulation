@@ -53,6 +53,7 @@ from kernels import vectorized_gather_and_B_into       # noqa: E402
 from physics_engine import (                           # noqa: E402
     compute_poloidal_field_grids,
     check_confinement_flux,
+    compute_psi_normalised,
 )
 from reactor_cpu import _push_alphas                   # noqa: E402
 
@@ -204,7 +205,12 @@ def run(args):
                 av = vel.astype(np.float64)
                 vm = np.linalg.norm(av, axis=1)
                 ek = (0.5 * cfg.MASS_ALPHA * vm**2) / KEV_J
-                new_ek, _ = engine.compute_alpha_heating_power(ek, cfg.reactor_dt, cfg)
+                # Thermalization floor (3/2) T_i of the loaded profile T0 (1 - psi_N)
+                # at each alpha (no thermal particles in this alpha-only run).
+                xN = compute_psi_normalised(np.hypot(pos[:, 0], pos[:, 1]).astype(np.float64),
+                                            pos[:, 2].astype(np.float64), eq)
+                floor = 1.5 * cfg.T_thermal_keV * np.clip(1.0 - xN, 0.0, 1.0)
+                new_ek, _ = engine.compute_alpha_heating_power(ek, cfg.reactor_dt, cfg, floor_keV=floor)
                 new_vm = np.sqrt(2.0 * (new_ek * KEV_J) / cfg.MASS_ALPHA)
                 av *= (new_vm / np.where(vm == 0, 1e-10, vm))[:, None]
                 vel[:] = av.astype(np.float32)

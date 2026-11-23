@@ -31,8 +31,22 @@ class SimulationConfiguration:
 
         # --- STEADY-STATE REACTOR SETTINGS ---
         self.reactor_num_steps = 10000
-        self.reactor_dt = 1.0e-9        # Short dt to resolve the full gyro-orbit
-        self.nu_c = 5000.0              # Collision frequency
+        # Global step. omega_c dt = q B dt / m is 0.575 rad (thermal D) and 0.384 rad
+        # (thermal T) at B0 = 12 T, 0.82 / 0.55 rad at the strongest field on the last
+        # closed flux surface (17.1 T at R = 0.70 m): 8 to 16 steps per gyration,
+        # inside the Boris stability limit (omega_c dt < 2), independent of energy.
+        # At 25 keV the thermal Larmor radius is ~3 mm against a 2 cm field grid, and
+        # the mu-conservation tests pass at this step for thermal D and T.
+        self.reactor_dt = 1.0e-9
+
+        # Collisions: isotropic re-randomisation of the velocity direction (speed
+        # kept) at a fixed rate per species, NU_C = {type code: rate [1/s]}. The
+        # rates are NOT set here: initialize_reactor evaluates the NRL Plasma
+        # Formulary ion collision rate (physics_engine.thermal_collision_frequencies)
+        # at the loaded central density and temperature of the D-T plasma -- ~38 /s
+        # for D and ~31 /s for T at 25 keV and n0 = 2.03e20 m^-3 (the on-axis value
+        # of a (1 - psi_N) profile averaging 1e20).
+        self.NU_C = None
 
         """
         initial thermal count which sets initial plasma particle count. 
@@ -47,15 +61,19 @@ class SimulationConfiguration:
         # on-axis temperature. n0 follows from N_AVG_TARGET below. The count is split
         # evenly between thermal deuterium (type 0) and thermal tritium (type 3), each
         # with those same profiles and the same weight; tritium has its own pool.
-        self.T_thermal_keV = 1.0
-        self.nbi_energy_keV = 50.0
+        # SCENARIO INPUT: 25 keV on axis. ITER Q = 10 baseline modelling gives
+        # T_D,T(0) ~ 25 keV (arXiv:2306.08442, METIS scenario).
+        self.T_thermal_keV = 25.0
+        # SCENARIO INPUT: 1 MeV. ITER's heating neutral beams inject 1 MeV deuterium
+        # (ITER NBI design: 2 x 16.5 MW = 33 MW at 1 MeV D0).
+        self.nbi_energy_keV = 1000.0
 
-        # Neutral beam source, calibrated by injected power. P_NBI_MW is an INPUT, not
-        # a result: 33 MW is ITER's design neutral-beam heating power. The beam is
+        # Neutral beam source, calibrated by injected power. P_NBI_MW is a SCENARIO
+        # INPUT, not a result: 33 MW is ITER's design neutral-beam heating power. The beam is
         # injected at a constant NBI_MACRO_PER_STEP beam macroparticles per step
         # (fractional rates realised stochastically), each carrying
         #     WEIGHT[1] = P_NBI * dt / (E_beam * NBI_MACRO_PER_STEP)
-        # real ions (~2e12, about 3,500x lighter than a thermal macroparticle), so
+        # real ions (~1e11 at 1 MeV, ~70,000x lighter than a thermal macroparticle), so
         # the weighted injected power is P_NBI while the beam keeps good statistics.
         self.P_NBI_MW = 33.0
         self.NBI_MACRO_PER_STEP = 2.0
@@ -70,11 +88,15 @@ class SimulationConfiguration:
         self.ALPHA_BIRTH_WEIGHT = None          # latest w_alpha, set by the loop
 
         # 3.5 MeV alphas cover ~1.3e-2 m per global step against a ~2.2e-2 m Larmor
-        # radius -- under two samples per gyro-arc, hence jagged orbits. Sub-step only
-        # the alphas; deuterons/NBI are already resolved (Larmor radius ~5e-4 m).
+        # radius -- under two samples per gyro-arc, hence jagged orbits. They are
+        # pushed in ALPHA_SUBSTEPS sub-steps with the field re-gathered every sub-step:
+        # omega_c dt / 10 = 0.058 rad of gyro-phase and 1.3 mm of travel per sub-step
+        # at B0. Thermal ions stay on the global step (Larmor radius 0.5 mm at 1 keV,
+        # ~3 mm at 25 keV, against a 2 cm field grid).
         self.ALPHA_SUBSTEPS = 10
-        # Alphas also need a finer history cadence than the 20-step thermal one, or the
-        # plot stays aliased however finely the pusher integrates.
+        # Fast ions (beam D and alphas) also need a finer history cadence than the
+        # 20-step thermal one, or the plot stays aliased however finely the pusher
+        # integrates.
         self.ALPHA_HISTORY_EVERY = 2
 
         # --- MHD INSTABILITIES & TEARING MODES ---
@@ -117,6 +139,17 @@ class SimulationConfiguration:
         self.MASS_ALPHA = M_ALPHA                # He-4 nucleus mass (kg)
         self.CHARGE_ALPHA = 2.0 * E_CHARGE       # +2e (C)
 
+        # Beam sub-steps, from the alphas' criterion: no more gyro-phase per sub-step
+        # than the alpha sub-step takes, omega_c dt / n_sub <= omega_c,alpha dt /
+        # ALPHA_SUBSTEPS, both at B0. A 1 MeV deuteron covers ~1 cm per global step
+        # against a ~1.7 cm Larmor radius, the regime the alphas are sub-stepped for.
+        # q/m of a deuteron is within 1% of an alpha's, so this gives 10: 0.0575 rad
+        # and 0.98 mm per sub-step (alpha: 0.058 rad, 1.3 mm). Field re-gathered at
+        # every sub-step, as for the alphas.
+        _omega_dt_alpha = self.CHARGE_ALPHA * self.B0 / self.MASS_ALPHA * self.reactor_dt
+        _omega_dt_beam = self.e_charge * self.B0 / self.m_deuterium * self.reactor_dt
+        self.NBI_SUBSTEPS = int(np.ceil(_omega_dt_beam / (_omega_dt_alpha / self.ALPHA_SUBSTEPS)))
+
         # =====================================================================
         # ALPHA SLOWING-DOWN
         # =====================================================================
@@ -128,9 +161,10 @@ class SimulationConfiguration:
         # nu_s = energy drag
         self.NU_S = 1.0 / self.ALPHA_SLOWING_TIME
 
-        # Below this energy (keV) an alpha counts as thermalized (Helium ash) and
-        # stops heating
-        self.THERMALIZATION_ENERGY_KEV = 15.0
+        # Thermalization floor: an alpha slowed to (3/2) T_i of the thermal ions on its
+        # own flux surface (from the latest profiles, refreshed every
+        # FIELD_UPDATE_EVERY steps) counts as helium ash and stops heating
+        # (physics_engine.alpha_thermalization_floor_keV). Not a config constant.
 
         # Volume-averaged ion density the thermal macroparticles represent (m^-3).
         # After the plasma volume is known, initialization sets the per-species
