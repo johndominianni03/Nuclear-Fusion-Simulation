@@ -19,6 +19,7 @@ import pandas as pd
 from matplotlib.lines import Line2D
 from visualizer import PlasmaVisualizer
 from physics_engine import interpolate_psi_array, STORED_ENERGY_SPECIES
+from constants import MU_0
 
 # One colour per species for the line plots (profiles, stored energy), keyed by type code.
 SPECIES_COLOR = {0: "tab:blue", 1: "tab:orange", 2: "tab:pink", 3: "tab:green"}
@@ -347,10 +348,9 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
         axes[2].set_xlim(0.0, 1.0)
         beta_txt = ""
         if "beta_avg" in flux_profiles:
-            mu0 = 4.0e-7 * np.pi
             V = flux_profiles["shell_volume"]
             p_th = flux_profiles["p"][0] + flux_profiles["p"][3]          # thermal D + T
-            beta_th = 2.0 * mu0 * float(np.sum(p_th * V) / np.sum(V)) / cfg.B0**2
+            beta_th = 2.0 * MU_0 * float(np.sum(p_th * V) / np.sum(V)) / cfg.B0**2
             beta_txt = (f"\n$\\langle\\beta\\rangle$ = {flux_profiles['beta_avg']:.2e} all species, "
                         f"{beta_th:.2e} thermal  ($B_0$ = {cfg.B0:g} T)")
         axes[0].set_title("Flux-Surface Profiles at End of Run (weighted)" + beta_txt)
@@ -527,22 +527,25 @@ def run_steady_state_diagnostics(cfg, eq, rho_grid, phi_grid, stored_energy_J, a
     if lawson_history is not None and len(lawson_history) > 0:
         fig, ax = plt.subplots(figsize=(9, 5))
 
-        lawson_arr = _scrub_1d(lawson_history)
+        # NaN is kept, not scrubbed to 0: tau_E = W_thermal / P_loss is undefined
+        # before the first thermal-ion loss and wherever the trailing window holds no
+        # loss, and those stretches are left as gaps rather than drawn as numbers.
+        lawson_arr = np.array([float(x.item() if hasattr(x, 'item') else x) for x in lawson_history])
         time_array = np.arange(len(lawson_arr)) * cfg.reactor_dt * 1e6
 
-        # Before the first particle loss tau_E is a fixed placeholder, not a
-        # measurement, so that segment is not drawn.
-        if lawson_first_measured_step is not None:
-            k0 = int(lawson_first_measured_step)
-            ax.plot(time_array[k0:], lawson_arr[k0:], color='firebrick', linewidth=2.5,
-                    label='Simulated Triple Product ($n_e T_i \\tau_E$)')
+        _ok = np.isfinite(lawson_arr) & (lawson_arr > 0)
+        if lawson_first_measured_step is not None and np.any(_ok):
+            ax.plot(time_array, np.where(_ok, lawson_arr, np.nan), color='firebrick', linewidth=2.5,
+                    label='$n_i T_i \\tau_E$, $\\tau_E = W_{th} / P_{loss}$')
         else:
-            ax.text(0.5, 0.5, "No particle lost: confinement time not measured",
+            ax.text(0.5, 0.5, "No thermal ion lost: confinement time not measured",
                     transform=ax.transAxes, ha='center', va='center', color='dimgray')
         ax.set_xlim(0.0, len(lawson_arr) * cfg.reactor_dt * 1e6)
         ax.axhline(cfg.lawson_target, color='mediumseagreen', linestyle='--', linewidth=2, label=f'Reference value ({cfg.lawson_target:.1e})')
 
-        ax.set_title("Lawson Triple Product Evolution")
+        ax.set_title("Lawson Triple Product, Ion Energy Confinement from Orbit Losses Only\n"
+                     f"(thermal-ion loss power through the LCFS, {cfg.TAU_E_WINDOW_STEPS * cfg.reactor_dt * 1e6:g} $\\mu s$ "
+                     "window; no electrons, no transport model)", fontsize=10)
         ax.set_xlabel("Simulation Time ($\\mu s$)")
         ax.set_ylabel("Triple Product ($keV \\cdot s \\cdot m^{-3}$)")
         ax.set_yscale('log')

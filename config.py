@@ -1,12 +1,16 @@
 import numpy as np
 import torch
 
+from constants import E_CHARGE, M_DEUTERON, M_TRITON, M_ALPHA, MEV_J
+
 class SimulationConfiguration:
     def __init__(self):
         # --- PHYSICS CONSTANTS ---
-        self.e_charge = 1.602e-19       # Elementary charge (C)
-        self.m_deuterium = 3.344e-27    # Deuterium mass (kg)
-        self.m_tritium = 3.016 * 1.660539e-27   # Tritium mass (kg), 3.016 u
+        # Charge and masses come from constants.py (CODATA 2022). The masses are
+        # the bare-nucleus masses: deuteron, triton, alpha particle.
+        self.e_charge = E_CHARGE        # Elementary charge (C)
+        self.m_deuterium = M_DEUTERON   # Deuteron mass (kg)
+        self.m_tritium = M_TRITON       # Triton mass (kg)
 
         # --- MAGNETIC FIELD ---
         self.B0 = 12.0                  # Toroidal field (T)
@@ -103,15 +107,15 @@ class SimulationConfiguration:
         
         # Energy yield per D-T reaction
         self.E_FUSION_MEV = 17.6        # Energy released per D-T fusion (MeV)
-        self.E_FUSION_JOULES = self.E_FUSION_MEV * 1e6 * self.e_charge  # ~2.8198e-12 J
+        self.E_FUSION_JOULES = self.E_FUSION_MEV * MEV_J  # ~2.8198e-12 J
 
         # ====================================================
         # ALPHA PARTICLE (He-4) CONSTANTS
         # ====================================================
         self.ALPHA_ENERGY_MEV = 3.5              # Birth energy
-        self.ALPHA_ENERGY_JOULES = self.ALPHA_ENERGY_MEV * 1e6 * 1.6022e-19
-        self.MASS_ALPHA = 4.0015 * 1.660539e-27  # He-4 nucleus mass (kg)
-        self.CHARGE_ALPHA = 2.0 * 1.6022e-19     # +2e (C)
+        self.ALPHA_ENERGY_JOULES = self.ALPHA_ENERGY_MEV * MEV_J
+        self.MASS_ALPHA = M_ALPHA                # He-4 nucleus mass (kg)
+        self.CHARGE_ALPHA = 2.0 * E_CHARGE       # +2e (C)
 
         # =====================================================================
         # ALPHA SLOWING-DOWN
@@ -154,6 +158,14 @@ class SimulationConfiguration:
         # LAWSON CRITERION
         # ==========================================
         self.lawson_target = 3.0e21  # D-T ignition triple product (keV * s * m^-3)
+
+        # Ion energy confinement time from orbit losses only: tau_E = W_thermal / P_loss,
+        # W_thermal the weighted thermal D + T kinetic energy, P_loss the weighted kinetic
+        # energy thermal ions carry out through the last closed flux surface, averaged
+        # over a trailing window of TAU_E_WINDOW_STEPS steps (1,000 steps = 1 us, a tenth
+        # of a production run; shorter while fewer steps have elapsed). No electrons and
+        # no transport model, so this is not a tokamak energy confinement time.
+        self.TAU_E_WINDOW_STEPS = 1000
 
         # =====================================================================
         # HPC, MULTI-CORE PROCESSING & METAL GPU ACCELERATION

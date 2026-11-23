@@ -8,6 +8,7 @@ import numpy as np
 import time
 import torch
 
+from constants import KEV_J
 from physics_engine import (
     update_force_balance_field,             # quasi-neutral E_r from thermal-ion force balance (host)
     deposit_ion_charge_density,             # end-of-run weighted CIC density map (host)
@@ -24,6 +25,11 @@ from physics_engine import (
     weight_lut,
     thermal_temperature_keV,                # T from thermal D + T only
     STORED_ENERGY_SPECIES,
+    species_masses,
+    inventory_line,                         # weighted real ions per species [macroparticles]
+    loss_energy_by_species,                 # weighted energy carried out through the LCFS (host)
+    WindowedLossPower,
+    energy_confinement_time,
     tearing_amplitude_over_B0,              # prescribed ripple / B0, reported at the end
 )
 from profiling import (
@@ -186,6 +192,10 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
     pid_pool[rows_d] = 0
     pid_pool[rows_t] = 2
+    # pid -> species type code, host-side and write-once at birth (twin of the CPU
+    # loop): the confinement check overwrites a lost particle's type with -1.
+    pid_species = np.full(pid_capacity, -1, dtype=np.int8)
+    pid_species[:n_init] = type_np_init
     slot_alive = np.zeros(_MAX_TRACKED_SLOTS, dtype=bool)
 
     # 500 thermal D + 500 thermal T, the first of each pool (ascending pid), as
@@ -228,9 +238,14 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     alpha_birth_shells, alpha_birth_update, alpha_rate_updates = [], [], []
     temp_history, lawson_triple_product_history = [], []
     T_core = 0.0
-    # First step whose tau_E is measured (t > 0 and at least one particle lost).
-    # Earlier entries use the fixed tau_E below, so the plot starts here. None if
-    # nothing was ever lost. Bookkeeping only: reads counters, writes nothing else.
+    # Losses through the LCFS per species and the windowed tau_E (twin of the CPU loop).
+    mass_lut = np.asarray(species_masses(cfg), dtype=np.float64)
+    lost_energy_J = np.zeros(len(mass_lut))
+    lost_macro = np.zeros(len(mass_lut))
+    lost_real = np.zeros(len(mass_lut))
+    loss_power = WindowedLossPower(cfg.TAU_E_WINDOW_STEPS, cfg.reactor_dt)
+    tau_E_history, P_loss_history = [], []
+    # First step at which a thermal ion has been lost; tau_E is NaN before it.
     lawson_first_measured_step = None
 
     # --- Profiling state (inert unless cfg.PROFILE) ---
@@ -287,6 +302,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             pid_row_t[new_pids] = torch.arange(base_row, base_row + batch_size,
                                                device=device, dtype=torch.int64)
             pid_pool[next_pid:next_pid + batch_size] = 0
+            pid_species[next_pid:next_pid + batch_size] = 1
 
             n_new = min(batch_size, 1000 - tracked_nbis)
             if n_new > 0:
@@ -357,6 +373,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             pid_row_t[new_pids] = torch.arange(base_row, base_row + alpha_batch,
                                                device=device, dtype=torch.int64)
             pid_pool[next_pid:next_pid + alpha_batch] = 1
+            pid_species[next_pid:next_pid + alpha_batch] = 2
 
             n_new = min(alpha_batch, 1000 - tracked_alphas)
             if n_new > 0:
@@ -463,14 +480,29 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # and the confined count could never fall. Boolean-mask indexing keeps the removal
         # a single on-device gather per tensor -- only the last-known state of tracked
         # particles that just died round-trips to the CPU.
+        step_lost_J = 0.0                   # thermal D + T energy out this step
         if newly_lost > 0:
-            for _pool, _pos, _vel, _type, _pid, _lost in (
-                    (bulk, b_pos, b_vel, b_type, b_pid, lost_b),
-                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a),
-                    (trit, t_pos, t_vel, t_type, t_pid, lost_t)):
+            for _pool, _pos, _vel, _type, _pid, _lost, _wt in (
+                    (bulk, b_pos, b_vel, b_type, b_pid, lost_b, None),
+                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a, a_wt),
+                    (trit, t_pos, t_vel, t_type, t_pid, lost_t, None)):
                 if _lost == 0:
                     continue
                 alive = _type != -1
+
+                # Energy carried out through the LCFS, by species: the dead rows
+                # (pid, velocity, per-alpha weight) cross to the host once per
+                # loss event and go through the CPU loop's helper, in float64.
+                l_rows = torch.nonzero(~alive, as_tuple=False).squeeze(1)
+                l_pids = _pid[l_rows].cpu().numpy()
+                sp = pid_species[l_pids]
+                e_sp, n_sp, w_sp = loss_energy_by_species(
+                    _vel[l_rows].cpu().numpy(), sp, mass_lut,
+                    w_lut[sp] if _wt is None else _wt[l_rows].cpu().numpy())
+                lost_energy_J += e_sp
+                lost_macro += n_sp
+                lost_real += w_sp
+                step_lost_J += float(e_sp[0] + e_sp[3])
 
                 # Preserve the last known state of any TRACKED particle before it is
                 # dropped. Gated on pid <= max_tracked_pid so a large loss event
@@ -556,13 +588,13 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         if alpha.n_live > 0:
             alpha_vels = a_vel
             v_mags = torch.linalg.norm(alpha_vels, dim=1)
-            alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * v_mags**2) / 1.602e-16
+            alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * v_mags**2) / KEV_J
             # Second return value is the raw simulation-scale keV drained, needed by the
             # energy transfer below.
             # Weighted: sum(w_a dE) / w_thermal, the real energy given up.
             new_energies_kev, alpha_deposited_kev = compute_alpha_heating_power_torch(
                 alpha_energies_kev, cfg.reactor_dt, cfg, rel_weights=a_wt / float(w_lut[0]))
-            new_v_mags = torch.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
+            new_v_mags = torch.sqrt(2.0 * (new_energies_kev * KEV_J) / cfg.MASS_ALPHA)
             safe_v_mags = torch.where(v_mags == 0, torch.full_like(v_mags, 1e-10), v_mags)
             scale_factors = new_v_mags / safe_v_mags
             a_vel.copy_(alpha_vels * scale_factors.unsqueeze(1))
@@ -583,7 +615,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         r_t = rel_w_t[t_type.long()]
         if alpha_deposited_kev > 0.0 and (bulk.n_live + trit.n_live) > 0:
             bulk_energy_kev = (float((r_b * (0.5 * cfg.m_deuterium * torch.sum(b_vel**2, dim=1))).sum().item())
-                               + float((r_t * (0.5 * cfg.m_tritium * torch.sum(t_vel**2, dim=1))).sum().item())) / 1.602e-16
+                               + float((r_t * (0.5 * cfg.m_tritium * torch.sum(t_vel**2, dim=1))).sum().item())) / KEV_J
             if bulk_energy_kev > 0.0:
                 boost = float(np.sqrt(1.0 + alpha_deposited_kev / bulk_energy_kev))
                 b_vel.copy_(b_vel * boost)
@@ -605,10 +637,14 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("alpha heating + energy transfer", _t)
 
         _t = prof.mark()
-        loss_rate = total_lost / t if t > 0 else 1e-5
-        tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
-        if lawson_first_measured_step is None and t > 0 and total_lost > 0:
+        # tau_E = W_thermal / P_loss over the trailing window (twin of the CPU loop).
+        P_loss = loss_power.add(step_lost_J)
+        if lawson_first_measured_step is None and step_lost_J > 0.0:
             lawson_first_measured_step = step
+        tau_E = (energy_confinement_time(E_spec[0] + E_spec[3], P_loss)
+                 if lawson_first_measured_step is not None else float("nan"))
+        tau_E_history.append(tau_E)
+        P_loss_history.append(P_loss)
         # The triple product's density is the weighted thermal-ion density: real
         # thermal D + T count over the psi_edge volume (twin of the CPU loop).
         n_e_reactor = (N_spec[0] + N_spec[3]) / cfg.PLASMA_VOLUME_M3
@@ -622,7 +658,11 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         if (step + 1) % 500 == 0:
             max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
+            n_macro = torch.bincount(b_type.long(), minlength=len(w_lut)).cpu().numpy().astype(np.float64)
+            n_macro[2] += alpha.n_live
+            n_macro[3] += trit.n_live
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | ions {inventory_line(N_spec, n_macro)} "
+                  f"| Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
 
     # Prescribed tearing-mode ripple relative to B0 at the last pushed time level
     # (twin of the CPU loop).
@@ -672,4 +712,7 @@ def _run_reactor_loop_gpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
             _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
                      alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
-                     alpha_rate_updates, weight_np, tearing_amp_over_B0))
+                     alpha_rate_updates, weight_np, tearing_amp_over_B0,
+                     dict(tau_E=tau_E_history, P_loss_thermal_W=P_loss_history,
+                          lost_energy_J=lost_energy_J, lost_macro=lost_macro,
+                          lost_real=lost_real)))

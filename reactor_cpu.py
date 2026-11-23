@@ -20,6 +20,11 @@ from physics_engine import (
     species_energy_and_count,               # real J and real ion count per species
     thermal_temperature_keV,                # T from thermal D + T only
     STORED_ENERGY_SPECIES,
+    species_masses,
+    inventory_line,                         # weighted real ions per species [macroparticles]
+    loss_energy_by_species,                 # weighted energy carried out through the LCFS
+    WindowedLossPower,
+    energy_confinement_time,
     tearing_amplitude_over_B0,              # prescribed ripple / B0, reported at the end
     drain_alpha_energy,
     weighted_kinetic_energy_kev,
@@ -134,6 +139,11 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     # an alpha keeps heating, it does not reclassify it -- so a particle can never
     # change pool. Only its row moves, and pid_row carries that.
     pid_pool = np.full(pid_capacity, -1, dtype=np.int8)
+    # pid -> species type code, write-once at birth like pid_pool. The confinement
+    # check overwrites a lost particle's type with -1, so this is what says which
+    # species carried energy out through the last closed flux surface.
+    pid_species = np.full(pid_capacity, -1, dtype=np.int8)
+    pid_species[:n_init] = type_init
 
     # --- SPLIT POOLS ---
     # bulk holds deuterium (types 0 and 1), alpha holds type 2, trit holds thermal
@@ -221,9 +231,19 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     alpha_birth_shells, alpha_birth_update, alpha_rate_updates = [], [], []
     temp_history, lawson_triple_product_history = [], []
     T_core = 0.0
-    # First step whose tau_E is measured (t > 0 and at least one particle lost).
-    # Earlier entries use the fixed tau_E below, so the plot starts here. None if
-    # nothing was ever lost. Bookkeeping only: reads counters, writes nothing else.
+    # --- LOSSES THROUGH THE LAST CLOSED FLUX SURFACE, PER SPECIES ---
+    # Weighted kinetic energy [J], macroparticles and real ions lost, by type code.
+    mass_lut = np.asarray(species_masses(cfg), dtype=np.float64)
+    lost_energy_J = np.zeros(len(mass_lut))
+    lost_macro = np.zeros(len(mass_lut))
+    lost_real = np.zeros(len(mass_lut))
+    # Ion energy confinement time from orbit losses: tau_E = W_thermal / P_loss, with
+    # P_loss the thermal-ion loss power over a trailing TAU_E_WINDOW_STEPS window.
+    loss_power = WindowedLossPower(cfg.TAU_E_WINDOW_STEPS, cfg.reactor_dt)
+    tau_E_history, P_loss_history = [], []
+    # First step at which a thermal ion has been lost: tau_E (and the triple product)
+    # is NaN before it -- there is no loss power to divide by. None if no thermal
+    # ion was ever lost.
     lawson_first_measured_step = None
 
     print("[SYSTEM] Igniting time-domain reactor loop on CPU/Numba (fastest path at this particle count)...")
@@ -272,6 +292,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             pid_row[new_pids] = np.arange(base_row, base_row + batch_size,
                                           dtype=np.int64)
             pid_pool[new_pids] = 0
+            pid_species[new_pids] = 1
             next_pid += batch_size
             total_injected += batch_size
 
@@ -341,6 +362,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             pid_row[new_pids] = np.arange(base_row, base_row + alpha_batch,
                                           dtype=np.int64)
             pid_pool[new_pids] = 1
+            pid_species[new_pids] = 2
             next_pid += alpha_batch
 
             n_new = min(alpha_batch, 1000 - tracked_alphas)
@@ -444,20 +466,30 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         # arrays meant the pools only ever grew, every kernel paid for dead particles, and
         # the confined count could never fall. Trajectory history is pid-keyed, so it
         # survives the row-index shift and the diagnostics payload is unchanged.
+        step_lost_J = 0.0                   # thermal D + T energy out this step
         if newly_lost > 0:
             # Each pool compacts independently; rows are renumbered within a pool,
             # which is exactly what pid_row means now that pid_pool says which
             # pool the index belongs to.
-            for _pool, _pos, _vel, _type, _pid, _lost in (
-                    (bulk, b_pos, b_vel, b_type, b_pid, lost_b),
-                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a),
-                    (trit, t_pos, t_vel, t_type, t_pid, lost_t)):
+            for _pool, _pos, _vel, _type, _pid, _lost, _wt in (
+                    (bulk, b_pos, b_vel, b_type, b_pid, lost_b, None),
+                    (alpha, a_pos, a_vel, a_type, a_pid, lost_a, a_wt),
+                    (trit, t_pos, t_vel, t_type, t_pid, lost_t, None)):
                 if _lost == 0:
                     continue
                 alive = _type != -1
                 dead_rows = np.nonzero(~alive)[0]
                 if dead_rows.size > 0:
                     dead_pids = _pid[dead_rows]
+                    # Energy carried out, at the crossing velocity, by species.
+                    sp = pid_species[dead_pids]
+                    e_sp, n_sp, w_sp = loss_energy_by_species(
+                        _vel[dead_rows], sp, mass_lut,
+                        w_lut[sp] if _wt is None else _wt[dead_rows])
+                    lost_energy_J += e_sp
+                    lost_macro += n_sp
+                    lost_real += w_sp
+                    step_lost_J += float(e_sp[0] + e_sp[3])
                     dead_slots = pid_slot[dead_pids]
                     is_tracked = dead_slots >= 0
                     if np.any(is_tracked):
@@ -584,10 +616,16 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         prof.add("alpha heating + energy transfer", _t)
 
         _t = prof.mark()
-        loss_rate = total_lost / t if t > 0 else 1e-5
-        tau_E = min(current_confined / loss_rate if loss_rate > 0 else 0.5, 3.0)
-        if lawson_first_measured_step is None and t > 0 and total_lost > 0:
+        # tau_E = W_thermal / P_loss: weighted thermal D + T kinetic energy over the
+        # thermal-ion loss power through the LCFS (trailing window). Ion orbit losses
+        # only -- no electrons, no transport -- and NaN until a thermal ion is lost.
+        P_loss = loss_power.add(step_lost_J)
+        if lawson_first_measured_step is None and step_lost_J > 0.0:
             lawson_first_measured_step = step
+        tau_E = (energy_confinement_time(E_spec[0] + E_spec[3], P_loss)
+                 if lawson_first_measured_step is not None else float("nan"))
+        tau_E_history.append(tau_E)
+        P_loss_history.append(P_loss)
         # The triple product's density is the weighted thermal-ion density: real
         # thermal D + T count over the psi_edge volume. Units: m^-3 * keV * s,
         # matching cfg.lawson_target and the axis label.
@@ -599,7 +637,11 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
 
         if (step + 1) % 500 == 0:
             max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
-            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
+            n_macro = np.bincount(b_type, minlength=len(w_lut)).astype(np.float64)
+            n_macro[2] += alpha.n_live
+            n_macro[3] += trit.n_live
+            print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | ions {inventory_line(N_spec, n_macro)} "
+                  f"| Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
 
     # The prescribed tearing-mode ripple (kernels._field_at) acts on every particle
     # through the field gather; report how large it got, relative to B0, at the
@@ -655,4 +697,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
             _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
                      alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
-                     alpha_rate_updates, weight_np, tearing_amp_over_B0))
+                     alpha_rate_updates, weight_np, tearing_amp_over_B0,
+                     dict(tau_E=tau_E_history, P_loss_thermal_W=P_loss_history,
+                          lost_energy_J=lost_energy_J, lost_macro=lost_macro,
+                          lost_real=lost_real)))

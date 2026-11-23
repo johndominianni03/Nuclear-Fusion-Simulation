@@ -160,10 +160,11 @@ def test_alpha_energy_drain_preserves_direction():
     vel = vel * rng.uniform(0.05, 1.0, (1000, 1)).astype(np.float32)   # spread of energies
     v64 = vel.astype(np.float64)
     vm = np.linalg.norm(v64, axis=1)
-    ek = (0.5 * cfg.MASS_ALPHA * vm**2) / 1.602e-16
+    from constants import KEV_J
+    ek = (0.5 * cfg.MASS_ALPHA * vm**2) / KEV_J
     # Same lines as the loop, with a large dt so the drain is visible.
     new_ek, _ = engine.compute_alpha_heating_power(ek, 1e-2, cfg)
-    new_vm = np.sqrt(2.0 * (new_ek * 1.602e-16) / cfg.MASS_ALPHA)
+    new_vm = np.sqrt(2.0 * (new_ek * KEV_J) / cfg.MASS_ALPHA)
     out = (v64 * (new_vm / vm)[:, None]).astype(np.float32).astype(np.float64)
     cosang = np.sum(out * v64, axis=1) / (np.linalg.norm(out, axis=1) * vm)
     assert np.all(new_ek <= ek)
@@ -565,10 +566,11 @@ def test_tritium_gyrofrequency():
     """reactor_cpu._push_thermal_tritium (the loop's triton push) gyrates at
     Omega = e B / m_T: at the production dt it matches the Boris rotation
     2 atan(Omega dt / 2) / dt to float32 precision, and as dt -> 0 it converges
-    on e B / m_T itself. m_T is 3.016 u."""
+    on e B / m_T itself. m_T is the CODATA 2022 triton mass (constants.py)."""
     import reactor_cpu
     cfg, *_ = _production_fields()
-    assert abs(cfg.m_tritium / (3.016 * 1.660539e-27) - 1.0) < 1e-12
+    from constants import M_TRITON
+    assert cfg.m_tritium == M_TRITON
     B_mag = 12.0
     omega = cfg.e_charge * B_mag / cfg.m_tritium
     push = reactor_cpu._push_thermal_tritium
@@ -965,7 +967,8 @@ def test_per_alpha_weights_follow_compaction_and_conserve_energy():
 ENERGY_TEST_STEPS = 1000
 
 
-def _closed_run(loop_fn, n_thermal=4000, steps=ENERGY_TEST_STEPS, seed=31, psiN_max=0.8):
+def _closed_run(loop_fn, n_thermal=4000, steps=ENERGY_TEST_STEPS, seed=31, psiN_max=0.8,
+                edge_scale=None):
     """A closed system run through a reactor loop: E = 0 (the force-balance update
     is wrapped to return zero grids), both sources off (NBI_MACRO_PER_STEP =
     ALPHA_MACRO_PER_STEP = 0), and only thermals with psi_N < psiN_max loaded, so
@@ -998,6 +1001,10 @@ def _closed_run(loop_fn, n_thermal=4000, steps=ENERGY_TEST_STEPS, seed=31, psiN_
         np.random.set_state(state)
         pn = p.cpu().numpy()
         keep = compute_psi_normalised(np.hypot(pn[:, 0], pn[:, 1]), pn[:, 2], eq) < psiN_max
+        if edge_scale is not None:
+            # Pull the loss boundary inward (CLAUDE.md's forced wall-loss recipe):
+            # psi_edge -> edge_scale * psi_core, so the loop has losses to account for.
+            eq.psi_edge = eq.psi_core * edge_scale
         idx = torch.from_numpy(np.nonzero(keep)[0]).to(p.device)
         p, v, t = p[idx].contiguous(), v[idx].contiguous(), t[idx].contiguous()
         cfg.initial_thermal_count = int(keep.sum())
@@ -1068,6 +1075,100 @@ def test_closed_system_conserves_weighted_kinetic_energy_gpu_twin():
     rel = abs(W1 - W0) / W0
     hard = 16 * ENERGY_TEST_STEPS * 2.0 ** -23
     assert rel < hard, f"|dW|/W = {rel:.3e} exceeds the float32-arithmetic bound {hard:.3e}"
+
+
+# =======================================================
+# TIER 2.5 PHASE 2 -- constants, tau_E
+# =======================================================
+def test_no_mass_or_charge_literal_outside_constants():
+    """Every mass and charge comes from constants.py (CODATA 2022). Scan every
+    project .py file except constants.py for a numeric literal that is a particle
+    mass (any *e-27 or *e-31 kg number, an atomic-mass-unit multiplier), the
+    elementary charge or 1 keV in joules (1.6...e-19 / e-16), mu0 (4e-7 pi,
+    1.2566...e-6) or epsilon0 (8.85...e-12). Comments and strings are scanned
+    too: a stale value in a comment is how a literal comes back."""
+    import re
+    pattern = re.compile(
+        r"\b\d+(\.\d+)?[eE]-(27|31)\b"                     # kg masses
+        r"|\b1\.6\d*[eE]-1[0-9]\b"                          # e, keV, MeV in SI
+        r"|\b4(\.0*)?[eE]-0?7\s*\*\s*(np\.|math\.)?pi\b"   # mu0 = 4 pi 1e-7
+        r"|\b1\.2566\d*[eE]-0?6\b"                           # mu0
+        r"|\b8\.85\d*[eE]-12\b"                              # epsilon0
+        r"|\b(1\.6605|1\.6726|9\.109)\d*\b")                 # u, m_p, m_e mantissas
+    skip_dirs = {"venv", ".venv", ".git", "__pycache__", ".cache", "docs"}
+    hits = []
+    for root, dirs, files in os.walk(REPO):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in files:
+            if not name.endswith(".py") or (root == REPO and name == "constants.py"):
+                continue
+            path = os.path.join(root, name)
+            with open(path) as fh:
+                for k, line in enumerate(fh, 1):
+                    if pattern.search(line):
+                        hits.append(f"{os.path.relpath(path, REPO)}:{k}: {line.strip()}")
+    assert not hits, "mass/charge literals outside constants.py:\n" + "\n".join(hits)
+
+
+def test_energy_confinement_time_synthetic_exact():
+    """tau_E = W / P_loss with P_loss averaged over the trailing window.
+    (a) A constant loss of P dt per step gives P_loss = P from the first step on
+    (the average runs over the steps so far until the window fills), so tau_E = W/P
+    to float64 rounding. (b) A single loss E at step s gives P_loss = E / (k dt)
+    with k = min(step + 1, window) for the next `window` steps, then 0 and tau_E =
+    NaN (nothing being lost)."""
+    from physics_engine import WindowedLossPower, energy_confinement_time
+    dt, window = 1.0e-9, 1000
+    W, P = 3.7e5, 2.5e7                                   # J, W -> tau_E = 1.48e-2 s
+    lp = WindowedLossPower(window, dt)
+    for step in range(3 * window):
+        P_loss = lp.add(P * dt)
+        assert abs(P_loss / P - 1.0) < 1e-12, (step, P_loss)
+        assert abs(energy_confinement_time(W, P_loss) / (W / P) - 1.0) < 1e-12
+    E, s = 42.0, 1500
+    lp = WindowedLossPower(window, dt)
+    for step in range(s + window + 10):
+        P_loss = lp.add(E if step == s else 0.0)
+        if step < s or step >= s + window:
+            assert P_loss == 0.0, (step, P_loss)
+            assert np.isnan(energy_confinement_time(W, P_loss))
+        else:
+            assert P_loss == E / (window * dt), (step, P_loss)
+            assert energy_confinement_time(W, P_loss) == W / (E / (window * dt))
+    lp = WindowedLossPower(window, dt)                    # early in the run: k = step + 1
+    for step in range(5):
+        P_loss = lp.add(E if step == 0 else 0.0)
+        assert P_loss == E / ((step + 1) * dt), (step, P_loss)
+
+
+def test_lost_energy_closes_the_energy_balance():
+    """The loss bookkeeping behind P_loss, end to end through the CPU loop: in a
+    closed system (E = 0, sources off) whose loss boundary is pulled inward
+    (psi_edge = 1.06 psi_core), the energy carried out through the LCFS plus the
+    energy still stored equals the energy loaded, W0 = W_end + sum(lost_energy_J),
+    to the float32 rounding bound of the closed-system test (2 * steps * 2^-23).
+    The per-species loss counts add up to total_lost, and tau_E is NaN before the
+    first thermal loss and W_thermal / P_loss (finite) from then on."""
+    import reactor_cpu
+    steps = 200
+    cfg, out, W0, _ = _closed_run(reactor_cpu._run_reactor_loop_cpu, n_thermal=4000,
+                                  steps=steps, psiN_max=1.0, edge_scale=1.06)
+    log = out[-1]
+    assert out[9] > 100, f"only {out[9]} losses: the forced-loss setup did not bite"
+    assert int(log["lost_macro"].sum()) == out[9]
+    assert log["lost_macro"][1] == 0 and log["lost_macro"][2] == 0     # no beam, no alphas
+    W_end = float(out[11][-1].sum())
+    E_out = float(log["lost_energy_J"].sum())
+    rel = abs(W0 - W_end - E_out) / W0
+    assert rel < 2 * steps * 2.0 ** -23, f"W0 - W_end - E_lost = {rel:.3e} of W0"
+    tau = log["tau_E"]
+    k0 = out[15]
+    assert k0 is not None and np.all(np.isnan(tau[:k0]))
+    E_th = out[11][:, 0] + out[11][:, 1]
+    P = log["P_loss_thermal_W"]
+    ok = P > 0
+    assert np.all(np.isfinite(tau[k0:][ok[k0:]]))
+    assert np.allclose(tau[ok], E_th[ok] / P[ok], rtol=1e-14, atol=0.0)
 
 
 # =======================================================

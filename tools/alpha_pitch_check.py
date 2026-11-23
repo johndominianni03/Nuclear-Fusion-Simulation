@@ -47,6 +47,7 @@ ALPHA_EVERY = 4      # this tool's fixed alpha schedule (the Tier 1 reactor sche
 from numba import njit, prange                         # noqa: E402
 
 from config import SimulationConfiguration             # noqa: E402
+from constants import KEV_J                            # noqa: E402
 import initialization                                  # noqa: E402
 from kernels import vectorized_gather_and_B_into       # noqa: E402
 from physics_engine import (                           # noqa: E402
@@ -202,9 +203,9 @@ def run(args):
             if not args.no_heating:
                 av = vel.astype(np.float64)
                 vm = np.linalg.norm(av, axis=1)
-                ek = (0.5 * cfg.MASS_ALPHA * vm**2) / 1.602e-16
+                ek = (0.5 * cfg.MASS_ALPHA * vm**2) / KEV_J
                 new_ek, _ = engine.compute_alpha_heating_power(ek, cfg.reactor_dt, cfg)
-                new_vm = np.sqrt(2.0 * (new_ek * 1.602e-16) / cfg.MASS_ALPHA)
+                new_vm = np.sqrt(2.0 * (new_ek * KEV_J) / cfg.MASS_ALPHA)
                 av *= (new_vm / np.where(vm == 0, 1e-10, vm))[:, None]
                 vel[:] = av.astype(np.float32)
 
@@ -232,7 +233,7 @@ def run(args):
             R = np.hypot(pos[:, 0], pos[:, 1]).astype(np.float64)
             for k in range(len(pos)):
                 records.append((step, pid[k], birth[k], R[k], float(pos[k, 2]), vpar[k] / vm[k],
-                                0.5 * cfg.MASS_ALPHA * vm[k]**2 / 1.602e-16,
+                                0.5 * cfg.MASS_ALPHA * vm[k]**2 / KEV_J,
                                 cfg.MASS_ALPHA * vperp2[k] / (2.0 * Bm[k])))
 
     rec = np.array(records, dtype=[("step", "i8"), ("pid", "i8"), ("birth", "i8"), ("R", "f8"),

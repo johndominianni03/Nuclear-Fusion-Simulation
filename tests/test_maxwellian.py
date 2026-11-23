@@ -8,6 +8,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from physics_engine import ParticlePusher                # noqa: E402
+from constants import KEV_J                              # noqa: E402
 
 def test_maxwellian_sampling():
     print("Testing Maxwell-Boltzmann velocity sampling and diagnostic plotting...")
@@ -24,9 +25,8 @@ def test_maxwellian_sampling():
     print(f"Successfully sampled {num_particles} velocity vectors.")
     
     # 2. Check the standard deviation
-    k_B = 1.380649e-23
-    T_K = T_keV * 1.16045e7
-    v_th_expected = np.sqrt(k_B * T_K / pusher.m)
+    # Per-component standard deviation sqrt(kT / m), kT = T_keV * 1 keV.
+    v_th_expected = np.sqrt(T_keV * KEV_J / pusher.m)
     
     vx_std = np.std(velocities[:, 0])
     vy_std = np.std(velocities[:, 1])

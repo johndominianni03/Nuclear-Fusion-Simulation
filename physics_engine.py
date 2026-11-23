@@ -3,9 +3,10 @@ import matplotlib.pyplot as plt
 from numba import njit, prange
 import torch
 
-# --- CONSTANTS ---
-e_charge = 1.602e-19       # Coulombs
-m_deuterium = 3.3435e-27   # kg
+# --- CONSTANTS (CODATA 2022, constants.py) ---
+from constants import E_CHARGE, M_DEUTERON, MU_0, KEV_J
+e_charge = E_CHARGE        # Coulombs
+m_deuterium = M_DEUTERON   # kg; the injector and the thermal-D loading use this
 
 class ParticlePusher:
     def __init__(self, equilibrium):
@@ -944,10 +945,9 @@ def compute_flux_profiles(pos, vel, types, eq, masses, weight=1.0,
         "weight": tuple(float(x) for x in w_s) if pw is None else "per-particle",
     }
     if B0 is not None:
-        mu0 = 4.0e-7 * np.pi
         p_tot = p.sum(axis=0)
-        out["beta_profile"] = 2.0 * mu0 * p_tot / B0**2
-        out["beta_avg"] = 2.0 * mu0 * float(np.sum(p_tot * V) / np.sum(V)) / B0**2
+        out["beta_profile"] = 2.0 * MU_0 * p_tot / B0**2
+        out["beta_avg"] = 2.0 * MU_0 * float(np.sum(p_tot * V) / np.sum(V)) / B0**2
     return out
 
 
@@ -1247,10 +1247,69 @@ def thermal_temperature_keV(E_J, N):
     return (2.0 / 3.0) * (E_J[0] + E_J[3]) / n_th / (e_charge * 1.0e3)
 
 
+SPECIES_LABEL = {0: "D", 1: "beam", 2: "alpha", 3: "T"}
+
+
+def inventory_line(N_real, n_macro):
+    """The progress line's inventory: weighted real-ion count per species with the
+    macroparticle count in brackets, in thermal D, thermal T, beam D, alpha order.
+    N_real and n_macro are indexed by type code."""
+    return "  ".join(f"{SPECIES_LABEL[s]} {N_real[s]:.3e} [{int(n_macro[s]):,}]"
+                     for s in (0, 3, 1, 2))
+
+
+def loss_energy_by_species(vel, species, mass_lut, weight):
+    """Weighted kinetic energy [J], macroparticle count and real-ion count of a set
+    of particles crossing the last closed flux surface, per type code.
+
+    vel (N, 3), species (N,) type codes (the type each had before it was flagged
+    -1), mass_lut indexed by type code, weight (N,) real ions per macroparticle.
+    Returns three float64 arrays of length len(mass_lut)."""
+    n_sp = len(mass_lut)
+    sp = np.asarray(species, dtype=np.int64)
+    v = np.asarray(vel, dtype=np.float64)
+    w = np.asarray(weight, dtype=np.float64)
+    e = w * 0.5 * np.asarray(mass_lut, dtype=np.float64)[sp] * np.sum(v * v, axis=1)
+    return (np.bincount(sp, weights=e, minlength=n_sp),
+            np.bincount(sp, minlength=n_sp).astype(np.float64),
+            np.bincount(sp, weights=w, minlength=n_sp))
+
+
+class WindowedLossPower:
+    """Power carried out through the last closed flux surface, averaged over a
+    trailing window of `window_steps` steps of length dt:
+
+        P_loss(step) = sum of the energy lost in the last min(step + 1, window_steps)
+                       steps / (that many steps * dt).
+
+    Early in the run, before a full window has elapsed, the average runs over the
+    steps so far. add() takes the energy [J] lost this step and returns P_loss [W].
+    The window sum is recomputed from the ring buffer every call (no running
+    subtraction), so it is exact to float64 summation."""
+
+    def __init__(self, window_steps, dt):
+        self.window_steps = int(window_steps)
+        self.dt = float(dt)
+        self.buf = np.zeros(self.window_steps, dtype=np.float64)
+        self.n = 0
+
+    def add(self, energy_J):
+        self.buf[self.n % self.window_steps] = energy_J
+        self.n += 1
+        k = min(self.n, self.window_steps)
+        return float(np.sum(self.buf)) / (k * self.dt)
+
+
+def energy_confinement_time(W_J, P_loss_W):
+    """tau_E = W / P_loss [s]; NaN when nothing is being lost (P_loss <= 0), so an
+    undefined confinement time is never drawn as a number."""
+    return float(W_J) / float(P_loss_W) if P_loss_W > 0.0 else float("nan")
+
+
 def weighted_kinetic_energy_kev(vels64, rel_w, mass):
     """sum_i rel_w_i * (1/2) m |v_i|^2, in keV: the real kinetic energy of a set of
     macroparticles in thermal-D macroparticle units."""
-    return float(np.sum(rel_w * (0.5 * mass * np.sum(vels64**2, axis=1)))) / 1.602e-16
+    return float(np.sum(rel_w * (0.5 * mass * np.sum(vels64**2, axis=1)))) / KEV_J
 
 
 def drain_alpha_energy(engine, cfg, alpha_vels, rel_w, dt):
@@ -1258,10 +1317,10 @@ def drain_alpha_energy(engine, cfg, alpha_vels, rel_w, dt):
     the real energy given up, sum(rel_w * dE) in keV (thermal-D macroparticle units).
     alpha_vels is float64 and is rescaled in place (speed only)."""
     v_mags = np.linalg.norm(alpha_vels, axis=1)
-    alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / 1.602e-16
+    alpha_energies_kev = (0.5 * cfg.MASS_ALPHA * (v_mags**2)) / KEV_J
     new_energies_kev, deposited_kev = engine.compute_alpha_heating_power(
         alpha_energies_kev, dt, cfg, rel_weights=rel_w)
-    new_v_mags = np.sqrt(2.0 * (new_energies_kev * 1.602e-16) / cfg.MASS_ALPHA)
+    new_v_mags = np.sqrt(2.0 * (new_energies_kev * KEV_J) / cfg.MASS_ALPHA)
     scale_factors = new_v_mags / np.where(v_mags == 0, 1e-10, v_mags)
     alpha_vels *= scale_factors[:, np.newaxis]
     return deposited_kev

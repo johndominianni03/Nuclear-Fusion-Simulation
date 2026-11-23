@@ -202,7 +202,7 @@ def _pool_capacity_bounds(cfg, n_bulk_init, n_trit_init):
 
 def _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
              alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
-             alpha_rate_updates, weight_np, tearing_amp_over_B0):
+             alpha_rate_updates, weight_np, tearing_amp_over_B0, losses):
     """The loops' last return value: source bookkeeping and per-row weights.
 
       nbi_per_step        beam macroparticles injected each step
@@ -215,6 +215,12 @@ def _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
       alpha_rate_updates  (n_updates, n_shells) rate_k at each field update [1/s]
       weight_np           real ions per row of the returned pos/vel/type arrays
       tearing_amp_over_B0 prescribed tearing-mode amplitude / B0 at the last step
+      tau_E               per step, W_thermal / P_loss [s] (NaN before the first
+                          thermal-ion loss or with nothing lost in the window)
+      P_loss_thermal_W    per step, thermal-ion loss power through the LCFS [W]
+      lost_energy_J       weighted kinetic energy carried out, per type code [J]
+      lost_macro          macroparticles lost, per type code
+      lost_real           real ions lost, per type code
     Shared by both reactor loops.
     """
     return {
@@ -228,4 +234,9 @@ def _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
         "alpha_rate_updates": np.asarray(alpha_rate_updates, dtype=np.float64),
         "weight_np": np.asarray(weight_np, dtype=np.float64),
         "tearing_amp_over_B0": float(tearing_amp_over_B0),
+        "tau_E": np.asarray(losses["tau_E"], dtype=np.float64),
+        "P_loss_thermal_W": np.asarray(losses["P_loss_thermal_W"], dtype=np.float64),
+        "lost_energy_J": np.asarray(losses["lost_energy_J"], dtype=np.float64),
+        "lost_macro": np.asarray(losses["lost_macro"], dtype=np.float64),
+        "lost_real": np.asarray(losses["lost_real"], dtype=np.float64),
     }
