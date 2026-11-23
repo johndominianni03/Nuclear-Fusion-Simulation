@@ -8,7 +8,6 @@ import time
 import torch
 
 from physics_engine import (
-    compute_radiative_cooling_power,
     update_force_balance_field,             # quasi-neutral E_r from thermal-ion force balance
     deposit_ion_charge_density,             # end-of-run weighted CIC density map
     vectorized_boris_push_numba_fallback,
@@ -21,6 +20,7 @@ from physics_engine import (
     species_energy_and_count,               # real J and real ion count per species
     thermal_temperature_keV,                # T from thermal D + T only
     STORED_ENERGY_SPECIES,
+    tearing_amplitude_over_B0,              # prescribed ripple / B0, reported at the end
     drain_alpha_energy,
     weighted_kinetic_energy_kev,
     bulk_boost_factor,
@@ -220,7 +220,7 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
     alpha_per_step, alpha_rate_per_step, alpha_birth_weight = [], [], 0.0
     alpha_birth_shells, alpha_birth_update, alpha_rate_updates = [], [], []
     temp_history, lawson_triple_product_history = [], []
-    trigger_time, T_core_baseline, T_core = None, 0.0, 0.0
+    T_core = 0.0
     # First step whose tau_E is measured (t > 0 and at least one particle lost).
     # Earlier entries use the fixed tau_E below, so the plot starts here. None if
     # nothing was ever lost. Bookkeeping only: reads counters, writes nothing else.
@@ -302,7 +302,9 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             # birth weight that makes ALPHA_MACRO_PER_STEP macro-alphas per step carry
             # the computed total rate.
             alpha_rates = compute_alpha_birth_rates(_pot["profile"], cfg)
-            w_alpha = float(alpha_rates.sum()) * cfg.reactor_dt / cfg.ALPHA_MACRO_PER_STEP
+            # ALPHA_MACRO_PER_STEP = 0 switches the source off (no births, weight 0).
+            w_alpha = (float(alpha_rates.sum()) * cfg.reactor_dt / cfg.ALPHA_MACRO_PER_STEP
+                       if cfg.ALPHA_MACRO_PER_STEP > 0 else 0.0)
             cfg.WEIGHT[2] = w_alpha
             cfg.ALPHA_BIRTH_WEIGHT = w_alpha
             alpha_rate_updates.append(alpha_rates.copy())
@@ -571,68 +573,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         N_spec = N_spec + N_t_ + N_a_
         stored_energy_J.append(E_spec[stored_cols])
 
-        current_amp = cfg.b_perturb_initial * np.exp(cfg.gamma_growth * t)
-
         # --- T_core IS THE THERMAL-ION TEMPERATURE ---
         # (2/3) <E> per real thermal ion, from thermal D and thermal T only: the
-        # 50 keV beam ions and the alphas are not part of the thermal plasma and
-        # used to pull this several keV above it. Feeds the SPI trigger baseline,
-        # the radiative drain and the Lawson triple product.
-        T_core_kinetic = thermal_temperature_keV(E_spec, N_spec)
-
-        if current_amp > cfg.MAX_ISLAND_WIDTH_THRESHOLD and not cfg.SPI_TRIGGERED:
-            cfg.SPI_TRIGGERED = True
-            trigger_time = t
-            T_core_baseline = T_core_kinetic
-            print(f" [EMERGENCY] Magnetic Island exceeded {cfg.MAX_ISLAND_WIDTH_THRESHOLD*100}% minor radius!")
-            print(f" [SYSTEM] Firing Shattered Pellet Injection (SPI) at t={t*1000:.2f} ms...")
-            print(f" [SYSTEM] Pre-disruption core temperature: {T_core_baseline:.3f} keV")
-
-        # --- REPORTED TEMPERATURE IS MEASURED, NOT PRESCRIBED ---
-        # T_core is the kinetic temperature of the thermal ions in both regimes,
-        # before and after the SPI trigger, so a quench shows up only because the
-        # drain below removes energy from the particles.
-        T_core = T_core_kinetic
-
-        if cfg.SPI_TRIGGERED:
-            post_quench_keV = cfg.POST_QUENCH_TEMP / 1000.0
-            # Feeding the MEASURED temperature back into P_rad closes the loop: as the
-            # plasma cools, sqrt(T_e) falls and the impurity radiation weakens with it,
-            # so the quench self-limits rather than following a prescribed trajectory.
-            P_rad = compute_radiative_cooling_power(1.0e20, cfg.IMPURITY_DENSITY_NZ, T_core * 1000.0, cfg.RADIATIVE_COOLING_COEFF)
-
-            # --- RADIATIVE ENERGY DRAIN (energy conservation) ---
-            # P_rad used to be diagnostic-only: reported and plotted, but never taken out
-            # of the particles, so the bulk kept its full kinetic energy through the
-            # disruption -- quenched on the chart, pre-SPI in the velocity distribution.
-            #
-            # P_rad is a power DENSITY [W/m^3] at the reference density passed in above
-            # (1e20 m^-3), so convert it to a per-step loss FRACTION against the thermal
-            # energy density W = (3/2) * n_e * kT that same reference plasma stores. The
-            # reference density cancels, which keeps this independent of macro_weight:
-            #
-            #   f = P_rad * dt / ((3/2) * n_ref * kT)
-            #
-            # kT is measured, so the drain stays proportional to the energy the particles
-            # actually hold. Energy goes as v^2, so removing fraction f means scaling
-            # every bulk-D and tritium velocity by sqrt(1 - f).
-            T_kin_joules = T_core_kinetic * 1000.0 * cfg.e_charge
-            W_thermal = 1.5 * 1.0e20 * T_kin_joules
-            if W_thermal > 0.0 and (bulk.n_live + trit.n_live) > 0:
-                loss_fraction = float(P_rad) * cfg.reactor_dt / W_thermal
-                # Radiation cools toward the post-quench floor, not through it: cap the
-                # drain at the energy above POST_QUENCH_TEMP so a large P_rad can never
-                # scale the velocities to or past zero.
-                headroom = max(1.0 - post_quench_keV / max(T_core_kinetic, 1e-12), 0.0)
-                loss_fraction = min(max(loss_fraction, 0.0), headroom)
-                if loss_fraction > 0.0:
-                    drain = np.sqrt(1.0 - loss_fraction)
-                    b_vel[:] = (b_vel.astype(np.float64) * drain).astype(np.float32)
-                    t_vel[:] = (t_vel.astype(np.float64) * drain).astype(np.float32)
-
-        # stored_energy_J / T_core_kinetic above are recorded BEFORE the drain, which
-        # is correct: the radiation covers [t, t+dt] and so lands in the next step's
-        # ledger, not retroactively in this one.
+        # beam ions and the alphas are not part of the thermal plasma and used to
+        # pull this several keV above it. Measured, never prescribed: nothing in the
+        # loop removes energy from the particles except losses through the last
+        # closed flux surface (the scripted pellet quench is gone, Tier 2.5).
+        T_core = thermal_temperature_keV(E_spec, N_spec)
 
         prof.add("alpha heating + energy transfer", _t)
 
@@ -653,6 +600,13 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
         if (step + 1) % 500 == 0:
             max_E, max_phi = np.max(np.hypot(E_R_grid, E_Z_grid)), np.max(np.abs(phi_grid))
             print(f"  Step {step+1:04d}/{cfg.reactor_num_steps} | Confined: {current_confined:,} | Max |E|: {max_E:.3e} V/m | Max |Phi|: {max_phi:.2e} V | w_alpha: {w_alpha:.3e}")
+
+    # The prescribed tearing-mode ripple (kernels._field_at) acts on every particle
+    # through the field gather; report how large it got, relative to B0, at the
+    # last time level the loop pushed.
+    tearing_amp_over_B0 = tearing_amplitude_over_B0(cfg, (cfg.reactor_num_steps - 1) * cfg.reactor_dt)
+    print(f"[SYSTEM] Tearing-mode amplitude at end of run: {tearing_amp_over_B0:.3e} of B0 "
+          f"({tearing_amp_over_B0 * cfg.B0:.3e} T)")
 
     if profiling:
         loop_wall = time.perf_counter() - loop_wall_start
@@ -697,8 +651,8 @@ def _run_reactor_loop_cpu(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_
             tracked_lost,
             total_injected, total_lost,
             inventory_history, np.asarray(stored_energy_J, dtype=np.float64).reshape(-1, len(stored_cols)),
-            temp_history, trigger_time, T_core,
+            temp_history, T_core,
             lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
             _run_log(nbi_per_step, nbi_energy_J, alpha_per_step, alpha_rate_per_step,
                      alpha_birth_weight, alpha_birth_shells, alpha_birth_update,
-                     alpha_rate_updates, weight_np))
+                     alpha_rate_updates, weight_np, tearing_amp_over_B0))

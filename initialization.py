@@ -52,7 +52,9 @@ def initialize_reactor(cfg):
     # Beam weight from the injected power: NBI_MACRO_PER_STEP macroparticles per
     # step at E_beam each carry P_NBI * dt of energy between them.
     E_beam_J = cfg.nbi_energy_keV * 1.0e3 * cfg.e_charge
-    w_beam = cfg.P_NBI_MW * 1.0e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
+    # NBI_MACRO_PER_STEP = 0 switches the beam off (no injections, weight 0).
+    w_beam = (cfg.P_NBI_MW * 1.0e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
+              if cfg.NBI_MACRO_PER_STEP > 0 else 0.0)
     cfg.WEIGHT = {0: w_thermal,     # thermal D
                   1: w_beam,        # beam D
                   2: 0.0,           # alpha: each macro-alpha carries its own birth weight
@@ -62,8 +64,8 @@ def initialize_reactor(cfg):
           f"(<n> = {cfg.N_AVG_TARGET:.2e} m^-3 over {cfg.PLASMA_VOLUME_M3:.3f} m^3)")
     print(f"[SYSTEM] w_beam = {w_beam:.3e} ions per beam macroparticle "
           f"(P_NBI = {cfg.P_NBI_MW:.1f} MW at {cfg.nbi_energy_keV:.0f} keV, "
-          f"{cfg.NBI_MACRO_PER_STEP:g} macroparticles/step; {w_thermal / w_beam:,.0f}x lighter "
-          f"than a thermal macroparticle)")
+          f"{cfg.NBI_MACRO_PER_STEP:g} macroparticles/step"
+          + (f"; {w_thermal / w_beam:,.0f}x lighter than a thermal macroparticle)" if w_beam > 0 else ")"))
 
     # Thermal D and thermal T, half each (D gets the odd one out of an odd count).
     N = cfg.initial_thermal_count

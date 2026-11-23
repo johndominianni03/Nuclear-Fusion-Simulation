@@ -234,7 +234,7 @@ def run_pipeline(quiet=True):
         (pos_np, vel_np, type_np, history_tracks, tracked_type, tracked_lastpos,
          tracked_lastvel, tracked_lost, total_injected, total_lost,
          inventory_history, stored_energy_J,
-         temp_history, trigger_time, T_core,
+         temp_history, T_core,
          lawson_triple_product_history, _lawson_first_measured_step,
          rho_grid_out, phi_grid_out, run_log) = loop_out
 
@@ -256,9 +256,6 @@ def run_pipeline(quiet=True):
         "total_injected": np.asarray(total_injected, dtype=np.int64),
         "total_lost": np.asarray(total_lost, dtype=np.int64),
         "T_core": np.asarray(float(T_core), dtype=np.float64),
-        # trigger_time is None unless the SPI disruption fired.
-        "trigger_time": np.asarray(
-            np.nan if trigger_time is None else float(trigger_time), dtype=np.float64),
 
         # --- final particle / field state
         "pos_np": np.asarray(pos_np, dtype=np.float64),
@@ -350,7 +347,7 @@ def compare_arrays(name, golden, current, rtol):
                 f"golden {np.ravel(golden)[where][:5]} -> "
                 f"current {np.ravel(current)[where][:5]})")
 
-    # atleast_1d: the recorded scalars (T_core, trigger_time,
+    # atleast_1d: the recorded scalars (T_core,
     # total_fusion_power_watts) come back from npz as 0-d arrays, and a
     # 0-d subtraction yields an immutable numpy scalar.
     g = np.atleast_1d(golden.astype(np.float64))
@@ -370,8 +367,8 @@ def compare_arrays(name, golden, current, rtol):
 
     # An absolute floor tied to the array's own magnitude, so values that
     # sit at or near zero are not judged by a relative test they cannot
-    # pass. nanmax, since a recorded NaN (trigger_time with no disruption)
-    # would otherwise poison the floor and fail the array against itself.
+    # pass. Finite values only, so a recorded NaN cannot poison the floor
+    # and fail the array against itself.
     finite_scale = scale[np.isfinite(scale)]
     atol = rtol * (float(finite_scale.max()) if finite_scale.size else 0.0)
     tolerated = atol + rtol * np.where(np.isfinite(g), np.abs(g), 0.0)

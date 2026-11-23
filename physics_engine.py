@@ -246,20 +246,14 @@ def gather_electric_field_scalar(px, py, pz, E_R_grid, E_Z_grid,
 
 
 # =======================================================
-# DISRUPTION MITIGATION FLUID FUNCTIONS
+# PRESCRIBED TEARING MODE
 # =======================================================
 
-def compute_radiative_cooling_power(n_e, n_z, T_e, cooling_coeff):
-    # Radiative power loss P_rad = n_e * n_z * L_z(T_e) [W/m^3] after a Shattered
-    # Pellet Injection introduces heavy impurities (Neon/Argon).
-
-    # Keep the sqrt proxy well-defined at low/negative T
-    safe_Te = np.clip(T_e, 0.1, None)
-
-    # Simplified proxy for line radiation/bremsstrahlung
-    p_rad = n_e * n_z * cooling_coeff * np.sqrt(safe_Te)
-
-    return p_rad
+def tearing_amplitude_over_B0(cfg, t):
+    """Amplitude of the prescribed m/n tearing-mode ripple at time t, relative to
+    B0: b_perturb_initial * exp(gamma_growth * t) / B0. This is the amplitude
+    kernels._field_at adds to every particle's B."""
+    return float(cfg.b_perturb_initial * np.exp(cfg.gamma_growth * t) / cfg.B0)
 
 # =======================================================
 # REACTIVITY MATRICES & VOLUMETRIC FUSION RATES

@@ -241,7 +241,7 @@ def run_reactor_steady_state(save_plots=None):
      tracked_lost,
      total_injected, total_lost,
      inventory_history, stored_energy_J,
-     temp_history, trigger_time, T_core,
+     temp_history, T_core,
      lawson_triple_product_history, lawson_first_measured_step, rho_grid, phi_grid,
      run_log) = loop_fn(cfg, engine, pos_tensor, vel_tensor, type_tensor, rho_grid, phi_grid, E_R_grid, E_Z_grid, B_R_pol_grid, B_Z_pol_grid)
 

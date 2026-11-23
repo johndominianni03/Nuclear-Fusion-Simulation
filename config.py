@@ -78,29 +78,16 @@ class SimulationConfiguration:
         self.m_mode = 2                 # Poloidal mode number
         self.n_mode = 1                 # Toroidal mode number
         self.gamma_growth = 35000.0     # Exponential growth rate (gamma)
-
-        # =======================================================
-        # DISRUPTION MITIGATION & SAFETY CONTROLS (SPI)
-        # =======================================================
-        # Trigger threshold. Must sit above b_perturb_initial: at exactly 1e-4 the island
-        # cleared it on step 1 and the run spent its whole life post-quench, flatlining
-        # the thermodynamics (the drain scales as sqrt(T_e)). The island grows to ~1.42e-4 over
-        # 10,000 steps, so 1.2e-4 fires around the midpoint -- hot first, then quenched.
-        self.MAX_ISLAND_WIDTH_THRESHOLD = 1.2e-4
-        self.SPI_TRIGGERED = False              # Emergency-system flag
+        # The ripple is prescribed: b_perturb_initial * exp(gamma_growth * t), added to
+        # the B every particle sees. It drives nothing else (the scripted pellet quench
+        # it used to trigger was removed in Tier 2.5); the loops report its final
+        # amplitude relative to B0.
 
         # Per-stage wall-clock instrumentation in the reactor loops. Purely
         # additive: it reads clocks and accumulates floats, and touches no
         # array, no RNG and no control flow, so a profiled run and an
         # unprofiled one produce identical numbers.
         self.PROFILE = False
-
-        # Shattered Pellet Injection (SPI) constants
-        self.IMPURITY_DENSITY_NZ = 5.0e19       # Injected Neon/Argon density (m^-3)
-        self.RADIATIVE_COOLING_COEFF = 1.5e-32  # Simplified L_z(T_e) [W * m^3]
-
-        # Floor the radiative drain cools toward
-        self.POST_QUENCH_TEMP = 10.0            # Cold baseline temperature after the quench (eV)
 
         # =======================================================
         # REACTIVITY MATRICES & VOLUMETRIC FUSION RATES

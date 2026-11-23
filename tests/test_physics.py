@@ -804,7 +804,7 @@ def test_nbi_injected_power_equals_P_NBI():
     the loop from the stored rows, divided by the elapsed time, equals P_NBI
     within 1% over a 2,000-step run; w_beam = P_NBI dt / (E_beam * rate)."""
     cfg, out, _, _ = _source_run(2000, 2.0)
-    log = out[19]
+    log = out[-1]
     E_beam_J = cfg.nbi_energy_keV * 1e3 * cfg.e_charge
     w_expect = cfg.P_NBI_MW * 1e6 * cfg.reactor_dt / (E_beam_J * cfg.NBI_MACRO_PER_STEP)
     assert abs(cfg.WEIGHT[1] / w_expect - 1.0) < 1e-12
@@ -820,7 +820,7 @@ def test_nbi_mean_macroparticles_per_step_fractional_rate():
     P_NBI within the same relative noise."""
     rate = 1.37
     cfg, out, _, _ = _source_run(4000, rate)
-    log = out[19]
+    log = out[-1]
     k = log["nbi_per_step"]
     assert len(k) == cfg.reactor_num_steps and set(np.unique(k)) <= {1, 2}
     f = rate - int(rate)
@@ -844,7 +844,7 @@ def test_alpha_birth_rate_equals_fusion_reaction_rate():
     for rate, n_steps in ((1.0, 1000), (0.6, 3000)):
         cfg, out, init, eq = _source_run(n_steps, 2.0, n_thermal=2000, seed=12,
                                          alpha_macro_per_step=rate)
-        log = out[19]
+        log = out[-1]
         elapsed = n_steps * cfg.reactor_dt
         mean_rate = float(np.mean(log["alpha_rate_per_step"]))
         assert mean_rate > 0.0
@@ -916,7 +916,7 @@ def test_alpha_birth_radial_distribution_matches_rates():
 
     # The loop's own births against the rates in force when each was born.
     cfg2, out, _, _ = _source_run(3000, 2.0, n_thermal=2000, seed=12, alpha_macro_per_step=1.0)
-    log = out[19]
+    log = out[-1]
     upd = log["alpha_rate_updates"]
     probs = upd / upd.sum(axis=1, keepdims=True)
     expected = probs[log["alpha_birth_update"]].sum(axis=0)
@@ -957,6 +957,117 @@ def test_per_alpha_weights_follow_compaction_and_conserve_energy():
     given = _real_energy(vel_v, w_v, cfg.MASS_ALPHA) - _real_energy(a1, w_v, cfg.MASS_ALPHA)
     received = _real_energy(b1, b_w, cfg.m_deuterium) - _real_energy(b_vel, b_w, cfg.m_deuterium)
     assert given > 0.0 and abs(received / given - 1.0) < 1e-12, (given, received)
+
+
+# =======================================================
+# TIER 2.5 PHASE 1 -- no hidden energy sink
+# =======================================================
+ENERGY_TEST_STEPS = 1000
+
+
+def _closed_run(loop_fn, n_thermal=4000, steps=ENERGY_TEST_STEPS, seed=31, psiN_max=0.8):
+    """A closed system run through a reactor loop: E = 0 (the force-balance update
+    is wrapped to return zero grids), both sources off (NBI_MACRO_PER_STEP =
+    ALPHA_MACRO_PER_STEP = 0), and only thermals with psi_N < psiN_max loaded, so
+    none reaches the last closed flux surface in `steps` steps. Returns
+    (cfg, loop output, initial real kinetic energy [J], per-particle real
+    energies [J] at load)."""
+    import torch
+    from config import SimulationConfiguration
+    import initialization
+    import physics_engine
+    import reactor_cpu
+    import reactor_gpu
+    from physics_engine import compute_poloidal_field_grids, compute_psi_normalised
+
+    real_update = physics_engine.update_force_balance_field
+
+    def zero_field(cfg_, eq_, pos, vel, types):
+        phi, E_R, E_Z, pot = real_update(cfg_, eq_, pos, vel, types)
+        return np.zeros_like(phi), np.zeros_like(E_R), np.zeros_like(E_Z), pot
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        cfg = SimulationConfiguration()
+        cfg.initial_thermal_count = n_thermal
+        cfg.reactor_num_steps = steps
+        cfg.NBI_MACRO_PER_STEP = 0.0
+        cfg.ALPHA_MACRO_PER_STEP = 0.0
+        state = np.random.get_state()
+        np.random.seed(seed)
+        eq, engine, p, v, t, rho, phi, ER, EZ = initialization.initialize_reactor(cfg)
+        np.random.set_state(state)
+        pn = p.cpu().numpy()
+        keep = compute_psi_normalised(np.hypot(pn[:, 0], pn[:, 1]), pn[:, 2], eq) < psiN_max
+        idx = torch.from_numpy(np.nonzero(keep)[0]).to(p.device)
+        p, v, t = p[idx].contiguous(), v[idx].contiguous(), t[idx].contiguous()
+        cfg.initial_thermal_count = int(keep.sum())
+        B_R, B_Z, _, _ = compute_poloidal_field_grids(
+            eq, cfg.B0, R0=cfg.R0_major, a_minor=0.3, q_target=cfg.Q_SAFETY_TARGET,
+            dst_R_min=cfg.R_min, dst_R_max=cfg.R_max, dst_Z_min=cfg.Z_min,
+            dst_Z_max=cfg.Z_max, dst_nR=cfg.nR, dst_nZ=cfg.nZ)
+        vel0 = v.cpu().numpy().astype(np.float64)
+        typ0 = t.cpu().numpy()
+        mass = np.where(typ0 == 3, cfg.m_tritium, cfg.m_deuterium)
+        w = np.array([cfg.WEIGHT[int(s)] for s in typ0])
+        E_p = w * 0.5 * mass * np.sum(vel0 ** 2, axis=1)
+        saved = (reactor_cpu.update_force_balance_field, reactor_gpu.update_force_balance_field)
+        reactor_cpu.update_force_balance_field = zero_field
+        reactor_gpu.update_force_balance_field = zero_field
+        try:
+            out = loop_fn(cfg, engine, p, v, t, rho, phi, ER, EZ, B_R, B_Z)
+        finally:
+            reactor_cpu.update_force_balance_field, reactor_gpu.update_force_balance_field = saved
+    return cfg, out, float(E_p.sum()), E_p
+
+
+def test_closed_system_conserves_weighted_kinetic_energy():
+    """With E = 0, both sources off and no wall losses, nothing may change the
+    total weighted kinetic energy except float32 rounding: the Boris rotation is
+    norm-preserving (computed in float64 in the numba push), the collisions
+    re-randomise direction at fixed speed, and the alpha drag has no alphas to act
+    on. A hidden sink (the scripted pellet drain removed ~6e-5 of the thermal
+    energy per step) would show up here.
+
+    The bound. Velocities are stored as float32 after every push (and after a
+    collision), each component rounded to nearest, so per store and per component
+    |dv_i| <= 2^-24 |v_i| and |d(v^2)| <= 2^-23 v^2 (to first order).
+      * Hard (worst case, every rounding the same sign, two stores per particle
+        per step to cover collisions): |dW| / W <= 2 * steps * 2^-23 = 2.4e-4 at
+        1,000 steps.
+      * Statistical: each rounding error is uniform on [-ulp/2, ulp/2], so
+        var(dE_p) <= (4/3) 2^-48 E_p^2 per store, and
+        sigma_W <= 2^-24 sqrt((4/3) * steps * sum_p E_p^2); require |dW| < 6 sigma_W
+        (~2e-7 of W here). A sink of 1e-9 per step would fail it.
+    """
+    import reactor_cpu
+    cfg, out, W0, E_p = _closed_run(reactor_cpu._run_reactor_loop_cpu)
+    total_injected, total_lost = out[8], out[9]
+    assert total_lost == 0, f"{total_lost} particles lost: not a closed system"
+    assert total_injected == cfg.initial_thermal_count
+    assert np.all(out[-1]["nbi_per_step"] == 0) and np.all(out[-1]["alpha_per_step"] == 0)
+    W1 = float(out[11][-1].sum())                       # after the last of 1,000 steps
+    rel = abs(W1 - W0) / W0
+    hard = 2 * ENERGY_TEST_STEPS * 2.0 ** -23
+    sigma = 2.0 ** -24 * np.sqrt(4.0 / 3.0 * ENERGY_TEST_STEPS * np.sum(E_p ** 2)) / W0
+    assert rel < hard, f"|dW|/W = {rel:.3e} exceeds the worst-case float32 bound {hard:.3e}"
+    assert rel < 6.0 * sigma, f"|dW|/W = {rel:.3e} exceeds 6 sigma = {6 * sigma:.3e} of float32 rounding"
+
+
+def test_closed_system_conserves_weighted_kinetic_energy_gpu_twin():
+    """The same closed system through reactor_gpu._run_reactor_loop_gpu. MPS has
+    no float64, so the whole Boris push is float32 arithmetic, not just the
+    store: the rotation v' = v- + v- x t, v+ = v- + v' x s rounds ~16 times per
+    component chain (measured drift ~4e-7, ~9x the store-only sigma). Bound: 16
+    roundings of v^2 per particle per step, worst case, |dW| / W <= 16 * steps *
+    2^-23 = 1.9e-3 at 1,000 steps -- still 30x below what the removed pellet
+    drain took out (6e-2 over 1,000 steps)."""
+    import reactor_gpu
+    cfg, out, W0, _ = _closed_run(reactor_gpu._run_reactor_loop_gpu)
+    assert out[9] == 0, f"{out[9]} particles lost: not a closed system"
+    W1 = float(out[11][-1].sum())
+    rel = abs(W1 - W0) / W0
+    hard = 16 * ENERGY_TEST_STEPS * 2.0 ** -23
+    assert rel < hard, f"|dW|/W = {rel:.3e} exceeds the float32-arithmetic bound {hard:.3e}"
 
 
 # =======================================================
